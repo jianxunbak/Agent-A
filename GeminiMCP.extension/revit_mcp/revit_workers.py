@@ -270,6 +270,543 @@ def _poly_area_mm2(pts):
                    for i in range(n))) / 2.0
 
 
+def _normalise_footprint_holes(holes):
+    """Ensure footprint_holes is [[polygon1_pts], [polygon2_pts], ...].
+
+    Gemini may output a flat list [[x,y],[x,y],...] for a single-hole courtyard.
+    The engine always expects a list-of-polygons [[[x,y],...], [[x,y],...]].
+    """
+    if not holes:
+        return []
+    # Already nested: first element is a list of [x,y] lists
+    first = holes[0]
+    if isinstance(first, (list, tuple)) and first and isinstance(first[0], (list, tuple)):
+        return holes
+    # Flat list of [x,y] points — wrap in outer list as a single-hole polygon
+    if isinstance(first, (list, tuple)) and len(first) == 2 and isinstance(first[0], (int, float)):
+        return [holes]
+    return holes
+
+
+def pre_analyse_floor_plate(manifest, compliance_overrides=None, user_goal=None):
+    """Pure Python — no Revit API.
+
+    Analyses a Pass-1 manifest (shell geometry + lift count only) and returns
+    a structured dict with individual element dimensions and building geometry
+    description for injection into the Pass-2 Gemini prompt.
+    """
+    import math as _pa_math
+
+    setup       = manifest.get("project_setup", {})
+    shell       = manifest.get("shell", {})
+    lifts_cfg   = manifest.get("lifts", {})
+    typology    = (manifest.get("typology") or setup.get("typology", "")).lower().replace(" ", "_")
+    presets     = load_presets()
+    preset      = presets.get(typology) or presets.get("default") or presets.get("commercial_office", {})
+
+    # ── Pre-expand SVG footprint so classification / area use real polygon ───
+    _pa_svg = shell.get("footprint_svg")
+    if _pa_svg and not shell.get("footprint_points"):
+        try:
+            from revit_mcp.svg_to_footprint import svg_path_to_multiloop as _pa_s2m
+            _pa_ml = _pa_s2m(_pa_svg)
+            shell = dict(shell)
+            shell["footprint_points"] = _pa_ml["outer"]
+            _pa_off = _pa_ml.get("offset", [0.0, 0.0])
+            if _pa_ml.get("holes"):
+                shell["footprint_holes"] = _pa_ml["holes"]
+            elif shell.get("footprint_holes"):
+                _pa_raw_holes = _normalise_footprint_holes(shell["footprint_holes"])
+                if _pa_off[0] != 0.0 or _pa_off[1] != 0.0:
+                    _pa_raw_holes = [
+                        [[p[0] - _pa_off[0], p[1] - _pa_off[1]] for p in h]
+                        for h in _pa_raw_holes
+                    ]
+                shell["footprint_holes"] = _pa_raw_holes
+        except Exception:
+            pass  # SVG parse fail — fall back to width/length estimates
+
+    # ── Typical floor height ─────────────────────────────────────────────────
+    _preset_typical = safe_num(preset.get("floor_heights", {}).get("typical", 0), 0)
+    _manifest_h     = safe_num(setup.get("level_height", 0), 0)
+    typical_h_mm    = _manifest_h if _manifest_h > 0 else (_preset_typical if _preset_typical > 0 else 4000)
+
+    num_storeys = max(1, safe_num(setup.get("levels", 5), 5))
+
+    # ── Lift count ───────────────────────────────────────────────────────────
+    num_lifts = lifts_cfg.get("count")
+    if isinstance(num_lifts, dict):
+        num_lifts = num_lifts.get("passenger", num_lifts.get("total", num_lifts.get("count", None)))
+    _fw = safe_num(shell.get("width", 30000), 30000)
+    _fl = safe_num(shell.get("length", 50000), 50000)
+    fp_pts  = shell.get("footprint_points")
+    if fp_pts and fp_pts[0] and isinstance(fp_pts[0][0], (list, tuple)):
+        fp_pts = fp_pts[0]
+    fp_holes = _normalise_footprint_holes(shell.get("footprint_holes", []))
+    if fp_pts and len(fp_pts) >= 3:
+        _floor_area_mm2 = _poly_area_mm2(fp_pts)
+    else:
+        _floor_area_mm2 = _fw * _fl
+    _NFA_RATIO   = 0.60
+    _occ_density = safe_num(lifts_cfg.get("occupancy_density", 0.067), 0.067)
+    _total_occ   = max(100, (_floor_area_mm2 / 1e6) * _NFA_RATIO * _occ_density * num_storeys)
+    _auto_lifts  = lift_logic.calculate_lift_requirements(num_storeys, typical_h_mm, _total_occ)
+    if num_lifts is None or num_lifts == "random":
+        num_lifts = _auto_lifts
+    else:
+        try:
+            _manifest_n = int(num_lifts)
+            if _manifest_n >= max(2, int(_auto_lifts * 0.8)):
+                num_lifts = _manifest_n
+            else:
+                num_lifts = _auto_lifts
+        except (TypeError, ValueError):
+            num_lifts = _auto_lifts
+    num_lifts = int(num_lifts)
+
+    lobby_w = safe_num(lifts_cfg.get("lobby_width",
+                       preset.get("core_logic", {}).get("lift_lobby_width", 3000)), 3000)
+
+    # ── Compliance overrides ─────────────────────────────────────────────────
+    cp = compliance_overrides or manifest.get("compliance_parameters", {})
+    _cp_overrides = {}
+    if cp.get("stair_riser_mm"):        _cp_overrides["max_riser_mm"]              = int(cp["stair_riser_mm"])
+    if cp.get("stair_tread_mm"):        _cp_overrides["min_tread_mm"]              = int(cp["stair_tread_mm"])
+    if cp.get("stair_headroom_mm"):     _cp_overrides["min_headroom_mm"]           = int(cp["stair_headroom_mm"])
+    if cp.get("stair_overrun_mm"):      _cp_overrides["overrun_height_mm"]         = int(cp["stair_overrun_mm"])
+    if cp.get("max_travel_distance_mm"):_cp_overrides["max_travel_distance_mm"]    = int(cp["max_travel_distance_mm"])
+
+    # ── Passenger lift element dimensions ────────────────────────────────────
+    _lift_internal = tuple(preset.get("core_logic", {}).get("lift_internal_size", [2500, 2500]))
+    _lift_wall_t   = int(safe_num(preset.get("core_logic", {}).get("lift_wall_thickness", 200), 200))
+    layout         = lift_logic.get_total_core_layout(num_lifts, internal_size=_lift_internal, lobby_width=lobby_w)
+    _lift_car_w    = _lift_internal[0]
+    _lift_car_d    = _lift_internal[1]
+    _psgr_lobby_w  = layout["total_w"]
+    _psgr_lobby_d  = lobby_w
+    _psgr_lobby_a  = int(_psgr_lobby_w * _psgr_lobby_d)
+
+    # Per-lift unit width: car + one wall thickness (walls are shared between adjacent cars,
+    # so the marginal width added by each car is car_w + wall_t, not car_w + 2*wall_t).
+    _lift_unit_w = _lift_car_w + _lift_wall_t
+
+    passenger_lift_elements = {
+        "num_lifts":              num_lifts,
+        "lifts_per_block":        layout["lifts_per_block"],
+        "num_blocks":             layout["num_blocks"],
+        "lift_car_w_mm":          _lift_car_w,
+        "lift_car_d_mm":          _lift_car_d,
+        "lift_wall_thickness_mm": _lift_wall_t,
+        "lift_car_unit_w_mm":     _lift_unit_w,
+        "passenger_lobby_width_mm":  int(_psgr_lobby_w),
+        "passenger_lobby_depth_mm":  int(_psgr_lobby_d),
+        "passenger_lobby_area_mm2":  _psgr_lobby_a,
+        "passenger_bank_total_depth_mm": int(layout["total_d"]),
+    }
+
+    # ── Fire cluster element dimensions ──────────────────────────────────────
+    preset_fs   = preset.get("core_logic", {}).get("fire_safety", {})
+    stair_spec  = preset_fs.get("staircase_spec", {}).copy()
+    _lift_bounds_pre = (
+        -layout["total_w"] / 2.0, -layout["total_d"] / 2.0,
+         layout["total_w"] / 2.0,  layout["total_d"] / 2.0,
+    )
+    _floor_dims_stub = [(_fw, _fl)]
+    try:
+        _safety_sets = fire_safety_logic.calculate_fire_safety_requirements(
+            _floor_dims_stub, [0.0, 0.0], _lift_bounds_pre,
+            typical_h_mm, preset_fs, num_lifts, lobby_w,
+            compliance_overrides=_cp_overrides,
+            footprint_pts=fp_pts, footprint_holes=fp_holes,
+            orientation="NS"
+        )
+        num_clusters = max(len(_safety_sets), 1)
+    except Exception:
+        num_clusters = 2
+
+    # Individual fire cluster element sizes (from FSC constants / compliance JSON)
+    from revit_mcp.fire_safety_logic import _FSC, _STC, _FL_CAR_SIZE, _FL_SHAFT_D, _WALL_THICKNESS
+    _fl_car_w = int(safe_num(cp.get("fire_lift_car_width_mm",  _FSC.get("fire_lift", {}).get("car_size_mm", 2500)), 2500))
+    _fl_car_d = int(safe_num(cp.get("fire_lift_car_depth_mm",  _FL_CAR_SIZE), _FL_CAR_SIZE))
+    _fl_shaft_w = _fl_car_w + 2 * _WALL_THICKNESS
+    _fl_shaft_d = _FL_SHAFT_D
+    _fire_lobby_d   = int(safe_num(cp.get("fire_lobby_min_depth_mm",
+                          _FSC.get("fire_lift", {}).get("lobby_min_depth_mm", 1800)), 1800))
+    _fire_lobby_a   = int(safe_num(cp.get("fire_lobby_min_area_mm2",
+                          _FSC.get("fire_lift", {}).get("lobby_min_area_mm2", 5400000)), 5400000))
+    _smoke_d = int(safe_num(cp.get("smoke_stop_lobby_min_depth_mm",
+                   _FSC.get("perimeter_staircase", {}).get("smoke_stop_lobby_clear_depth_mm", 2000)), 2000))
+    _smoke_a = int(safe_num(cp.get("smoke_stop_lobby_min_area_mm2", 3000000), 3000000))
+    _sw_nat, _sd_nat = staircase_logic.get_shaft_dimensions(typical_h_mm, stair_spec)
+    _st_flight_w = int(stair_spec.get("width_of_flight",
+                        safe_num(_FSC.get("staircase", {}).get("width_of_flight_mm", 1200), 1200)))
+    _st_landing_d = int(stair_spec.get("landing_width",
+                         safe_num(_FSC.get("staircase", {}).get("landing_width_mm", 1200), 1200)))
+
+    # Compact rectangle: all 3 modules side-by-side parallel to bank face.
+    # Perpendicular depth = deepest single module = staircase depth (sd_nat).
+    _cluster_d_p   = int(_sd_nat)
+
+    fire_cluster_elements = {
+        "num_clusters":                  num_clusters,
+        "fire_lift_car_w_mm":            _fl_car_w,
+        "fire_lift_car_d_mm":            _fl_car_d,
+        "fire_lift_shaft_w_mm":          int(_fl_shaft_w),
+        "fire_lift_shaft_d_mm":          int(_fl_shaft_d),
+        "fire_lobby_min_depth_mm":       _fire_lobby_d,
+        "fire_lobby_min_area_mm2":       _fire_lobby_a,
+        "smoke_stop_lobby_min_depth_mm": _smoke_d,
+        "smoke_stop_lobby_min_area_mm2": _smoke_a,
+        "staircase_flight_w_mm":         _st_flight_w,
+        "staircase_landing_d_mm":        _st_landing_d,
+        "staircase_shaft_w_mm":          int(_sw_nat),
+        "staircase_shaft_d_mm":          int(_sd_nat),
+        "cluster_assembly_depth_mm":     _cluster_d_p,
+    }
+
+    staircase_count_required = max(num_clusters, 2)
+
+    # ── Classify footprint shape ─────────────────────────────────────────────
+    _has_pts   = bool(fp_pts and len(fp_pts) >= 3)
+    _has_svg   = bool(shell.get("footprint_svg"))
+    _has_holes = bool(fp_holes)
+    _has_vols  = bool(manifest.get("volumes"))
+    _shape_str = shell.get("shape", "")
+
+    if _shape_str in ("circle", "ellipse"):
+        shape_classification = _shape_str
+    elif _has_pts and _has_holes:
+        shape_classification = "courtyard"
+    elif _has_pts:
+        # Count concave vertices to classify irregular polygons
+        n = len(fp_pts)
+        _concave = 0
+        for _vi in range(n):
+            ax, ay = fp_pts[(_vi - 1) % n]
+            bx, by = fp_pts[_vi]
+            cx, cy = fp_pts[(_vi + 1) % n]
+            _cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+            if _cross < 0:
+                _concave += 1
+        if _concave <= 2:
+            shape_classification = "L-shape"
+        elif _concave <= 4:
+            shape_classification = "U-shape or T-shape"
+        else:
+            shape_classification = "H-shape or complex"
+    elif _has_svg:
+        shape_classification = "organic_svg"
+    elif _has_holes:
+        shape_classification = "courtyard"
+    elif _has_vols:
+        shape_classification = "volumes_composite"
+    else:
+        shape_classification = "rectangular"
+
+    # ── Floor plate variation analysis ───────────────────────────────────────
+    _w_base = safe_num(shell.get("width", 30000), 30000)
+    _l_base = safe_num(shell.get("length", 50000), 50000)
+    overrides = shell.get("floor_overrides", {})
+    scale_ovr = shell.get("footprint_scale_overrides", {})
+    _all_ws = [_w_base]; _all_ls = [_l_base]
+    for _k, _ov in overrides.items():
+        _all_ws.append(safe_num(_ov.get("width", _w_base), _w_base))
+        _all_ls.append(safe_num(_ov.get("length", _l_base), _l_base))
+    for _k, _sc in scale_ovr.items():
+        try:
+            _s = float(_sc)
+            _all_ws.append(_w_base * _s); _all_ls.append(_l_base * _s)
+        except (TypeError, ValueError):
+            pass
+    _min_w, _max_w = int(min(_all_ws)), int(max(_all_ws))
+    _min_l, _max_l = int(min(_all_ls)), int(max(_all_ls))
+    _is_uniform    = (_min_w == _max_w) and (_min_l == _max_l) and not overrides and not scale_ovr
+    if _is_uniform:
+        _var_desc = "identical all floors"
+    elif overrides:
+        _var_desc = "varies per floor_overrides on specific levels"
+    elif scale_ovr:
+        _var_desc = "tapers via footprint_scale_overrides from {:.0f}×{:.0f} to {:.0f}×{:.0f} mm".format(
+            _max_w, _max_l, _min_w, _min_l)
+    else:
+        _var_desc = "varies (check floor_overrides)"
+
+    floor_plate_variation = {
+        "is_uniform":        _is_uniform,
+        "smallest_plate_mm": [_min_w, _min_l],
+        "largest_plate_mm":  [_max_w, _max_l],
+        "description":       _var_desc,
+    }
+
+    # ── 3D building form description ─────────────────────────────────────────
+    _void_bounds = None
+    if shape_classification in ("courtyard",) and fp_holes:
+        _all_hx = [p[0] for h in fp_holes for p in h]
+        _all_hy = [p[1] for h in fp_holes for p in h]
+        if _all_hx:
+            _void_bounds = [int(min(_all_hx)), int(min(_all_hy)), int(max(_all_hx)), int(max(_all_hy))]
+
+    if _has_vols:
+        _form_type = "volumes_composite"
+        _vols = manifest.get("volumes", [])
+        _vdesc_parts = []
+        for _v in _vols:
+            _vdesc_parts.append("Volume at ({},{}) {:.0f}×{:.0f}mm levels {}-{}".format(
+                _v.get("offset_x", 0), _v.get("offset_y", 0),
+                safe_num(_v.get("width", 0), 0), safe_num(_v.get("length", 0), 0),
+                _v.get("start_level", 1), _v.get("end_level", num_storeys)))
+        _form_desc = "; ".join(_vdesc_parts) if _vdesc_parts else "composite volume form"
+    elif shape_classification in ("courtyard",):
+        _form_type = "courtyard_extrusion"
+        _vw = _void_bounds[2] - _void_bounds[0] if _void_bounds else 0
+        _vl = _void_bounds[3] - _void_bounds[1] if _void_bounds else 0
+        _form_desc = ("Courtyard plan extruded {0} floors. Outer plate: {1:.0f}×{2:.0f} mm. "
+                      "Inner void approx: {3:.0f}×{4:.0f} mm centred at [{5:.0f},{6:.0f}].").format(
+            num_storeys, _w_base, _l_base, _vw, _vl,
+            (_void_bounds[0] + _void_bounds[2]) / 2 if _void_bounds else 0,
+            (_void_bounds[1] + _void_bounds[3]) / 2 if _void_bounds else 0)
+    elif shape_classification in ("L-shape", "U-shape or T-shape", "H-shape or complex") and fp_pts:
+        _form_type = "irregular_polygon_extrusion"
+        _xs = [p[0] for p in fp_pts]; _ys = [p[1] for p in fp_pts]
+        _bb_w = max(_xs) - min(_xs); _bb_l = max(_ys) - min(_ys)
+        _form_desc = ("{0} plan extruded {1} floors. Bounding box: {2:.0f}×{3:.0f} mm. "
+                      "Plate uniform: {4}").format(
+            shape_classification, num_storeys, _bb_w, _bb_l, _is_uniform)
+    elif shape_classification in ("organic_svg",):
+        _form_type = "organic_svg_extrusion"
+        _form_desc = "Organic SVG footprint extruded {} floors.".format(num_storeys)
+    elif not _is_uniform:
+        _form_type = "tapered"
+        _form_desc = ("Rectangular plan extruded {0} floors. "
+                      "Base: {1}×{2} mm, minimum: {3}×{4} mm. {5}").format(
+            num_storeys, _max_w, _max_l, _min_w, _min_l, _var_desc)
+    else:
+        _form_type = "direct_extrusion"
+        _form_desc = "Rectangular plan {0}×{1} mm extruded {2} floors uniformly.".format(
+            int(_w_base), int(_l_base), num_storeys)
+
+    building_form_3d = {
+        "form_type":         _form_type,
+        "description":       _form_desc,
+        "void_boundaries_mm": _void_bounds,
+    }
+
+    # ── Solid zone analysis for irregular polygons and courtyards ────────────
+    solid_zones = []
+    if fp_pts and len(fp_pts) >= 3 and shape_classification not in ("rectangular", "circular", "ellipse"):
+        from revit_mcp.staircase_logic import _point_in_polygon as _pip_sz
+        # Compute centroid of each arm by partitioning the polygon into rectangular-ish regions
+        _xs_sz = [p[0] for p in fp_pts]; _ys_sz = [p[1] for p in fp_pts]
+        _bb_xmin, _bb_xmax = min(_xs_sz), max(_xs_sz)
+        _bb_ymin, _bb_ymax = min(_ys_sz), max(_ys_sz)
+        _bb_w_sz = _bb_xmax - _bb_xmin; _bb_l_sz = _bb_ymax - _bb_ymin
+
+        if shape_classification == "courtyard" and _void_bounds:
+            # Courtyard: four band zones (N/S/E/W donut)
+            _vx1, _vy1, _vx2, _vy2 = _void_bounds
+            _zones_def = [
+                ("North band", [_bb_xmin, _vy2, _bb_xmax, _bb_ymax]),
+                ("South band", [_bb_xmin, _bb_ymin, _bb_xmax, _vy1]),
+                ("East band",  [_vx2, _vy1, _bb_xmax, _vy2]),
+                ("West band",  [_bb_xmin, _vy1, _vx1, _vy2]),
+            ]
+            for _zlabel, _zrect in _zones_def:
+                _zw = _zrect[2] - _zrect[0]; _zh = _zrect[3] - _zrect[1]
+                if _zw > 0 and _zh > 0:
+                    solid_zones.append({
+                        "label":          _zlabel,
+                        "centroid_mm":    [int((_zrect[0] + _zrect[2]) / 2), int((_zrect[1] + _zrect[3]) / 2)],
+                        "available_w_mm": int(_zw),
+                        "available_d_mm": int(_zh),
+                    })
+        else:
+            # Irregular polygon: detect arms and report each arm's LOCAL narrow dimension.
+            # Strategy: fine grid sampling to find each cell's local cross-section width
+            # (how wide the polygon is at that point horizontally AND vertically).
+            # Arm grouping uses strict adjacency (1.05× step) so L/U/H corners don't
+            # merge separate arms into one zone.
+            _STEP = max(3000, int(min(_bb_w_sz, _bb_l_sz) / 10))
+            _cells = []
+            _x = _bb_xmin + _STEP / 2.0
+            while _x < _bb_xmax:
+                _y = _bb_ymin + _STEP / 2.0
+                while _y < _bb_ymax:
+                    if _pip_sz(_x, _y, fp_pts):
+                        _inside_hole = any(_pip_sz(_x, _y, _h) for _h in fp_holes) if fp_holes else False
+                        if not _inside_hole:
+                            _cells.append((_x, _y))
+                    _y += _STEP
+                _x += _STEP
+
+            # Helper: measure polygon width at a given x or y by counting consecutive
+            # interior grid cells along that scan line.
+            def _local_w_at_y(_cy):
+                """Horizontal span of polygon at y=_cy using sampled cells."""
+                _xs_hit = [_cx for (_cx, _cy2) in _cells if abs(_cy2 - _cy) <= _STEP * 0.6]
+                return (max(_xs_hit) - min(_xs_hit) + _STEP) if len(_xs_hit) >= 2 else _STEP
+
+            def _local_d_at_x(_cx):
+                """Vertical span of polygon at x=_cx using sampled cells."""
+                _ys_hit = [_cy for (_cx2, _cy) in _cells if abs(_cx2 - _cx) <= _STEP * 0.6]
+                return (max(_ys_hit) - min(_ys_hit) + _STEP) if len(_ys_hit) >= 2 else _STEP
+
+            # Group cells into arms using strict adjacency (avoids merging L/U corner arms).
+            # Two cells belong to the same arm only if one step apart on the grid.
+            _CONNECTIVITY_R = _STEP * 1.05
+            _visited = [False] * len(_cells)
+            _arms = []
+            for _ci in range(len(_cells)):
+                if _visited[_ci]:
+                    continue
+                _arm = [_ci]; _queue = [_ci]; _visited[_ci] = True
+                while _queue:
+                    _qi = _queue.pop()
+                    _qx, _qy = _cells[_qi]
+                    for _nj in range(len(_cells)):
+                        if not _visited[_nj]:
+                            _nx, _ny = _cells[_nj]
+                            # Strictly axis-aligned adjacency (N/S/E/W only, no diagonal)
+                            _same_col = abs(_nx - _qx) <= _CONNECTIVITY_R and abs(_ny - _qy) <= 0.1
+                            _same_row = abs(_ny - _qy) <= _CONNECTIVITY_R and abs(_nx - _qx) <= 0.1
+                            if _same_col or _same_row:
+                                _visited[_nj] = True; _arm.append(_nj); _queue.append(_nj)
+                _arms.append(_arm)
+
+            # For each arm report its centroid plus its LOCAL narrow dimension.
+            # The narrow dimension is the minimum cross-section across the arm
+            # (not the bounding box, which over-reports for long rectangular arms).
+            for _arm_i, _arm_cells in enumerate(_arms):
+                if len(_arm_cells) < 2:
+                    continue
+                _axs = [_cells[_ci][0] for _ci in _arm_cells]
+                _ays = [_cells[_ci][1] for _ci in _arm_cells]
+                _cx_arm = sum(_axs) / len(_axs)
+                _cy_arm = sum(_ays) / len(_ays)
+                # Bounding extents of this arm
+                _arm_xmin, _arm_xmax = min(_axs), max(_axs)
+                _arm_ymin, _arm_ymax = min(_ays), max(_ays)
+                _bbox_w = int(_arm_xmax - _arm_xmin + _STEP)
+                _bbox_d = int(_arm_ymax - _arm_ymin + _STEP)
+                # Local narrow dimension: sample cross-sections at 3 positions along the
+                # arm's long axis and take the minimum — this is the actual arm width a
+                # core must fit within, not the arm's full extent.
+                _is_wider = _bbox_w >= _bbox_d  # arm runs east-west
+                if _is_wider:
+                    # Arm is horizontal → depth (Y) is the narrow dimension, width (X) is long.
+                    # Sample Y-span at left, mid, right thirds of the arm.
+                    _sample_xs = [_arm_xmin + (_arm_xmax - _arm_xmin) * f for f in (0.25, 0.5, 0.75)]
+                    _d_samples = [_local_d_at_x(_sx) for _sx in _sample_xs]
+                    _narrow_d = int(min(_d_samples))
+                    _long_w   = _bbox_w
+                    _available_w_mm = _long_w
+                    _available_d_mm = _narrow_d
+                else:
+                    # Arm is vertical → width (X) is the narrow dimension, depth (Y) is long.
+                    _sample_ys = [_arm_ymin + (_arm_ymax - _arm_ymin) * f for f in (0.25, 0.5, 0.75)]
+                    _w_samples = [_local_w_at_y(_sy) for _sy in _sample_ys]
+                    _narrow_w = int(min(_w_samples))
+                    _long_d   = _bbox_d
+                    _available_w_mm = _narrow_w
+                    _available_d_mm = _long_d
+                solid_zones.append({
+                    "label":          "Arm {}".format(_arm_i + 1),
+                    "centroid_mm":    [int(_cx_arm), int(_cy_arm)],
+                    "available_w_mm": _available_w_mm,
+                    "available_d_mm": _available_d_mm,
+                })
+
+    # ── Bounding box ─────────────────────────────────────────────────────────
+    if fp_pts and len(fp_pts) >= 3:
+        _bx = [p[0] for p in fp_pts]; _by = [p[1] for p in fp_pts]
+        bounding_box_mm = [int(min(_bx)), int(min(_by)), int(max(_bx)), int(max(_by))]
+    else:
+        bounding_box_mm = [int(-_w_base / 2), int(-_l_base / 2), int(_w_base / 2), int(_l_base / 2)]
+
+    # ── Courtyard multi-bank guidance ────────────────────────────────────────
+    # When band width < bank_depth + 2×cluster_depth, two clusters cannot fit on
+    # one bank in any single band.  Tell Gemini to use lifts.banks with one
+    # cluster per opposing band instead.
+    courtyard_split_guidance = {}
+    if shape_classification == "courtyard" and _void_bounds:
+        try:
+            _vx1, _vy1, _vx2, _vy2 = _void_bounds
+            _bb = bounding_box_mm  # [xmin, ymin, xmax, ymax]
+            _bank_half_d = int(layout["total_d"] // 2)
+            # Min band width needed for bank + 2 clusters on same side of the bank:
+            # one cluster depth on each face, plus the bank itself
+            _min_2c = 2 * _bank_half_d + 2 * _cluster_d_p
+            _south_band_w = _vy1 - _bb[1]      # building_south → void_south
+            _north_band_w = _bb[3] - _vy2      # void_north → building_north
+            _requires_split = (_south_band_w < _min_2c) or (_north_band_w < _min_2c)
+            if _requires_split:
+                # Split lifts evenly — neither bank should have fewer than 2 lifts
+                _sec_count  = max(2, num_lifts // 2)
+                _main_count = max(2, num_lifts - _sec_count)
+                # Main bank: 1000mm buffer from void south edge
+                _main_cy = _vy1 - _bank_half_d - 1000
+                _main_s_outer = _main_cy - _bank_half_d - _cluster_d_p
+                _main_south_clr = int(_main_s_outer - _bb[1])
+                # Secondary bank: 1000mm buffer from void north edge
+                try:
+                    _sec_layout = lift_logic.get_total_core_layout(_sec_count, lobby_width=lobby_w)
+                    _sec_half_d = int(_sec_layout["total_d"] // 2)
+                except Exception:
+                    _sec_half_d = 1450
+                _sec_cy = _vy2 + _sec_half_d + 1000
+                _sec_n_outer = _sec_cy + _sec_half_d + _cluster_d_p
+                _sec_north_clr = int(_bb[3] - _sec_n_outer)
+                courtyard_split_guidance = {
+                    "requires_separate_banks": True,
+                    "reason": (
+                        "South/North bands are {0}mm wide — too narrow for bank+2 clusters "
+                        "({1}mm needed). Use lifts.banks with one cluster per band.".format(
+                            int(min(_south_band_w, _north_band_w)), int(_min_2c))
+                    ),
+                    "main_bank": {
+                        "count":        _main_count,
+                        "position_y_mm": int(_main_cy),
+                        "orientation":  "EW",
+                        "cluster_side": "south",
+                        "cluster_outer_y_mm": int(_main_s_outer),
+                        "south_wall_clearance_mm": max(0, _main_south_clr),
+                    },
+                    "secondary_bank": {
+                        "count":        _sec_count,
+                        "position_y_mm": int(_sec_cy),
+                        "orientation":  "EW",
+                        "cluster_side": "north",
+                        "cluster_outer_y_mm": int(_sec_n_outer),
+                        "north_wall_clearance_mm": max(0, _sec_north_clr),
+                    },
+                }
+        except Exception:
+            pass
+
+    # OR-Tools pre-computation removed: it was solving around a dummy anchor at
+    # origin and the result was discarded after formatting into the prompt text.
+    # The fire_cluster_elements block already provides all module sizes via pure
+    # arithmetic. OR-Tools runs once at actual build time in generate_fire_safety_manifest.
+    _core_ortools_envelope = None
+
+    return {
+        "user_goal":                user_goal,
+        "shape_classification":     shape_classification,
+        "floor_plate_area_mm2":     int(_floor_area_mm2),
+        "footprint_polygon_mm":     fp_pts if _has_pts else None,
+        "footprint_holes_mm":       fp_holes if fp_holes else [],
+        "bounding_box_mm":          bounding_box_mm,
+        "floor_plate_variation":    floor_plate_variation,
+        "building_form_3d":         building_form_3d,
+        "passenger_lift_elements":  passenger_lift_elements,
+        "fire_cluster_elements":    fire_cluster_elements,
+        "staircase_count_required":   staircase_count_required,
+        "minimum_clearance_mm":       6000,
+        "solid_zones":                solid_zones,
+        "courtyard_split_guidance":   courtyard_split_guidance,
+        "core_ortools_envelope":      _core_ortools_envelope,
+    }
+
+
 def _volume_footprint_pts(vol):
     """Return the footprint polygon [[x,y], ...] (mm) for a volume entry.
     Uses explicit footprint_points if provided, otherwise builds a rectangle
@@ -399,18 +936,67 @@ class RevitWorkers:
         # Convert footprint_svg → footprint_points before any phase touches the manifest.
         # This is the real execution path; building_generator._expand_high_level_manifest
         # is the legacy path and is not called from here.
+        #
+        # IMPORTANT: if footprint_points already exist (Gemini supplied them directly, which
+        # is the case for courtyard buildings using footprint_points + footprint_holes), skip
+        # SVG conversion entirely.  Running SVG conversion would re-centre the polygon and
+        # inject a non-zero _svg_offset, causing lifts.position to be shifted by that offset
+        # even though the coordinates are already in the correct absolute space.
+        # footprint_points always wins; footprint_svg is stripped so nothing downstream
+        # accidentally re-triggers conversion.
         _shell = manifest.get("shell", {})
+        if _shell.get("footprint_points") and _shell.get("footprint_svg"):
+            # footprint_points is authoritative — drop the redundant SVG and normalise holes
+            _shell = dict(_shell)
+            _shell.pop("footprint_svg", None)
+            if _shell.get("footprint_holes"):
+                _shell["footprint_holes"] = _normalise_footprint_holes(_shell["footprint_holes"])
+            manifest = dict(manifest)
+            manifest["shell"] = _shell
+            self.log("[SVG] footprint_points already present — footprint_svg stripped (no re-centring)")
+        # Normalise footprint_points to a flat [[x,y],...] list.
+        # Gemini sometimes sends [[outer_polygon], [hole_polygon]] or [[outer_polygon]]
+        # (a list-of-polygons) when the footprint has both outer and hole subpaths.
+        # Extract only the outer ring here; holes belong in footprint_holes.
+        _fp_raw = manifest.get("shell", {}).get("footprint_points")
+        if _fp_raw and _fp_raw[0] and isinstance(_fp_raw[0][0], (list, tuple)):
+            _shell2 = dict(manifest.get("shell", {}))
+            _outer = _fp_raw[0]
+            _inner = _fp_raw[1:]
+            _shell2["footprint_points"] = _outer
+            if _inner and not _shell2.get("footprint_holes"):
+                _shell2["footprint_holes"] = _normalise_footprint_holes(_inner)
+            manifest = dict(manifest)
+            manifest["shell"] = _shell2
+            self.log("[Footprint] Normalised nested footprint_points: {} outer pts, {} hole(s)".format(
+                len(_outer), len(_inner)))
         _svg_path = _shell.get("footprint_svg")
         if _svg_path:
             try:
                 from revit_mcp.svg_to_footprint import svg_path_to_multiloop
                 _ml = svg_path_to_multiloop(_svg_path)
+                _svg_off = _ml.get("offset", [0.0, 0.0])
+                _svg_dx, _svg_dy = float(_svg_off[0]), float(_svg_off[1])
                 _shell = dict(_shell)
                 _shell["footprint_points"] = _ml["outer"]
+                # Store offset so lifts.position can be adjusted below
+                _shell["_svg_offset"] = [_svg_dx, _svg_dy]
                 if _ml.get("holes"):
+                    # SVG contained inner subpaths — use them (already re-centred)
                     _shell["footprint_holes"] = _ml["holes"]
                     self.log("[SVG] footprint_svg converted: {} outer vertices, {} hole(s)".format(
                         len(_ml["outer"]), len(_ml["holes"])))
+                elif _shell.get("footprint_holes"):
+                    # JSON footprint_holes — normalise to list-of-polygons, then shift if needed
+                    _raw_holes = _normalise_footprint_holes(_shell["footprint_holes"])
+                    if _svg_dx != 0.0 or _svg_dy != 0.0:
+                        _raw_holes = [
+                            [[p[0] - _svg_dx, p[1] - _svg_dy] for p in hole]
+                            for hole in _raw_holes
+                        ]
+                    _shell["footprint_holes"] = _raw_holes
+                    self.log("[SVG] footprint_svg converted: {} vertices, JSON holes shifted by ({:.0f},{:.0f})".format(
+                        len(_ml["outer"]), _svg_dx, _svg_dy))
                 else:
                     self.log("[SVG] footprint_svg converted: {} vertices".format(len(_ml["outer"])))
                 _shell.pop("footprint_svg", None)
@@ -491,6 +1077,36 @@ class RevitWorkers:
             # Expand shape shorthand FIRST so _process_shell_dimensions sees footprint_points
             shell = manifest.get("shell", {})
             shell = _expand_shape_shorthand(shell)
+            # Normalise floor_overrides: Gemini occasionally sends the inverted schema
+            # {"width": {"10": 28333}, "length": {"10": 28333}} instead of the correct
+            # {"10": {"width": 28333, "length": 28333}}.  Detect and transpose.
+            _raw_fo = shell.get("floor_overrides")
+            if isinstance(_raw_fo, dict) and _raw_fo:
+                _fo_vals = list(_raw_fo.values())
+                if all(isinstance(v, dict) for v in _fo_vals):
+                    # Correct format: {"10": {"width": ..., "length": ...}} — keys are floor indices
+                    pass
+                elif all(isinstance(v, (int, float)) for v in _fo_vals):
+                    # Wrong format: {"width": 28333, "length": 28333} — scalar values, ignore
+                    pass
+                else:
+                    # Check for inverted format: {"width": {"10": N, "20": N}, "length": {"10": N, "20": N}}
+                    # Keys would be dimension names ("width", "length") not floor indices
+                    _dim_keys = {"width", "length", "parapet_height", "cantilever_depth", "offset_x", "offset_y"}
+                    if any(k in _dim_keys for k in _raw_fo):
+                        _transposed = {}
+                        for _dim_name, _floor_map in _raw_fo.items():
+                            if isinstance(_floor_map, dict):
+                                for _floor_k, _dim_v in _floor_map.items():
+                                    if _floor_k not in _transposed:
+                                        _transposed[_floor_k] = {}
+                                    _transposed[_floor_k][_dim_name] = _dim_v
+                        if _transposed:
+                            shell = dict(shell)
+                            shell["floor_overrides"] = _transposed
+                            manifest["shell"] = shell
+                            self.log("[Manifest] Normalised floor_overrides from inverted schema: {}".format(
+                                list(_transposed.keys())))
             manifest["shell"] = shell  # write back so _process_shell_dimensions sees footprint_points
             # Fix 6: organic builds always define the full geometry — never inherit stale wall lengths
             if shell.get("footprint_points") and not shell.get("force_global_dimensions"):
@@ -524,6 +1140,17 @@ class RevitWorkers:
                 for (vx1, vy1, vx2, vy2) in voids_mm:
                     u_voids_ft.append((mm_to_ft(vx1), mm_to_ft(vy1), mm_to_ft(vx2), mm_to_ft(vy2)))
                 self._stair_voids = u_voids_ft
+                # void_polygons: rotated rectangle corner lists (mm) produced by
+                # _rotate_geometry when rotation_deg is non-zero.  Convert to ft
+                # for _process_floors to cut precisely-shaped slab openings.
+                void_polys_mm = manifest.get("void_polygons", [])
+                if void_polys_mm:
+                    self._stair_void_polygons = [
+                        [(mm_to_ft(p[0]), mm_to_ft(p[1])) for p in poly]
+                        for poly in void_polys_mm
+                    ]
+                else:
+                    self._stair_void_polygons = []
                 core_bounds = core_bounds_ft
             else:
                 self._stair_voids = []
@@ -572,8 +1199,10 @@ class RevitWorkers:
                 for el in DB.FilteredElementCollector(doc).OfCategory(c).WhereElementIsNotElementType().ToElements():
                     try:
                         p = el.get_Parameter(DB.BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
-                        if p and p.HasValue and p.AsString().startswith("AI_"):
-                            ids_to_delete.Add(el.Id)
+                        if p and p.HasValue:
+                            _cm = p.AsString()
+                            if _cm.startswith("AI_") or (_cm.startswith("B") and "_AI_" in _cm):
+                                ids_to_delete.Add(el.Id)
                     except:
                         pass
 
@@ -689,6 +1318,15 @@ class RevitWorkers:
                 self.tracker.record_created("columns", cols_new)
                 col_spacing = shell.get("column_spacing", 10000)
                 offset_edge = shell.get("column_offset_from_edge", 500)
+                # Normalise: AI may send a dict {"default":N}, {"value":N}, or {"x":N,"y":N}
+                if isinstance(col_spacing, dict):
+                    col_spacing = (col_spacing.get("default")
+                                   or col_spacing.get("value")
+                                   or col_spacing.get("x")
+                                   or col_spacing.get("y")
+                                   or 10000)
+                elif not isinstance(col_spacing, (int, float)):
+                    col_spacing = 10000
                 # col_spacing may be a list [x_spacing, y_spacing] from the AI
                 if isinstance(col_spacing, list):
                     spacing_str = "x".join(f"{v/1000:.0f}" for v in col_spacing) + "m"
@@ -933,6 +1571,15 @@ class RevitWorkers:
         levels_val = setup.get("levels", setup.get("storeys", default_levels))
         height_val = setup.get("level_height", default_height)
         height_overrides = setup.get("height_overrides", {})
+        # Normalise: Gemini may send a list of {level, height} dicts instead of {str: int}
+        if isinstance(height_overrides, list):
+            height_overrides = {
+                str(entry["level"]): entry["height"]
+                for entry in height_overrides
+                if isinstance(entry, dict) and "level" in entry and "height" in entry
+            }
+        elif not isinstance(height_overrides, dict):
+            height_overrides = {}
 
         # Expand range keys like '2-10' â†' {'2':v, '3':v, ..., '10':v}
         expanded_overrides = {}
@@ -959,15 +1606,36 @@ class RevitWorkers:
             elevations = [0.0]
             curr = 0.0
             from revit_mcp import staircase_logic
+
+            # level_height may be a per-floor list [h1, h2, ...] or a scalar.
+            # Extract a per-floor list and a representative "typical" scalar for
+            # staircase compliance functions that expect a single number.
+            if isinstance(height_val, list):
+                _lh_list = [safe_num(h, default_height) for h in height_val]
+                # Typical = most common value across all floors (use a simple frequency count)
+                _freq = {}
+                for _hv in _lh_list:
+                    _freq[_hv] = _freq.get(_hv, 0) + 1
+                _typical_h = max(_freq, key=_freq.get)
+            else:
+                _lh_list = None
+                _typical_h = safe_num(height_val, default_height)
+
             for i in range(1, count + 1):
-                h_val = height_overrides.get(str(i), height_val)
-                raw_h = get_random_dim(h_val, default_height, variation=0.15) if h_val == "random" else safe_num(h_val, default_height)
-                h = staircase_logic.adjust_storey_height(raw_h, height_val, is_top_floor=False)
+                # Priority: explicit height_overrides > per-floor list > scalar
+                if str(i) in height_overrides:
+                    h_src = height_overrides[str(i)]
+                elif _lh_list and i <= len(_lh_list):
+                    h_src = _lh_list[i - 1]
+                else:
+                    h_src = height_val if not isinstance(height_val, list) else _typical_h
+                raw_h = get_random_dim(h_src, default_height, variation=0.15) if h_src == "random" else safe_num(h_src, default_height)
+                h = staircase_logic.adjust_storey_height(raw_h, _typical_h, is_top_floor=False)
                 if self.tracker and abs(h - raw_h) > 1.0:
                     from revit_mcp import staircase_logic as _sc
-                    _rpf = _sc._risers_per_flight_typical(height_val, 150)
+                    _rpf = _sc._risers_per_flight_typical(_typical_h, 150)
                     _total_risers = _sc._snap_risers(h, 150)
-                    _num_flights = _sc._calc_num_flights(h, height_val, 150)
+                    _num_flights = _sc._calc_num_flights(h, _typical_h, 150)
                     self.tracker.log_adjustment(
                         f"Level {i}: height adjusted {raw_h:.0f}mm -> {h:.0f}mm "
                         f"to ensure even flight count ({_num_flights} flights, "
@@ -1348,7 +2016,7 @@ class RevitWorkers:
                     results["elements"].append(str(wall.Id.Value))
 
             # --- COURTYARD HOLE WALLS: generate enclosure walls for each footprint_holes polygon ---
-            _hole_polys = shell.get("footprint_holes", [])
+            _hole_polys = _normalise_footprint_holes(shell.get("footprint_holes", []))
             for _h_idx, _hole_raw in enumerate(_hole_polys):
                 for k, lvl in enumerate(current_levels):
                     from revit_mcp.cancel_manager import check_cancelled
@@ -1753,8 +2421,14 @@ class RevitWorkers:
                 # D1: Expand organic slab to cover the fixed core when offset upper
                 # floors would otherwise expose the core shaft.  Skip for tapered
                 # buildings (footprint_scale_overrides present) — the slab is supposed
-                # to shrink there, and expanding would produce protruding rectangles.
-                if _core_mm and not shell.get("footprint_scale_overrides"):
+                # to shrink there.  Also skip for footprint_points buildings — replacing
+                # a custom polygon with a bounding-box rectangle destroys the building
+                # shape (e.g. courtyard, L-shape).  The core must already be inside the
+                # footprint_points polygon (validated by E1); if it is not, that is a
+                # Gemini/engine placement error, not a slab coverage problem.
+                if (_core_mm
+                        and not shell.get("footprint_scale_overrides")
+                        and not shell.get("footprint_points")):
                     _fp_xs_c = [p[0] for p in level_pts]
                     _fp_ys_c = [p[1] for p in level_pts]
                     _sxmin, _sxmax = min(_fp_xs_c), max(_fp_xs_c)
@@ -1839,7 +2513,7 @@ class RevitWorkers:
             floor_loops.Add(loop)
 
             # Courtyard / inner-void holes from multi-subpath footprint_svg
-            _courtyard_holes = shell.get("footprint_holes", [])
+            _courtyard_holes = _normalise_footprint_holes(shell.get("footprint_holes", []))
             if _courtyard_holes:
                 _h_scale = _get_interpolated_scale(shell.get("footprint_scale_overrides", {}), orig_lvl)
                 _h_ox, _h_oy = _get_interpolated_offset(shell.get("footprint_offset_overrides", {}), orig_lvl)
@@ -1861,6 +2535,10 @@ class RevitWorkers:
                             pass
                     if _hole_loop.NumberOfCurves() >= 3:
                         floor_loops.Add(_hole_loop)
+
+            # Record loop count after courtyard holes so the void-retry fallback knows
+            # which loops are safe (outer boundary + courtyard holes) vs shaft/stair voids.
+            _n_safe_loops = floor_loops.Count
 
             # Floors ALWAYS use straight-line segments (DB.Line.CreateBound, line ~1693)
             # so _loop_has_arcs is always False.  Shaft/stair voids are now cut for
@@ -1894,12 +2572,14 @@ class RevitWorkers:
                         slab_max_y = cy_ft + slab_hy
                     min_void_ft = mm_to_ft(200)
                     clipped = []
+                    _pip_dropped = 0
                     for (vx1, vy1, vx2, vy2) in all_voids:
                         cx1 = max(vx1, slab_min_x)
                         cy1 = max(vy1, slab_min_y)
                         cx2 = min(vx2, slab_max_x)
                         cy2 = min(vy2, slab_max_y)
                         if (cx2 - cx1) < min_void_ft or (cy2 - cy1) < min_void_ft:
+                            _pip_dropped += 1
                             continue
                         # For organic slabs, verify all 4 void corners lie inside the
                         # actual polygon (bbox inset is not enough for curved edges).
@@ -1910,8 +2590,35 @@ class RevitWorkers:
                                 (ft_to_mm(cx2), ft_to_mm(cy2)), (ft_to_mm(cx1), ft_to_mm(cy2)),
                             ]
                             if not all(_pip_v(x, y, level_pts) for x, y in _vc_mm):
+                                _pip_dropped += 1
                                 continue
+                            # Reject voids whose corners land inside a courtyard hole (footprint_holes).
+                            # A void inside the courtyard void is not part of the floor plate.
+                            _courtyard_holes_v = _normalise_footprint_holes(shell.get("footprint_holes", []))
+                            if _courtyard_holes_v:
+                                _h_scale_v = _get_interpolated_scale(shell.get("footprint_scale_overrides", {}), orig_lvl)
+                                _h_ox_v, _h_oy_v = _get_interpolated_offset(shell.get("footprint_offset_overrides", {}), orig_lvl)
+                                _h_rot_v = _get_interpolated_rotation(shell.get("footprint_rotation_overrides", {}), orig_lvl)
+                                _inside_hole = False
+                                for _hole_raw_v in _courtyard_holes_v:
+                                    _hole_pts_v = _scale_footprint(_hole_raw_v, _h_scale_v, _h_ox_v, _h_oy_v, _h_rot_v) \
+                                        if (_h_scale_v != 1.0 or _h_ox_v or _h_oy_v or _h_rot_v) else _hole_raw_v
+                                    if any(_pip_v(x, y, _hole_pts_v) for x, y in _vc_mm):
+                                        _inside_hole = True
+                                        break
+                                if _inside_hole:
+                                    _pip_dropped += 1
+                                    continue
                         clipped.append((cx1, cy1, cx2, cy2))
+                    if k == 1:
+                        from .runner import log as _vlog
+                        _vlog("[VoidDiag] L{}: {} raw voids, {} clipped, {} dropped (pip/size), slab=[{:.2f},{:.2f}]x[{:.2f},{:.2f}]ft".format(
+                            k+1, len(all_voids), len(clipped), _pip_dropped,
+                            slab_min_x, slab_max_x, slab_min_y, slab_max_y))
+                        if clipped and footprint_pts:
+                            _vlog("[VoidDiag] sample void (mm): [{:.0f},{:.0f}]x[{:.0f},{:.0f}]".format(
+                                ft_to_mm(clipped[0][0]), ft_to_mm(clipped[0][1]),
+                                ft_to_mm(clipped[0][2]), ft_to_mm(clipped[0][3])))
                     merged = _merge_void_rects(clipped)
                     for (vx1, vy1, vx2, vy2) in merged:
                         vp1 = DB.XYZ(vx1, vy1, 0)
@@ -1955,12 +2662,29 @@ class RevitWorkers:
                 try:
                     floor = DB.Floor.Create(doc, floor_loops, ftype.Id, lvl.Id)
                 except Exception as e_void:
-                    # Void loops rejected — fall back to solid floor (no voids)
                     from .runner import log as _flog2
-                    _flog2("[FloorDims] L{}: void loops invalid, retrying solid floor".format(k+1))
-                    fallback_loops = Generic.List[DB.CurveLoop]()
-                    fallback_loops.Add(loop)
-                    floor = DB.Floor.Create(doc, fallback_loops, ftype.Id, lvl.Id)
+                    # Shaft/stair voids rejected — retry with only outer boundary +
+                    # courtyard holes (which always use straight-line segments and are
+                    # part of the floor plate definition).  Concave footprints (L/U/T)
+                    # can cause Revit to reject shaft voids whose edges touch the notch
+                    # boundary; courtyard holes are unaffected by this.
+                    if floor_loops.Count > _n_safe_loops:
+                        _flog2("[FloorDims] L{}: void loops invalid, retrying with courtyard holes only".format(k+1))
+                        _safe_loops = Generic.List[DB.CurveLoop]()
+                        for _sli in range(_n_safe_loops):
+                            _safe_loops.Add(floor_loops[_sli])
+                        try:
+                            floor = DB.Floor.Create(doc, _safe_loops, ftype.Id, lvl.Id)
+                        except Exception:
+                            _flog2("[FloorDims] L{}: courtyard retry failed, using solid floor".format(k+1))
+                            fallback_loops = Generic.List[DB.CurveLoop]()
+                            fallback_loops.Add(loop)
+                            floor = DB.Floor.Create(doc, fallback_loops, ftype.Id, lvl.Id)
+                    else:
+                        _flog2("[FloorDims] L{}: void loops invalid, retrying solid floor".format(k+1))
+                        fallback_loops = Generic.List[DB.CurveLoop]()
+                        fallback_loops.Add(loop)
+                        floor = DB.Floor.Create(doc, fallback_loops, ftype.Id, lvl.Id)
             except Exception as e_final:
                 self.log("[FloorDims] L{}: SKIPPED ({}), trying plain bbox".format(k+1, str(e_final)[:120]))
                 # Last resort: axis-aligned bounding box slab — never skip a floor entirely.
@@ -2632,8 +3356,9 @@ class RevitWorkers:
             from revit_mcp.building_generator import get_model_registry  # type: ignore
             registry = get_model_registry(doc)
             wall_keys = [k for k in registry if "Stair" in k or "LB" in k or "FL" in k]
-            self.log("  Door registry: {} total, {} wall keys (sample: {})".format(
-                len(registry), len(wall_keys), wall_keys[:3]))
+            lb_keys = [k for k in wall_keys if "_LB_" in k]
+            self.log("  Door registry: {} total, {} wall keys ({} LB lobby, sample: {}, LB sample: {})".format(
+                len(registry), len(wall_keys), len(lb_keys), wall_keys[:3], lb_keys[:3]))
         except Exception as _reg_err:
             self.log("  Door registry refresh failed: {}".format(_reg_err))
             registry = getattr(self, '_registry_cache', {})
@@ -2662,30 +3387,65 @@ class RevitWorkers:
                 if not level:
                     continue
                 try:
-                    # 1. Registry-first: look up wall by deterministic AI ID
+                    import Autodesk.Revit.DB as DB  # type: ignore
+                    # LB lobby entry doors: level-constrained lookup is unreliable because
+                    # LB walls may be registered under a different level key.  Skip directly
+                    # to the wide fallback which reliably finds them by geometry.
+                    _is_lb_entry = "_Lobby_EntryDoor" in spec_id and bool(wall_ai_id_map)
                     wall = None
-                    wall_ai_id = wall_ai_id_map.get(level_id) if wall_ai_id_map else None
-                    if wall_ai_id and wall_ai_id in registry:
-                        import Autodesk.Revit.DB as DB  # type: ignore
-                        elem = doc.GetElement(registry[wall_ai_id])
-                        if elem and isinstance(elem, DB.Wall):
-                            wall = elem
-
-                    # 2. Geometry fallback (level-constrained, direction-aware)
-                    if not wall:
+                    if _is_lb_entry and li > 0:
+                        # Floors L2+: go straight to wide fallback (faster, avoids spurious misses)
                         wall = self._find_wall_for_door(
-                            doc, pos_mm, level=level,
+                            doc, pos_mm, level=None,
+                            max_dist_mm=3000,
                             wall_line_mm=spec.get("wall_line_mm"),
                         )
+                        if wall:
+                            self.log("  Door {} @ level {}: LB fast-path via wide fallback".format(spec_id, level_id))
+                    else:
+                        # 1. Registry-first: look up wall by deterministic AI ID
+                        wall_ai_id = wall_ai_id_map.get(level_id) if wall_ai_id_map else None
+                        if wall_ai_id and wall_ai_id in registry:
+                            elem = doc.GetElement(registry[wall_ai_id])
+                            if elem and isinstance(elem, DB.Wall):
+                                wall = elem
+
+                        # 2. Geometry fallback (level-constrained, direction-aware)
+                        if not wall:
+                            wall = self._find_wall_for_door(
+                                doc, pos_mm, level=level,
+                                wall_line_mm=spec.get("wall_line_mm"),
+                            )
+                        # 3. Wide geometry fallback — if still not found, try without level constraint
+                        if not wall:
+                            wall = self._find_wall_for_door(
+                                doc, pos_mm, level=None,
+                                max_dist_mm=3000,
+                                wall_line_mm=spec.get("wall_line_mm"),
+                            )
+                            if wall:
+                                self.log("  Door {} @ level {}: found via wide fallback (no-level, 3000mm)".format(spec_id, level_id))
                     if not wall:
-                        self.log("  Door {} @ level {}: no wall found".format(spec_id, level_id))
+                        # Log registry miss info for diagnosis
+                        _dbg_ai_id = wall_ai_id_map.get(level_id) if wall_ai_id_map else None
+                        _in_reg = _dbg_ai_id in registry if _dbg_ai_id else False
+                        self.log("  Door {} @ level {}: no wall found (ai_id={}, in_registry={})".format(
+                            spec_id, level_id, _dbg_ai_id, _in_reg))
                         continue
 
-                    ins_pt = DB.XYZ(
+                    _raw_pt = DB.XYZ(
                         mm_to_ft(pos_mm[0]),
                         mm_to_ft(pos_mm[1]),
                         level.ProjectElevation
                     )
+                    # Clamp insertion point onto the wall's curve so Revit doesn't
+                    # error with "point is not on wall" when position is slightly outside.
+                    try:
+                        _wall_curve = wall.Location.Curve
+                        _proj = _wall_curve.Project(_raw_pt)
+                        ins_pt = DB.XYZ(_proj.XYZPoint.X, _proj.XYZPoint.Y, level.ProjectElevation)
+                    except Exception:
+                        ins_pt = _raw_pt
                     door_inst = doc.Create.NewFamilyInstance(
                         ins_pt, door_sym, wall, level,
                         DB.Structure.StructuralType.NonStructural
@@ -2721,6 +3481,9 @@ class RevitWorkers:
         for l in current_levels:
             p = l.get_Parameter(DB.BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
             if p and p.HasValue: level_map[p.AsString()] = l
+        # Diagnostic: log level_map keys to verify AI Level N keys are present
+        _lvl_keys = sorted(level_map.keys())
+        self.log("  GranWalls level_map: {} keys, first 4: {}".format(len(_lvl_keys), _lvl_keys[:4]))
         # Pre-fetch a 350mm WallType for core walls (user requirement); fall back to first available
         wall_type = self._find_core_wall_type(doc)
 
@@ -2753,7 +3516,11 @@ class RevitWorkers:
                 curve = DB.Line.CreateBound(p1, p2)
 
             lvl = level_map.get(w_data.get("level_id"))
-            if not lvl: lvl = current_levels[0]
+            if not lvl:
+                if "_LB_" in ai_id:
+                    self.log("  GranWalls WARN: LB wall {} has unknown level_id '{}', falling back to L1".format(
+                        ai_id, w_data.get("level_id")))
+                lvl = current_levels[0]
 
             existing = doc.GetElement(registry[ai_id]) if ai_id in registry else None
 
@@ -3202,6 +3969,15 @@ class RevitWorkers:
                 f_center_mm = [0.0, 0.0]
         else:
             f_center_mm = [0.0, 0.0]
+        # If the SVG footprint was re-centred at origin, shift lifts.position by the same offset
+        # so the position stays consistent with the re-centred footprint_points polygon.
+        _svg_offset_shell = manifest.get("shell", {}).get("_svg_offset")
+        if _svg_offset_shell and (f_center_mm[0] != 0.0 or f_center_mm[1] != 0.0):
+            f_center_mm[0] -= float(_svg_offset_shell[0])
+            f_center_mm[1] -= float(_svg_offset_shell[1])
+            self.log("[SVG] lifts.position adjusted by offset ({:.0f},{:.0f}) -> ({:.0f},{:.0f})".format(
+                float(_svg_offset_shell[0]), float(_svg_offset_shell[1]),
+                f_center_mm[0], f_center_mm[1]))
         _core_orientation = str(lifts_config.get("orientation", "auto")).upper()
         if _core_orientation not in ("NS", "EW", "AUTO"):
             _core_orientation = "AUTO"
@@ -3231,7 +4007,14 @@ class RevitWorkers:
             num_lifts = _auto_lifts
         else:
             try:
-                num_lifts = min(int(num_lifts), _auto_lifts)
+                _manifest_n = int(num_lifts)
+                # Accept the manifest count if it is within 20% of the calculated
+                # value; only enforce the RTT floor when the manifest is clearly
+                # under-provisioned (< 80% of calculated).
+                if _manifest_n >= max(2, int(_auto_lifts * 0.8)):
+                    num_lifts = _manifest_n
+                else:
+                    num_lifts = _auto_lifts
             except (TypeError, ValueError):
                 num_lifts = _auto_lifts
         num_lifts = int(num_lifts)
@@ -3275,24 +4058,59 @@ class RevitWorkers:
         # Must happen before the width calculation so the occupancy load is divided
         # by the real number of stairs (central + any perimeter added for 60m rule).
         _fp_pts_pre = shell.get("footprint_points")
+        if _fp_pts_pre and _fp_pts_pre[0] and isinstance(_fp_pts_pre[0][0], (list, tuple)):
+            _fp_pts_pre = _fp_pts_pre[0]
         _pre_floor_dims = floor_dims  # _check_travel_distance uses footprint_pts polygon directly
         _f_center_pre = list(f_center_mm)  # use manifest-specified position
-        _layout_pre = lift_logic.get_total_core_layout(num_lifts, lobby_width=lobby_w)
-        _lift_bounds_pre = (
-            _f_center_pre[0] - _layout_pre["total_w"] / 2.0,
-            _f_center_pre[1] - _layout_pre["total_d"] / 2.0,
-            _f_center_pre[0] + _layout_pre["total_w"] / 2.0,
-            _f_center_pre[1] + _layout_pre["total_d"] / 2.0,
-        )
-        _safety_sets_pre = fire_safety_logic.calculate_fire_safety_requirements(
-            _pre_floor_dims, _f_center_pre, _lift_bounds_pre,
-            typical_h_mm, preset_fs, num_lifts, lobby_w,
-            compliance_overrides=_cp_overrides,
-            footprint_pts=_fp_pts_pre,
-            footprint_holes=shell.get("footprint_holes", []),
-            orientation=_core_orientation
-        )
+
+        # For multi-bank layouts, run the pre-check per bank and merge stair positions
+        # so the travel distance test reflects the actual EW staircase placement.
+        _banks_cfg_pre = lifts_config.get("banks", [])
+        if _banks_cfg_pre:
+            _all_sets_pre = []
+            for _bk_p in _banks_cfg_pre:
+                _bk_p_pos = _bk_p.get("position", [f_center_mm[0], f_center_mm[1]])
+                _bk_p_cx, _bk_p_cy = float(_bk_p_pos[0]), float(_bk_p_pos[1])
+                _bk_p_n = int(safe_num(_bk_p.get("count", max(1, num_lifts // max(len(_banks_cfg_pre), 1))), 1))
+                _bk_p_orient = str(_bk_p.get("orientation", _core_orientation)).upper()
+                if _bk_p_orient not in ("NS", "EW", "AUTO"):
+                    _bk_p_orient = _core_orientation
+                _bk_p_layout = lift_logic.get_total_core_layout(_bk_p_n, lobby_width=lobby_w)
+                _bk_p_lcb = (
+                    _bk_p_cx - _bk_p_layout["total_w"] / 2.0,
+                    _bk_p_cy - _bk_p_layout["total_d"] / 2.0,
+                    _bk_p_cx + _bk_p_layout["total_w"] / 2.0,
+                    _bk_p_cy + _bk_p_layout["total_d"] / 2.0,
+                )
+                _bk_p_sets = fire_safety_logic.calculate_fire_safety_requirements(
+                    _pre_floor_dims, [_bk_p_cx, _bk_p_cy], _bk_p_lcb,
+                    typical_h_mm, preset_fs, _bk_p_n, lobby_w,
+                    compliance_overrides=_cp_overrides,
+                    footprint_pts=_fp_pts_pre,
+                    footprint_holes=shell.get("footprint_holes", []),
+                    orientation=_bk_p_orient,
+                    num_banks=len(_banks_cfg_pre)
+                )
+                _all_sets_pre.extend(_bk_p_sets)
+            _safety_sets_pre = _all_sets_pre
+        else:
+            _layout_pre = lift_logic.get_total_core_layout(num_lifts, lobby_width=lobby_w)
+            _lift_bounds_pre = (
+                _f_center_pre[0] - _layout_pre["total_w"] / 2.0,
+                _f_center_pre[1] - _layout_pre["total_d"] / 2.0,
+                _f_center_pre[0] + _layout_pre["total_w"] / 2.0,
+                _f_center_pre[1] + _layout_pre["total_d"] / 2.0,
+            )
+            _safety_sets_pre = fire_safety_logic.calculate_fire_safety_requirements(
+                _pre_floor_dims, _f_center_pre, _lift_bounds_pre,
+                typical_h_mm, preset_fs, num_lifts, lobby_w,
+                compliance_overrides=_cp_overrides,
+                footprint_pts=_fp_pts_pre,
+                footprint_holes=shell.get("footprint_holes", []),
+                orientation=_core_orientation
+            )
         _num_stairs_from_travel = max(len(_safety_sets_pre), 2)
+        _num_stairs = _num_stairs_from_travel
         self.log("[StairCount] Travel-distance compliance requires {} staircases".format(_num_stairs_from_travel))
 
         # --- Staircase width calculation (SCDF Table 2.2A method) ---
@@ -3304,13 +4122,21 @@ class RevitWorkers:
         # Step e: required width = unit_widths_per_stair * exit_width_per_unit_mm
         #         then clamp to >= min_flight_width_mm from RAG
         import math as _math
-        _occupant_load_factor  = safe_num(cp.get("occupant_load_factor_m2"),  0)
-        _exit_width_per_unit   = safe_num(cp.get("exit_width_per_unit_mm"),    0)
-        _min_flight_width      = safe_num(cp.get("stair_min_flight_width_mm"), 0)
-        _num_stairs            = _num_stairs_from_travel
-        # persons_per_unit_width: RAG extracts from Table 2.2A staircase column.
-        # If RAG didn't return it the calculation is skipped and the code-minimum width is used.
-        _persons_per_unit      = safe_num(cp.get("persons_per_unit_width"), 0)
+        # Resolve the fire_safety nested block first (key name varies by Gemini output)
+        _fs_cp_early = cp.get("fire_safety_scdf", cp.get("fire_safety", {}))
+        _occ_nested  = _fs_cp_early.get("occupant_load", {})
+        _exit_nested = _fs_cp_early.get("exit_width", {})
+        _stair_nested = _fs_cp_early.get("staircase", {})
+
+        # Flat key wins if present; otherwise fall back to nested path
+        _occupant_load_factor = safe_num(cp.get("occupant_load_factor_m2"), 0) or \
+                                safe_num(_occ_nested.get("occupant_load_factor_m2"), 0)
+        _exit_width_per_unit  = safe_num(cp.get("exit_width_per_unit_mm"), 0) or \
+                                safe_num(_exit_nested.get("exit_width_per_unit_mm"), 0)
+        _min_flight_width     = safe_num(cp.get("stair_min_flight_width_mm"), 0) or \
+                                safe_num(_stair_nested.get("min_flight_width_mm"), 0)
+        _persons_per_unit     = safe_num(cp.get("persons_per_unit_width"), 0) or \
+                                safe_num(_exit_nested.get("persons_per_unit_width"), 0)
 
         _calc_flight_width = None
         if _occupant_load_factor > 0 and _persons_per_unit > 0 and _exit_width_per_unit > 0 and floor_dims:
@@ -3342,8 +4168,11 @@ class RevitWorkers:
                      "persons_per_unit={} exit_width_per_unit={}".format(
                          _occupant_load_factor, _persons_per_unit, _exit_width_per_unit))
 
-        # Final flight width: max(calculated, RAG minimum, absolute code floor 1000mm)
-        _abs_min = 1000
+        # Final flight width: max(calculated, RAG minimum, absolute code floor 1000mm).
+        # Practical cap at 1800mm — single-flight widths beyond this are unbuildable;
+        # excess egress demand is met by adding more staircases instead.
+        _abs_min = 1200  # BS 9999 recommended minimum for fire-escape stairs
+        _max_flight_w = 1800
         _final_flight_width = _abs_min
         if _calc_flight_width:
             _final_flight_width = max(_calc_flight_width, int(_min_flight_width) if _min_flight_width else _abs_min, _abs_min)
@@ -3351,6 +4180,18 @@ class RevitWorkers:
             _final_flight_width = max(int(_min_flight_width), _abs_min)
         elif cp.get("stair_flight_width_mm"):
             _final_flight_width = max(int(cp["stair_flight_width_mm"]), _abs_min)
+        if _final_flight_width > _max_flight_w:
+            # Redistribute excess across more stairs rather than widening beyond practical limit
+            if _calc_flight_width and _occupant_load_factor > 0 and _persons_per_unit > 0 and _exit_width_per_unit > 0:
+                _req_stairs = max(_math.ceil(_total_unit_widths * _exit_width_per_unit / _max_flight_w), int(_num_stairs))
+                if _req_stairs > int(_num_stairs):
+                    _num_stairs_from_travel = _req_stairs
+                    _num_stairs = _req_stairs
+                    _units_per_stair = _math.ceil(_total_unit_widths / _num_stairs)
+                    _final_flight_width = int(_units_per_stair * _exit_width_per_unit)
+                    self.log("[StairWidth] Width capped: {} stairs added to keep flight ≤{}mm".format(
+                        _req_stairs, _max_flight_w))
+            _final_flight_width = min(_final_flight_width, _max_flight_w)
 
         stair_spec["width_of_flight"] = _final_flight_width
         _cp_overrides["min_flight_width_mm"] = _final_flight_width
@@ -3358,12 +4199,13 @@ class RevitWorkers:
             _final_flight_width, _calc_flight_width, _min_flight_width,
             preset.get("core_logic", {}).get("fire_safety", {}).get("staircase_spec", {}).get("width_of_flight")))
 
-        # Landing width = flight width + 300mm; door-side landing widens further for door swing
-        _landing_width = _final_flight_width + 300
+        # Landing width: use preset value if set, otherwise flight_width (U-turn minimum).
+        # The preset already encodes the correct landing for the typology.
+        _landing_width = stair_spec.get("landing_width") or _final_flight_width
         stair_spec["landing_width"] = _landing_width
         _cp_overrides["min_landing_width_mm"] = _landing_width
 
-        # Fire lift and lobby
+        # Fire lift and lobby — flat keys (old format Gemini used to emit)
         if cp.get("fire_lift_car_size_mm"):
             _cp_overrides["fire_lift_car_size_mm"] = int(cp["fire_lift_car_size_mm"])
         if cp.get("fire_lobby_min_area_mm2"):
@@ -3377,14 +4219,42 @@ class RevitWorkers:
         if cp.get("min_corridor_width_mm"):
             _cp_overrides["min_corridor_width_mm"] = int(cp["min_corridor_width_mm"])
 
+        # Fire lift and lobby — nested keys (Gemini currently emits compliance_parameters
+        # as a nested object: fire_safety.fire_lift.car_size_mm etc.).
+        # Only apply if the flat key wasn't already set.
+        _fs_cp = cp.get("fire_safety_scdf", cp.get("fire_safety", {}))
+        _fl_cp = _fs_cp.get("fire_lift", {})
+        _fl_lb_cp = _fs_cp.get("fire_lift_lobby", {})
+        _sm_lb_cp = _fs_cp.get("smoke_stop_lobby", {})
+        _cor_cp = _fs_cp.get("corridor", {})
+        if not _cp_overrides.get("fire_lift_car_size_mm") and _fl_cp.get("car_size_mm"):
+            _cp_overrides["fire_lift_car_size_mm"] = int(_fl_cp["car_size_mm"])
+        if not _cp_overrides.get("fire_lobby_min_area_mm2") and _fl_lb_cp.get("min_area_mm2"):
+            _cp_overrides["fire_lobby_min_area_mm2"] = int(_fl_lb_cp["min_area_mm2"])
+        if not _cp_overrides.get("fire_lobby_min_width_mm") and _fl_lb_cp.get("min_width_mm"):
+            _cp_overrides["fire_lobby_min_width_mm"] = int(_fl_lb_cp["min_width_mm"])
+        if not _cp_overrides.get("fire_lobby_min_depth_mm") and _fl_lb_cp.get("min_depth_mm"):
+            _cp_overrides["fire_lobby_min_depth_mm"] = int(_fl_lb_cp["min_depth_mm"])
+        if not _cp_overrides.get("smoke_lobby_min_area_mm2") and _sm_lb_cp.get("min_area_mm2"):
+            _cp_overrides["smoke_lobby_min_area_mm2"] = int(_sm_lb_cp["min_area_mm2"])
+        if not _cp_overrides.get("smoke_lobby_min_depth_mm") and _sm_lb_cp.get("min_depth_mm"):
+            _cp_overrides["smoke_lobby_min_depth_mm"] = int(_sm_lb_cp["min_depth_mm"])
+        if not _cp_overrides.get("min_corridor_width_mm") and _cor_cp.get("min_corridor_width_mm"):
+            _cp_overrides["min_corridor_width_mm"] = int(_cor_cp["min_corridor_width_mm"])
+
         if _cp_overrides:
             self.log("[ComplianceOverride] Applying {} RAG-derived value(s) to engine: {}".format(
                 len(_cp_overrides), list(_cp_overrides.keys())))
 
-        # Door-side (entry) landing must clear the door swing: flight_width + 300 is the base,
-        # but the door-side needs at minimum 1000mm door + 1800mm clear = 2800mm.
-        stair_spec["entry_landing_width"] = max(_landing_width, 2800)
         self._stair_spec = stair_spec
+        self.log("[StairSpec] FINAL stair_spec: riser={} tread={} flight_w={} landing={} "
+                 "entry_landing={} num_risers={}".format(
+            stair_spec.get("riser", 150),
+            stair_spec.get("tread", 280),
+            stair_spec.get("width_of_flight", "?"),
+            stair_spec.get("landing_width", "?"),
+            stair_spec.get("entry_landing_width", "?"),
+            stair_spec.get("num_risers", "?")))
 
         # 4. Calculate Unified Layout
         # f_center_mm and _core_orientation were read from lifts_config above (step 2)
@@ -3396,6 +4266,9 @@ class RevitWorkers:
         # stair candidates never land outside the building on any floor.
         _stair_floor_dims = floor_dims  # _check_travel_distance uses footprint_pts polygon directly
         _fp_pts = shell.get("footprint_points")
+        # Normalise: Gemini may send [[outer_polygon], [hole]] instead of flat [[x,y],...].
+        if _fp_pts and _fp_pts[0] and isinstance(_fp_pts[0][0], (list, tuple)):
+            _fp_pts = _fp_pts[0]
         _offset_ovr = shell.get("footprint_offset_overrides", {})
         if _offset_ovr:
             try:
@@ -3424,6 +4297,15 @@ class RevitWorkers:
             f_center_mm[0] + layout_lifts["total_w"]/2,
             f_center_mm[1] + layout_lifts["total_d"]/2
         )
+        self.log("[CoreSetup] Single-bank: center=({:.0f},{:.0f}) num_lifts={} lobby_w={:.0f} "
+                 "lcb=({:.0f},{:.0f},{:.0f},{:.0f}) lcb_w={:.0f} lcb_d={:.0f} orient={}".format(
+            float(f_center_mm[0]), float(f_center_mm[1]),
+            num_lifts, float(lobby_w),
+            float(lift_core_bounds_mm[0]), float(lift_core_bounds_mm[1]),
+            float(lift_core_bounds_mm[2]), float(lift_core_bounds_mm[3]),
+            float(lift_core_bounds_mm[2] - lift_core_bounds_mm[0]),
+            float(lift_core_bounds_mm[3] - lift_core_bounds_mm[1]),
+            _core_orientation))
 
         safety_sets = fire_safety_logic.calculate_fire_safety_requirements(
             _stair_floor_dims, f_center_mm, lift_core_bounds_mm,
@@ -3433,6 +4315,10 @@ class RevitWorkers:
             footprint_holes=shell.get("footprint_holes", []),
             orientation=_core_orientation
         )
+        self.log("[CoreSetup] safety_sets returned: {} sets: {}".format(
+            len(safety_sets),
+            [(s["type"], "({:.0f},{:.0f})".format(float(s["pos"][0]), float(s["pos"][1])),
+              "perim={}".format(s.get("is_perimeter", False))) for s in safety_sets]))
 
         # For organic offset buildings (S-shape etc), drop any perimeter SMOKE_STOP
         # sets that fire_safety_logic may have added to satisfy the 60m travel rule.
@@ -3447,19 +4333,788 @@ class RevitWorkers:
                 self.log("[Core] Organic offset: dropped {} perimeter stair set(s) — using {} core-adjacent set(s)".format(
                     _before - len(safety_sets), len(safety_sets)))
 
+        # Cluster directive override: Gemini specifies which sides get fire clusters
+        # and the arrangement / staircase_rotation per cluster.  Engine computes all
+        # exact coordinates from side + lift_core_bounds_mm — no polygon arithmetic
+        # by Gemini, which eliminates the root cause of spatial coordinate errors.
+        _clusters = lifts_config.get("clusters", [])
+        if _clusters:
+            l_xmin_c, l_ymin_c, l_xmax_c, l_ymax_c = lift_core_bounds_mm
+            _cluster_sets = []
+            for _cl in _clusters:
+                _side = str(_cl.get("side", "south")).lower()
+                if _side == "south":
+                    _entry = (f_center_mm[0], l_ymin_c)
+                elif _side == "north":
+                    _entry = (f_center_mm[0], l_ymax_c)
+                elif _side == "east":
+                    _entry = (l_xmax_c, f_center_mm[1])
+                else:  # west
+                    _entry = (l_xmin_c, f_center_mm[1])
+                _cs = {"pos": _entry, "type": "FIRE_LIFT"}
+                if _cl.get("arrangement") is not None:
+                    _cs["arrangement"] = str(_cl["arrangement"]).lower()
+                if _cl.get("staircase_rotation") is not None:
+                    try:
+                        _cs["staircase_rotation"] = float(_cl["staircase_rotation"])
+                    except (TypeError, ValueError):
+                        pass
+                _cluster_sets.append(_cs)
+            safety_sets = _cluster_sets
+            self.log("[Core] Cluster directives: {} set(s) from lifts.clusters".format(len(_cluster_sets)))
+
         # 5. Build Manifest Data
         levels_manifest = []
         for i, elev_ft in enumerate(elevations):
             levels_manifest.append({"id": "AI Level {}".format(i+1), "elevation": elev_ft * 304.8})
 
+        # ── Phase 2: core_layout path ──────────────────────────────────────────
+        # If manifest contains core_layout.elements, Gemini specifies all spatial
+        # decisions. Engine validates RAG minimums, runs E1 polygon check, generates
+        # geometry from explicit footprints, and returns.  The existing
+        # calculate_fire_safety_requirements pipeline is skipped.
+        _core_layout = manifest.get("core_layout", {})
+        _cl_elements = _core_layout.get("elements", []) if _core_layout else []
+        if _cl_elements:
+            _fl_car     = int(_cp_overrides.get("fire_lift_car_size_mm", 2500))
+            _wall_t_cl  = 350
+            _fl_shaft_min   = _fl_car + 2 * _wall_t_cl
+            _fl_lb_area_min = int(_cp_overrides.get("fire_lobby_min_area_mm2", 6000000))
+            _fl_lb_dep_min  = int(_cp_overrides.get("fire_lobby_min_depth_mm", 2000))
+            _sm_area_min    = int(_cp_overrides.get("smoke_lobby_min_area_mm2", 4000000))
+            _sm_dep_min     = int(_cp_overrides.get("smoke_lobby_min_depth_mm", 2000))
+
+            for _el in _cl_elements:
+                _el_type = _el.get("type", "")
+                _el_id   = _el.get("id", "?")
+                if _el_type == "staircase":
+                    continue
+                _fp_el = _el.get("footprint", [])
+                if len(_fp_el) < 3:
+                    continue
+                _area_el  = _poly_area_mm2(_fp_el)
+                _xs_el    = [p[0] for p in _fp_el]
+                _ys_el    = [p[1] for p in _fp_el]
+                _min_dim_el = min(max(_xs_el) - min(_xs_el), max(_ys_el) - min(_ys_el))
+                if _el_type == "fire_lift_shaft":
+                    if _area_el < _fl_shaft_min ** 2 or _min_dim_el < _fl_shaft_min:
+                        return {"status": "CONFLICT", "description":
+                            "Element '{}' (fire_lift_shaft) fails RAG minimum: "
+                            "area={:.0f}mm2 (min={:.0f}), min_dim={:.0f}mm (min={}). "
+                            "Widen the footprint to at least {}x{}mm.".format(
+                                _el_id, _area_el, _fl_shaft_min**2, _min_dim_el, _fl_shaft_min,
+                                _fl_shaft_min, _fl_shaft_min)}
+                elif _el_type == "fire_lift_lobby":
+                    if _area_el < _fl_lb_area_min or _min_dim_el < _fl_lb_dep_min:
+                        return {"status": "CONFLICT", "description":
+                            "Element '{}' (fire_lift_lobby) fails RAG minimum: "
+                            "area={:.0f}mm2 (min={}), min_dim={:.0f}mm (min={}). "
+                            "Enlarge the footprint.".format(
+                                _el_id, _area_el, _fl_lb_area_min, _min_dim_el, _fl_lb_dep_min)}
+                elif _el_type == "smoke_stop_lobby":
+                    if _area_el < _sm_area_min or _min_dim_el < _sm_dep_min:
+                        return {"status": "CONFLICT", "description":
+                            "Element '{}' (smoke_stop_lobby) fails RAG minimum: "
+                            "area={:.0f}mm2 (min={}), min_dim={:.0f}mm (min={}). "
+                            "Enlarge the footprint.".format(
+                                _el_id, _area_el, _sm_area_min, _min_dim_el, _sm_dep_min)}
+
+            # E1: all element polygons must lie within the floor plate polygon
+            _fp_pts_cl = shell.get("footprint_points")
+            if _fp_pts_cl and len(_fp_pts_cl) >= 3:
+                from revit_mcp.staircase_logic import _point_in_polygon as _pip_cl
+                _fp_holes_cl = shell.get("footprint_holes", [])
+                _outside_cl = []
+                for _el in _cl_elements:
+                    _el_fp = _el.get("footprint") or []
+                    if not _el_fp:
+                        _c = _el.get("center", [0, 0])
+                        _sw_cl = staircase_logic.get_shaft_dimensions(typical_h_mm, stair_spec)[0]
+                        _sd_cl = staircase_logic.get_max_shaft_depth(levels_manifest, stair_spec, typical_h_mm)
+                        _el_fp = [[_c[0]-_sw_cl/2, _c[1]-_sd_cl/2], [_c[0]+_sw_cl/2, _c[1]-_sd_cl/2],
+                                  [_c[0]+_sw_cl/2, _c[1]+_sd_cl/2], [_c[0]-_sw_cl/2, _c[1]+_sd_cl/2]]
+                    for _pt in _el_fp:
+                        if not _pip_cl(_pt[0], _pt[1], _fp_pts_cl) or \
+                                any(_pip_cl(_pt[0], _pt[1], _h) for _h in _fp_holes_cl):
+                            _outside_cl.append(_el.get("id", "?"))
+                            break
+                if _outside_cl:
+                    return {"status": "CONFLICT", "description":
+                        "core_layout element(s) {} have vertices outside the floor plate polygon. "
+                        "Reposition all elements to lie fully within footprint_points and not inside "
+                        "any footprint_holes.".format(", ".join("'{}'".format(e) for e in _outside_cl))}
+
+            cl_man = fire_safety_logic.generate_core_layout_manifest(
+                _cl_elements, levels_manifest, stair_spec, typical_h_mm, _cp_overrides,
+                num_lifts=num_lifts, lobby_width=lobby_w)
+
+            self._door_data = list(cl_man.get("door_specs", []))
+
+            sub_bounds_cl = cl_man.get("sub_boundaries", [])
+            _excl = []
+            for _sb in sub_bounds_cl:
+                _r = _sb["rect"]
+                _excl.append((mm_to_ft(_r[0]), mm_to_ft(_r[1]), mm_to_ft(_r[2]), mm_to_ft(_r[3])))
+                self.spatial_registry.reserve(_sb["id"], (_r[0], _r[1], 0, _r[2], _r[3], typical_h_mm))
+            self._core_exclusion_zones = _excl
+            if _excl:
+                self._lift_core_bounds_ft = _excl[0]
+
+            if "walls" not in manifest: manifest["walls"] = []
+            if "floors" not in manifest: manifest["floors"] = []
+            manifest["walls"].extend(cl_man.get("walls", []))
+            manifest["floors"].extend(cl_man.get("floors", []))
+
+            u_voids_ft = [(mm_to_ft(v[0]), mm_to_ft(v[1]), mm_to_ft(v[2]), mm_to_ft(v[3]))
+                          for v in cl_man.get("voids", [])]
+            self._stair_voids = u_voids_ft
+            self._stair_void_polygons = []
+
+            _stair_els = [e for e in _cl_elements if e.get("type") == "staircase"]
+            _stair_pos = [(float(e["center"][0]), float(e["center"][1])) for e in _stair_els]
+            _sd_nat_cl = staircase_logic.get_max_shaft_depth(levels_manifest, stair_spec, typical_h_mm)
+            _stair_base_ys_cl = [float(e["center"][1]) - _sd_nat_cl / 2.0 for e in _stair_els]
+            _shaft_w_cl = staircase_logic.get_shaft_dimensions(typical_h_mm, stair_spec)[0]
+            self._stair_run_data = staircase_logic.get_stair_run_data(
+                _stair_pos, levels_manifest, _shaft_w_cl, stair_spec, typical_h_mm,
+                lift_core_bounds_mm=None, floor_dims_mm=floor_dims, num_lifts=0, lobby_width=lobby_w,
+                rotated_indices=[], base_y_overrides=(_stair_base_ys_cl if _stair_base_ys_cl else None)
+            ) if _stair_pos else []
+
+            self._stair_summary = {
+                "count": len(_stair_pos),
+                "riser": stair_spec.get("riser", 150),
+                "tread": stair_spec.get("tread", 280),
+                "typical_h": typical_h_mm,
+                "flights_typical": staircase_logic._calc_num_flights(typical_h_mm, typical_h_mm, 150),
+                "risers_per_flight": staircase_logic._risers_per_flight_typical(typical_h_mm, 150)
+            }
+
+            _bounds_ft_cl = None
+            for _sb in sub_bounds_cl:
+                _r = _sb["rect"]
+                _cb = (mm_to_ft(_r[0]), mm_to_ft(_r[1]), mm_to_ft(_r[2]), mm_to_ft(_r[3]))
+                _bounds_ft_cl = _cb if _bounds_ft_cl is None else (
+                    min(_bounds_ft_cl[0], _cb[0]), min(_bounds_ft_cl[1], _cb[1]),
+                    max(_bounds_ft_cl[2], _cb[2]), max(_bounds_ft_cl[3], _cb[3]))
+            return _bounds_ft_cl
+        # ── End Phase 2 core_layout path ───────────────────────────────────────
+
+        # ── Multi-bank path ────────────────────────────────────────────────────
+        # lifts.banks: list of independent passenger lift banks, each with its
+        # own position, count, rotation_deg, and optional clusters.
+        # If present, each bank gets its own fire cluster; results are merged.
+        # Backward compat: if banks absent, fall through to single-bank path.
+        _banks_cfg = lifts_config.get("banks", [])
+        if _banks_cfg:
+            import math as _bkm
+            _bk_all_voids_ft = []
+            _bk_all_void_polys = []
+            _bk_all_door_specs = []
+            _bk_all_stair_run_data = []
+            _bk_all_stair_centers_count = 0
+            _bk_bounds_ft = None
+            _bk_first_excl = None
+            _per_bank_walls = []        # collected per-bank for Fix-4 alignment
+            _per_bank_floors = []       # per-bank floors (deferred for alignment)
+            _per_bank_voids_mm = []     # per-bank voids in mm (deferred for alignment)
+            _per_bank_door_specs = []   # per-bank door specs (deferred for alignment)
+            _per_bank_stair_sc = []     # per-bank stair_centers tuples (deferred for alignment)
+            _per_bank_oc_list = []      # ortools_conflict dicts from each bank (for CONFLICT bubble-up)
+
+            if "walls" not in manifest: manifest["walls"] = []
+            if "floors" not in manifest: manifest["floors"] = []
+
+            for _bk_idx, _bk in enumerate(_banks_cfg):
+                _bk_pos = _bk.get("position", [0, 0])
+                _bk_cx = float(_bk_pos[0])
+                _bk_cy = float(_bk_pos[1])
+                # Apply SVG re-centring offset to each bank position (same as single-bank path)
+                _svg_off_bk = manifest.get("shell", {}).get("_svg_offset")
+                if _svg_off_bk and (_bk_cx != 0.0 or _bk_cy != 0.0):
+                    _bk_cx -= float(_svg_off_bk[0])
+                    _bk_cy -= float(_svg_off_bk[1])
+                    self.log("[SVG] Bank {} position adjusted by offset ({:.0f},{:.0f}) -> ({:.0f},{:.0f})".format(
+                        _bk_idx, float(_svg_off_bk[0]), float(_svg_off_bk[1]), _bk_cx, _bk_cy))
+                _bk_rot = float(_bk.get("rotation_deg", 0.0))
+                _bk_n = int(safe_num(_bk.get("count", max(1, num_lifts // max(len(_banks_cfg), 1))), 1))
+                _bk_clusters = _bk.get("clusters", [])
+                # Per-bank orientation: bank can override the top-level orientation
+                _bk_raw_orient = str(_bk.get("orientation", _core_orientation)).upper()
+                if _bk_raw_orient not in ("NS", "EW", "AUTO"):
+                    _bk_raw_orient = _core_orientation
+                _bk_orientation = _bk_raw_orient
+
+                _bk_layout = lift_logic.get_total_core_layout(_bk_n, lobby_width=lobby_w)
+                _bk_lcb = (
+                    _bk_cx - _bk_layout["total_w"] / 2.0,
+                    _bk_cy - _bk_layout["total_d"] / 2.0,
+                    _bk_cx + _bk_layout["total_w"] / 2.0,
+                    _bk_cy + _bk_layout["total_d"] / 2.0,
+                )
+                self.log("[BankSetup] Bank {}: center=({:.0f},{:.0f}) n={} orient={} "
+                         "lcb=({:.0f},{:.0f},{:.0f},{:.0f}) lcb_w={:.0f} lcb_d={:.0f} "
+                         "total_w={:.0f} total_d={:.0f}".format(
+                    _bk_idx, _bk_cx, _bk_cy, _bk_n, _bk_orientation,
+                    _bk_lcb[0], _bk_lcb[1], _bk_lcb[2], _bk_lcb[3],
+                    _bk_lcb[2] - _bk_lcb[0], _bk_lcb[3] - _bk_lcb[1],
+                    float(_bk_layout["total_w"]), float(_bk_layout["total_d"])))
+
+                _bk_sets = fire_safety_logic.calculate_fire_safety_requirements(
+                    _stair_floor_dims, [_bk_cx, _bk_cy], _bk_lcb,
+                    typical_h_mm, preset_fs, _bk_n, lobby_w,
+                    compliance_overrides=_cp_overrides,
+                    footprint_pts=_fp_pts,
+                    footprint_holes=shell.get("footprint_holes", []),
+                    orientation=_bk_orientation,
+                    num_banks=len(_banks_cfg)
+                )
+                if _offset_ovr:
+                    _bk_sets = [s for s in _bk_sets if not s.get("is_perimeter", False)]
+                self.log("[BankSetup] Bank {} sets ({}): {}".format(
+                    _bk_idx, len(_bk_sets),
+                    [(s["type"], "({:.0f},{:.0f})".format(float(s["pos"][0]), float(s["pos"][1])),
+                      "perim={}".format(s.get("is_perimeter", False))) for s in _bk_sets]))
+
+                # Cluster directive override per bank
+                # For EW banks: Gemini often sends NS sides ("south"/"north") which is
+                # incorrect — EW clusters must be at "east"/"west". If all provided
+                # cluster sides are NS-only for an EW bank, ignore the directive and
+                # use the engine-computed sets (which already place fire lifts EW).
+                _ew_bank = (_bk_orientation == "EW")
+                _cluster_has_ew = any(
+                    str(_cl.get("side", "")).lower() in ("east", "west")
+                    for _cl in _bk_clusters
+                ) if _bk_clusters else False
+                _skip_cluster_override = _ew_bank and _bk_clusters and not _cluster_has_ew
+                if _bk_clusters and not _skip_cluster_override:
+                    l_xmin_b, l_ymin_b, l_xmax_b, l_ymax_b = _bk_lcb
+                    _bk_cs = []
+                    for _cl in _bk_clusters:
+                        _side = str(_cl.get("side", "south")).lower()
+                        if _side == "south":
+                            _e = (_bk_cx, l_ymin_b)
+                        elif _side == "north":
+                            _e = (_bk_cx, l_ymax_b)
+                        elif _side == "east":
+                            _e = (l_xmax_b, _bk_cy)
+                        else:
+                            _e = (l_xmin_b, _bk_cy)
+                        _d = {"pos": _e, "type": "FIRE_LIFT"}
+                        if _cl.get("arrangement") is not None:
+                            _d["arrangement"] = str(_cl["arrangement"]).lower()
+                        if _cl.get("staircase_rotation") is not None:
+                            try:
+                                _d["staircase_rotation"] = float(_cl["staircase_rotation"])
+                            except (TypeError, ValueError):
+                                pass
+                        _bk_cs.append(_d)
+                    _bk_sets = _bk_cs
+                elif _skip_cluster_override:
+                    self.log("[MultiBank] Bank {}: EW bank with NS-only clusters — ignoring cluster directive, using engine-computed EW sets ({} sets).".format(
+                        _bk_idx, len(_bk_sets)))
+
+                # topology_graph may be on the bank dict OR on the parent lifts_config
+                _bk_topo = _bk.get("topology_graph") or lifts_config.get("topology_graph")
+                self.log("[MultiBank] Bank {}: {} lifts @ ({:.0f},{:.0f}) orient={} rot={:.1f}deg, {} cluster(s), topology_graph={}".format(
+                    _bk_idx, _bk_n, _bk_cx, _bk_cy, _bk_orientation, _bk_rot, len(_bk_sets),
+                    "YES ({} rules)".format(len(_bk_topo)) if _bk_topo else "NO"))
+
+                # Always pass the bank dict to the solver so auto-inject can fire.
+                # When topology_graph is absent, generate_fire_safety_manifest
+                # injects the standard topology from orientation automatically.
+                _bk_for_solver = dict(_bk)
+                if _bk_topo:
+                    _bk_for_solver["topology_graph"] = _bk_topo
+
+                _bk_fs = fire_safety_logic.generate_fire_safety_manifest(
+                    _bk_sets, levels_manifest, stair_spec, typical_h_mm, preset_fs,
+                    _bk_lcb, _bk_n, lobby_w,
+                    compliance_overrides=_cp_overrides,
+                    footprint_pts=shell.get("footprint_points"),
+                    footprint_holes=_normalise_footprint_holes(shell.get("footprint_holes", [])),
+                    all_floor_dims=floor_dims,
+                    manifest_lifts=_bk_for_solver,
+                    center_pos=(_bk_cx, _bk_cy),
+                )
+                if isinstance(_bk_fs, dict) and _bk_fs.get("status") == "CONFLICT":
+                    self.log("[BankSetup] Bank {} generate_fire_safety_manifest → CONFLICT: {}".format(
+                        _bk_idx, _bk_fs.get("description", "")))
+                    _bk_fs.setdefault("manifest_inputs", {
+                        "lift_count": _bk_n,
+                        "bank_index": _bk_idx,
+                        "shell_width_mm": round(safe_num(manifest.get("shell", {}).get("width", 0), 0)),
+                        "shell_length_mm": round(safe_num(manifest.get("shell", {}).get("length", 0), 0)),
+                        "level_height_mm": round(typical_h_mm),
+                    })
+                    # Promote ortools_conflict.failure_details → ortools_failure_details so
+                    # dispatcher.py can include per-bank clearance info in the Gemini retry prompt.
+                    _oc = _bk_fs.get("ortools_conflict", {}) or {}
+                    if _oc.get("failure_details") and "ortools_failure_details" not in _bk_fs:
+                        _bk_fs["ortools_failure_details"] = _oc["failure_details"]
+                    return _bk_fs
+                self.log("[BankSetup] Bank {} manifest: walls={} floors={} door_specs={} voids={}".format(
+                    _bk_idx,
+                    len(_bk_fs.get("walls", [])),
+                    len(_bk_fs.get("floors", [])),
+                    len(_bk_fs.get("door_specs", [])),
+                    len(_bk_fs.get("voids", []))))
+
+                # Fix B: prefix all element IDs so each bank's walls have unique Revit IDs.
+                # Both banks follow the single-bank path in fire_safety_logic which emits
+                # identical IDs (e.g. AI_FireLobby_North__Level_1__W_N). Without a prefix
+                # the sync engine treats them as the same element and moves rather than
+                # creates, leaving only one bank with visible walls.
+                _bk_pfx = "B{}_".format(_bk_idx)
+                for _w in _bk_fs.get("walls", []):
+                    if _w.get("id", "").startswith("AI_"):
+                        _w["id"] = "AI_" + _bk_pfx + _w["id"][3:]
+                for _f in _bk_fs.get("floors", []):
+                    if _f.get("id", "").startswith("AI_"):
+                        _f["id"] = "AI_" + _bk_pfx + _f["id"][3:]
+                for _ds in _bk_fs.get("door_specs", []):
+                    # Prefix door id so each bank's doors are unique — avoids duplicate
+                    # placement when two banks have the same safety-set tag (e.g. SafetySet_1).
+                    if _ds.get("id"):
+                        _ds["id"] = _bk_pfx + _ds["id"]
+                    if _ds.get("wall_ai_id", "").startswith("AI_"):
+                        _ds["wall_ai_id"] = "AI_" + _bk_pfx + _ds["wall_ai_id"][3:]
+                    _aiid_map = _ds.get("wall_ai_id_map")
+                    if _aiid_map:
+                        _ds["wall_ai_id_map"] = {
+                            _lvl: ("AI_" + _bk_pfx + _v[3:] if _v.startswith("AI_") else _v)
+                            for _lvl, _v in _aiid_map.items()
+                        }
+
+                _bk_walls = list(_bk_fs.get("walls", []))
+                _bk_floors = list(_bk_fs.get("floors", []))
+
+                # Add passenger-lift shaft walls when the hardcoded path ran.
+                # The generative solver path generates passenger-lift walls internally via
+                # generate_lift_shaft_from_polygon, so only add them here when no topology
+                # graph was present (hardcoded path).  EW banks now always use the hardcoded
+                # path regardless of _bk_for_solver, so use _bk_topo as the indicator.
+                # flip_rows: smaller lift row goes to whichever side the staircase is on.
+                # fire_set_attach_sides[0] is the primary cluster's attach side.
+                # side=S → staircase below → smaller row south → flip_rows=True
+                # side=N → staircase above → smaller row north → flip_rows=False
+                _bk_attach_sides = _bk_fs.get("fire_set_attach_sides", [])
+                _bk_flip = bool(_bk_attach_sides and _bk_attach_sides[0] == "S")
+                self.log("[MultiBank] Bank {}: primary attach_side={} flip_rows={}".format(
+                    _bk_idx,
+                    _bk_attach_sides[0] if _bk_attach_sides else "?",
+                    _bk_flip))
+
+                if not _bk_topo:
+                    try:
+                        _bk_psgr = lift_logic.generate_lift_shaft_manifest(
+                            _bk_n, levels_manifest,
+                            center_pos=(_bk_cx, _bk_cy),
+                            lobby_width=lobby_w,
+                            flip_rows=_bk_flip,
+                        )
+                        for _w in _bk_psgr.get("walls", []):
+                            if _w.get("id", "").startswith("AI_"):
+                                _w["id"] = "AI_" + _bk_pfx + _w["id"][3:]
+                        for _f in _bk_psgr.get("floors", []):
+                            if _f.get("id", "").startswith("AI_"):
+                                _f["id"] = "AI_" + _bk_pfx + _f["id"][3:]
+                        _bk_walls.extend(_bk_psgr.get("walls", []))
+                        _bk_floors.extend(_bk_psgr.get("floors", []))
+                    except Exception as _bk_pe:
+                        self.log("[MultiBank] Bank {} psgr shaft failed (non-fatal): {}".format(_bk_idx, _bk_pe))
+
+                _bk_voids_mm = list(_bk_fs.get("voids", []))
+                try:
+                    _bk_voids_mm.extend(lift_logic.get_shaft_void_rectangles_mm(
+                        _bk_n, center_pos=(_bk_cx, _bk_cy), lobby_width=lobby_w,
+                        flip_rows=_bk_flip))
+                except Exception as _bk_ve:
+                    self.log("[MultiBank] Bank {} void rects failed (non-fatal): {}".format(_bk_idx, _bk_ve))
+
+                # Apply per-bank rotation
+                if _bk_rot:
+                    _bk_rad = _bkm.radians(_bk_rot)
+                    _bk_cos = _bkm.cos(_bk_rad)
+                    _bk_sin = _bkm.sin(_bk_rad)
+
+                    def _bk_rot_mm(x, y, cx=_bk_cx, cy=_bk_cy, c=_bk_cos, s=_bk_sin):
+                        dx = x - cx; dy = y - cy
+                        return (cx + dx * c - dy * s, cy + dx * s + dy * c)
+
+                    for _w in _bk_walls:
+                        if "start" in _w:
+                            _nx, _ny = _bk_rot_mm(_w["start"][0], _w["start"][1])
+                            _w["start"] = [_nx, _ny, _w["start"][2]]
+                        if "end" in _w:
+                            _nx, _ny = _bk_rot_mm(_w["end"][0], _w["end"][1])
+                            _w["end"] = [_nx, _ny, _w["end"][2]]
+
+                    for _f in _bk_floors:
+                        if "points" in _f:
+                            _f["points"] = [list(_bk_rot_mm(p[0], p[1])) for p in _f["points"]]
+
+                    _bk_cx_ft = mm_to_ft(_bk_cx)
+                    _bk_cy_ft = mm_to_ft(_bk_cy)
+                    def _bk_rot_ft(x, y, cx=_bk_cx_ft, cy=_bk_cy_ft, c=_bk_cos, s=_bk_sin):
+                        dx = x - cx; dy = y - cy
+                        return (cx + dx * c - dy * s, cy + dx * s + dy * c)
+                    # Also rotate the voids in mm so BankAlign shift (if any) is applied before ft conversion
+                    _bk_voids_mm_rotated = []
+                    for (vx1, vy1, vx2, vy2) in _bk_voids_mm:
+                        rx1, ry1 = _bk_rot_ft(mm_to_ft(vx1), mm_to_ft(vy1))
+                        rx2, ry2 = _bk_rot_ft(mm_to_ft(vx2), mm_to_ft(vy1))
+                        rx3, ry3 = _bk_rot_ft(mm_to_ft(vx2), mm_to_ft(vy2))
+                        rx4, ry4 = _bk_rot_ft(mm_to_ft(vx1), mm_to_ft(vy2))
+                        _bk_voids_mm_rotated.append(("rotated_ft", rx1, ry1, rx2, ry2, rx3, ry3, rx4, ry4))
+                    _bk_voids_mm = _bk_voids_mm_rotated
+
+                _per_bank_walls.append(list(_bk_walls))
+                _per_bank_floors.append(list(_bk_floors))
+
+                _bk_door_specs_this = list(_bk_fs.get("door_specs", []))
+                try:
+                    _pax_door_raw = lift_logic.get_passenger_lift_door_positions(
+                        _bk_n, center_pos=(_bk_cx, _bk_cy),
+                        lobby_width=lobby_w, levels_data=levels_manifest,
+                        flip_rows=_bk_flip)
+                    _bank_wall_pfx = "B{}_".format(_bk_idx)
+                    for _pd in _pax_door_raw:
+                        _pid = _pd.get("id", "")
+                        if _pid.startswith("AI_"):
+                            _pd["id"] = "AI_B{}_".format(_bk_idx) + _pid[3:]
+                        # Fix wall_ai_id_map: prefix every wall ID with the bank tag
+                        # so it matches the IDs registered by fire_safety_logic
+                        if "wall_ai_id_map" in _pd:
+                            _pd["wall_ai_id_map"] = {
+                                lvl_id: ("AI_" + _bank_wall_pfx + wid[3:])
+                                        if wid.startswith("AI_") else wid
+                                for lvl_id, wid in _pd["wall_ai_id_map"].items()
+                            }
+                    _bk_door_specs_this.extend(_pax_door_raw)
+                except Exception:
+                    pass
+                _per_bank_door_specs.append(_bk_door_specs_this)
+                _per_bank_voids_mm.append(list(_bk_voids_mm))
+
+                # Spatial reservation + column exclusion
+                _bk_sub = _bk_fs.get("sub_boundaries", [])
+                _bk_excl = [(mm_to_ft(_bk_lcb[0]), mm_to_ft(_bk_lcb[1]),
+                              mm_to_ft(_bk_lcb[2]), mm_to_ft(_bk_lcb[3]))]
+                for _sb in _bk_sub:
+                    _r = _sb["rect"]
+                    _bk_excl.append((mm_to_ft(_r[0]), mm_to_ft(_r[1]),
+                                     mm_to_ft(_r[2]), mm_to_ft(_r[3])))
+                    self.spatial_registry.reserve(_sb["id"], (_r[0], _r[1], 0, _r[2], _r[3], typical_h_mm))
+                for cb in _bk_fs.get("core_bounds", []):
+                    cb_ft = (mm_to_ft(cb[0]), mm_to_ft(cb[1]), mm_to_ft(cb[2]), mm_to_ft(cb[3]))
+                    if cb_ft not in _bk_excl:
+                        _bk_excl.append(cb_ft)
+
+                if _bk_first_excl is None:
+                    _bk_first_excl = _bk_excl[0] if _bk_excl else None
+
+                # Union bounds across banks
+                for _cb in _bk_fs.get("core_bounds", []):
+                    _cb_ft = (mm_to_ft(_cb[0]), mm_to_ft(_cb[1]),
+                               mm_to_ft(_cb[2]), mm_to_ft(_cb[3]))
+                    if _bk_bounds_ft is None:
+                        _bk_bounds_ft = _cb_ft
+                    else:
+                        _bk_bounds_ft = (
+                            min(_bk_bounds_ft[0], _cb_ft[0]), min(_bk_bounds_ft[1], _cb_ft[1]),
+                            max(_bk_bounds_ft[2], _cb_ft[2]), max(_bk_bounds_ft[3], _cb_ft[3]))
+
+                # Collect stair center tuples for deferred stair-run-data computation
+                _bk_sc = _bk_fs.get("stair_centers", [])
+                _bk_all_stair_centers_count += len(_bk_sc)
+                self.log("[MultiBank] Bank {} fire_safety result: walls={} floors={} voids={} stair_centers={} door_specs={}".format(
+                    _bk_idx, len(_bk_fs.get("walls", [])), len(_bk_fs.get("floors", [])),
+                    len(_bk_fs.get("voids", [])), len(_bk_sc), len(_bk_fs.get("door_specs", []))))
+                self.log("[MultiBank] Bank {} stair_centers: {}".format(_bk_idx, _bk_sc))
+                if _bk_fs.get("ortools_conflict"):
+                    _per_bank_oc_list.append(_bk_fs["ortools_conflict"])
+                _per_bank_stair_sc.append({
+                    "sc": _bk_sc,
+                    "overrides": _bk_fs.get("stair_overrides", []),
+                    "rot": _bk_rot, "cx": _bk_cx, "cy": _bk_cy,
+                    "n": _bk_n, "lcb": _bk_lcb,
+                })
+
+            # Fix 4: within each X-collocated group of banks (same arm), align their
+            # west (min-x) faces so staircase walls stay flush with stair flights.
+            # Banks on different arms (|cx difference| > 5000mm) must NOT be shifted
+            # relative to each other — doing so moves an entire arm's core onto another arm.
+            # Also skip banks on different Y rows (e.g. courtyard north/south bands) —
+            # those are independent arms and aligning their X faces is wrong.
+            if len(_per_bank_walls) >= 2:
+                # Group banks by rounded X centre (5000mm tolerance = same arm)
+                _bk_cx_list = [_per_bank_stair_sc[_bi]["cx"] for _bi in range(len(_per_bank_walls))]
+                _bk_cy_list = [_per_bank_stair_sc[_bi]["cy"] for _bi in range(len(_per_bank_walls))]
+                _bk_x1s = []
+                for _bk_wls in _per_bank_walls:
+                    xs = [w["start"][0] for w in _bk_wls if w.get("start")]
+                    _bk_x1s.append(min(xs) if xs else float("inf"))
+
+                # Build groups: banks are in the same group if |cx_i - cx_j| <= 5000mm
+                # AND their Y centres are within 5000mm (same horizontal row of banks).
+                # Courtyard buildings have north+south banks with very different cy values —
+                # those must NOT be aligned (they are on separate arms; aligning their X
+                # faces would shift one bank laterally, misaligning it from its OR-Tools solution).
+                _visited = set()
+                _align_groups = []
+                for _bi in range(len(_per_bank_walls)):
+                    if _bi in _visited: continue
+                    _grp = [_bi]
+                    _visited.add(_bi)
+                    for _bj in range(_bi + 1, len(_per_bank_walls)):
+                        if _bj not in _visited and abs(_bk_cx_list[_bi] - _bk_cx_list[_bj]) <= 5000 and abs(_bk_cy_list[_bi] - _bk_cy_list[_bj]) <= 5000:
+                            _grp.append(_bj)
+                            _visited.add(_bj)
+                    _align_groups.append(_grp)
+
+                for _grp in _align_groups:
+                    if len(_grp) < 2:
+                        continue  # single bank in its arm — nothing to align
+                    _grp_x1s = [_bk_x1s[_bi] for _bi in _grp]
+                    _grp_finite = [x for x in _grp_x1s if x != float("inf")]
+                    if len(_grp_finite) < 2:
+                        continue
+                    _target_x1 = max(_grp_finite)
+                    for _bidx in _grp:
+                        _bx1 = _bk_x1s[_bidx]
+                        dx_al = _target_x1 - _bx1
+                        if abs(dx_al) <= 1 or _bx1 == float("inf"):
+                            continue
+                        # Shift walls
+                        for _w in _per_bank_walls[_bidx]:
+                            if _w.get("start"): _w["start"][0] += dx_al
+                            if _w.get("end"):   _w["end"][0]   += dx_al
+                        # Shift floors
+                        for _f in _per_bank_floors[_bidx]:
+                            if "points" in _f:
+                                _f["points"] = [[p[0] + dx_al, p[1]] for p in _f["points"]]
+                        # Shift voids (non-rotated banks use mm rects; rotated use pre-converted ft corners)
+                        _shifted_voids = []
+                        for _vv in _per_bank_voids_mm[_bidx]:
+                            if isinstance(_vv, tuple) and len(_vv) == 9 and _vv[0] == "rotated_ft":
+                                _shifted_voids.append(_vv)  # rotated voids already in ft; skip mm shift
+                            else:
+                                _vx1, _vy1, _vx2, _vy2 = _vv
+                                _shifted_voids.append((_vx1 + dx_al, _vy1, _vx2 + dx_al, _vy2))
+                        _per_bank_voids_mm[_bidx] = _shifted_voids
+                        # Shift door positions
+                        for _ds in _per_bank_door_specs[_bidx]:
+                            _pm = _ds.get("position_mm")
+                            if _pm and len(_pm) >= 2: _pm[0] += dx_al
+                            for _wl in (_ds.get("wall_line_mm") or []):
+                                if len(_wl) >= 2: _wl[0] += dx_al
+                        # Shift stair centre X
+                        _pbs = _per_bank_stair_sc[_bidx]
+                        _pbs["sc"] = [
+                            (sc[0] + dx_al, sc[1], sc[2], sc[3] if len(sc) > 3 else None)
+                            for sc in _pbs["sc"]
+                        ]
+                        # Shift lift core bounds X so staircase geometry anchors to the shifted bank
+                        _old_lcb = _pbs.get("lcb")
+                        if _old_lcb:
+                            _pbs["lcb"] = [
+                                _old_lcb[0] + dx_al, _old_lcb[1],
+                                _old_lcb[2] + dx_al, _old_lcb[3],
+                            ]
+                        # base_y_overrides are Y-values — no X shift needed
+                        self.log("[BankAlign] Bank {}: x-aligned {:.0f}mm east within arm-group (walls+floors+voids+doors+stairs+lcb)".format(_bidx, dx_al))
+
+            # Now merge all per-bank data into combined lists
+            for _bk_wls in _per_bank_walls:
+                manifest["walls"].extend(_bk_wls)
+            for _bk_fls in _per_bank_floors:
+                manifest["floors"].extend(_bk_fls)
+            for _bk_ds in _per_bank_door_specs:
+                _bk_all_door_specs.extend(_bk_ds)
+            for _bidx2, _pbs in enumerate(_per_bank_stair_sc):
+                _bk_sc2   = _pbs["sc"]
+                _bk_rot2  = _pbs["rot"]
+                _bk_cx2   = _pbs["cx"]
+                _bk_cy2   = _pbs["cy"]
+                _bk_n2    = _pbs["n"]
+                _bk_lcb2  = _pbs["lcb"]
+                _bk_stair_pos2    = [(sc[0], sc[1]) for sc in _bk_sc2] if _bk_sc2 else []
+                _bk_rotated_idx2  = [idx for idx, sc in enumerate(_bk_sc2) if sc[2]] if _bk_sc2 else []
+                _bk_stair_ovr2    = _pbs["overrides"]
+                if _bk_stair_pos2:
+                    _bk_sw2 = staircase_logic.get_shaft_dimensions(typical_h_mm, stair_spec)[0]
+                    _bk_sc_rot_degs2 = [sc[3] if len(sc) > 3 else None for sc in _bk_sc2]
+                    _bk_rd2 = staircase_logic.get_stair_run_data(
+                        _bk_stair_pos2, levels_manifest, _bk_sw2, stair_spec, typical_h_mm,
+                        lift_core_bounds_mm=(_bk_lcb2 if not _bk_rot2 else None),
+                        floor_dims_mm=floor_dims, num_lifts=(_bk_n2 if not _bk_rot2 else 0),
+                        lobby_width=lobby_w,
+                        rotated_indices=_bk_rotated_idx2,
+                        base_y_overrides=(_bk_stair_ovr2 if _bk_stair_ovr2 else None),
+                        rotation_degs=_bk_sc_rot_degs2,
+                    )
+                    if _bk_rot2:
+                        _bk_rad_st2 = _bkm.radians(_bk_rot2)
+                        for _rd2 in _bk_rd2:
+                            _rd2['_global_rotation_rad'] = _bk_rad_st2
+                            _rd2['_rotation_cx_ft'] = mm_to_ft(_bk_cx2)
+                            _rd2['_rotation_cy_ft'] = mm_to_ft(_bk_cy2)
+                    _bk_all_stair_run_data.extend(_bk_rd2)
+            # Convert voids to ft and build void polys.
+            # Rotated banks stored pre-rotated corners as ("rotated_ft", rx1,ry1,...,rx4,ry4).
+            # Non-rotated banks stored plain (vx1,vy1,vx2,vy2) mm rectangles.
+            for _bk_voids2 in _per_bank_voids_mm:
+                for _v in _bk_voids2:
+                    if isinstance(_v, tuple) and len(_v) == 9 and _v[0] == "rotated_ft":
+                        _, rx1, ry1, rx2, ry2, rx3, ry3, rx4, ry4 = _v
+                        _corners2 = [(rx1, ry1), (rx2, ry2), (rx3, ry3), (rx4, ry4)]
+                        _bk_all_void_polys.append(_corners2)
+                        _xs2 = [p[0] for p in _corners2]; _ys2 = [p[1] for p in _corners2]
+                        _bk_all_voids_ft.append((min(_xs2), min(_ys2), max(_xs2), max(_ys2)))
+                    else:
+                        vx1, vy1, vx2, vy2 = _v
+                        _bk_all_voids_ft.append((mm_to_ft(vx1), mm_to_ft(vy1), mm_to_ft(vx2), mm_to_ft(vy2)))
+
+            # Commit multi-bank results
+            self._stair_voids = _bk_all_voids_ft
+            self._stair_void_polygons = _bk_all_void_polys
+            self._door_data = _bk_all_door_specs
+            self._stair_run_data = _bk_all_stair_run_data
+            self._core_exclusion_zones = []
+            # Rebuild combined exclusion list across all banks
+            for _bk2_idx, _bk2 in enumerate(_banks_cfg):
+                _bk2_pos = _bk2.get("position", [0, 0])
+                _bk2_cx = float(_bk2_pos[0]); _bk2_cy = float(_bk2_pos[1])
+                _svg_off_bk2 = manifest.get("shell", {}).get("_svg_offset")
+                if _svg_off_bk2 and (_bk2_cx != 0.0 or _bk2_cy != 0.0):
+                    _bk2_cx -= float(_svg_off_bk2[0])
+                    _bk2_cy -= float(_svg_off_bk2[1])
+                _bk2_n = int(safe_num(_bk2.get("count", max(1, num_lifts // max(len(_banks_cfg), 1))), 1))
+                _bk2_layout = lift_logic.get_total_core_layout(_bk2_n, lobby_width=lobby_w)
+                _bk2_lcb = (
+                    _bk2_cx - _bk2_layout["total_w"] / 2.0,
+                    _bk2_cy - _bk2_layout["total_d"] / 2.0,
+                    _bk2_cx + _bk2_layout["total_w"] / 2.0,
+                    _bk2_cy + _bk2_layout["total_d"] / 2.0,
+                )
+                self._core_exclusion_zones.append((
+                    mm_to_ft(_bk2_lcb[0]), mm_to_ft(_bk2_lcb[1]),
+                    mm_to_ft(_bk2_lcb[2]), mm_to_ft(_bk2_lcb[3])
+                ))
+            if _bk_first_excl is not None:
+                self._lift_core_bounds_ft = _bk_first_excl
+            self._stair_summary = {
+                "count": _bk_all_stair_centers_count,
+                "riser": stair_spec.get("riser", 150),
+                "tread": stair_spec.get("tread", 280),
+                "typical_h": typical_h_mm,
+                "flights_typical": staircase_logic._calc_num_flights(typical_h_mm, typical_h_mm, 150),
+                "risers_per_flight": staircase_logic._risers_per_flight_typical(typical_h_mm, 150)
+            }
+            self.log("[MultiBank] {} bank(s) complete: {} stair runs, {} voids".format(
+                len(_banks_cfg), len(_bk_all_stair_run_data), len(_bk_all_voids_ft)))
+            # If every bank produced 0 walls because OR-Tools + hardcoded both failed,
+            # bubble up a CONFLICT so the dispatcher retries instead of saving silently.
+            if _per_bank_oc_list:
+                _total_walls = sum(len(w) for w in _per_bank_walls)
+                if _total_walls == 0:
+                    _merged_oc = {
+                        "min_core_w":       max(oc["min_core_w"] for oc in _per_bank_oc_list),
+                        "min_core_d":       max(oc["min_core_d"] for oc in _per_bank_oc_list),
+                        "failed_set_count": sum(oc.get("failed_set_count", 0) for oc in _per_bank_oc_list),
+                        "failure_details":  [fd for oc in _per_bank_oc_list
+                                             for fd in oc.get("failure_details", [])],
+                    }
+                    _shell_w = round(safe_num(manifest.get("shell", {}).get("width",  0), 0))
+                    _shell_l = round(safe_num(manifest.get("shell", {}).get("length", 0), 0))
+                    _core_w  = _merged_oc["min_core_w"]
+                    _core_d  = _merged_oc["min_core_d"]
+                    _fp_pts  = manifest.get("shell", {}).get("footprint_points") or []
+                    _narrow  = None
+                    if _fp_pts:
+                        try:
+                            _xs = [p[0] for p in _fp_pts]; _ys = [p[1] for p in _fp_pts]
+                            _narrow = int(min(max(_xs) - min(_xs), max(_ys) - min(_ys)))
+                        except Exception:
+                            pass
+                    _narrow_note = (
+                        " Narrowest footprint span: {:,}mm (arm too narrow — must be ≥{:,}mm).".format(
+                            _narrow, _core_w)
+                        if (_narrow and _narrow < _core_w) else ""
+                    )
+                    self.log("[MultiBank] All banks produced 0 walls — returning CONFLICT for retry.")
+                    return {
+                        "status":  "CONFLICT",
+                        "type":    "ORTOOLS_INFEASIBLE",
+                        "description": (
+                            "OR-Tools could not fit the fire safety core ({} cluster(s)) in any bank "
+                            "within the given footprint. Minimum core envelope: {:,}×{:,}mm. "
+                            "Shell bounding box: {:,}×{:,}mm.{}"
+                            .format(_merged_oc["failed_set_count"], _core_w, _core_d,
+                                    _shell_w, _shell_l, _narrow_note)
+                        ),
+                        "core_layout_summary": "  total core envelope (min)  {:>6} x {:>5} mm\n".format(
+                            _core_w, _core_d),
+                        "core_total_mm":   {"width": _core_w, "depth": _core_d},
+                        "manifest_inputs": {
+                            "lift_count":      num_lifts,
+                            "shell_width_mm":  _shell_w,
+                            "shell_length_mm": _shell_l,
+                            "level_height_mm": round(typical_h_mm),
+                        },
+                        "resolution_hints": [
+                            "Minimum core width needed: {:,}mm.".format(_core_w),
+                            "Minimum core depth needed: {:,}mm.".format(_core_d),
+                            "Consider widening the arm, reducing lift count, or changing orientation.",
+                        ],
+                        "ortools_failure_details": _merged_oc["failure_details"],
+                    }
+            return _bk_bounds_ft
+        # ── End multi-bank path ────────────────────────────────────────────────
+
+        # When 2 fire clusters exist and lift count is odd, round UP to even so both
+        # staircase sides see equal lift counts (floor(n/2) == ceil(n/2)).
+        # Example: 5 lifts → 6 lifts (3+3). Both staircases see 3. Symmetric.
+        _non_perim_count = sum(
+            1 for s in safety_sets
+            if not s.get("is_perimeter") and s.get("type") == "FIRE_LIFT"
+        )
+        _eff_lifts = num_lifts
+        if _non_perim_count == 2 and num_lifts >= 4 and num_lifts % 2 != 0:
+            _eff_lifts = num_lifts + 1
+            self.log("[CoreSetup] 2 fire clusters + odd lift count ({}) → rounding to {} for symmetric split".format(
+                num_lifts, _eff_lifts))
+            # Recompute lift_core_bounds_mm with the adjusted count
+            _layout_eff = lift_logic.get_total_core_layout(_eff_lifts, lobby_width=lobby_w)
+            lift_core_bounds_mm = (
+                f_center_mm[0] - _layout_eff["total_w"] / 2,
+                f_center_mm[1] - _layout_eff["total_d"] / 2,
+                f_center_mm[0] + _layout_eff["total_w"] / 2,
+                f_center_mm[1] + _layout_eff["total_d"] / 2,
+            )
+
+        self.log("[CoreSetup] Single-bank generate_fire_safety_manifest: "
+                 "sets={} stair_spec riser={} flight_w={} entry_landing={} "
+                 "lcb=({:.0f},{:.0f},{:.0f},{:.0f}) num_lifts={} lobby_w={:.0f}".format(
+            len(safety_sets),
+            stair_spec.get("riser", 150), stair_spec.get("width_of_flight", "?"),
+            stair_spec.get("entry_landing_width", "?"),
+            float(lift_core_bounds_mm[0]), float(lift_core_bounds_mm[1]),
+            float(lift_core_bounds_mm[2]), float(lift_core_bounds_mm[3]),
+            _eff_lifts, float(lobby_w)))
         unified_man = fire_safety_logic.generate_fire_safety_manifest(
             safety_sets, levels_manifest, stair_spec, typical_h_mm, preset_fs,
-            lift_core_bounds_mm, num_lifts, lobby_w,
+            lift_core_bounds_mm, _eff_lifts, lobby_w,
             compliance_overrides=_cp_overrides,
-            footprint_pts=shell.get("footprint_points")
+            footprint_pts=shell.get("footprint_points"),
+            footprint_holes=_normalise_footprint_holes(shell.get("footprint_holes", [])),
+            all_floor_dims=floor_dims,
         )
-        
+
         if isinstance(unified_man, dict) and unified_man.get("status") == "CONFLICT":
+            self.log("[CoreSetup] Single-bank generate_fire_safety_manifest → CONFLICT: {}".format(
+                unified_man.get("description", "")))
             # Attach manifest inputs so dispatcher can build a rich retry prompt
             unified_man.setdefault("manifest_inputs", {
                 "lift_count": num_lifts,
@@ -3468,13 +5123,99 @@ class RevitWorkers:
                 "level_height_mm": round(typical_h_mm),
             })
             return unified_man
+        self.log("[CoreSetup] Single-bank manifest OK: walls={} floors={} door_specs={} voids={}".format(
+            len(unified_man.get("walls", [])),
+            len(unified_man.get("floors", [])),
+            len(unified_man.get("door_specs", [])),
+            len(unified_man.get("voids", []))))
+
+        # OR-Tools infeasibility: solver could not fit one or more fire safety clusters.
+        # Return a structured CONFLICT so dispatcher feeds real dimensions to Gemini.
+        _oc = unified_man.get("ortools_conflict")
+        if _oc:
+            _core_w   = _oc["min_core_w"]
+            _core_d   = _oc["min_core_d"]
+            _shell_w  = safe_num(manifest.get("shell", {}).get("width",  0), 0)
+            _shell_l  = safe_num(manifest.get("shell", {}).get("length", 0), 0)
+            # Compute narrowest footprint span — for L/U/H shapes this is the arm width,
+            # which is the actual binding constraint (not the shell bounding box).
+            _fp_pts = manifest.get("shell", {}).get("footprint_points") or []
+            _narrowest_span = None
+            if _fp_pts and len(_fp_pts) >= 3:
+                try:
+                    _fp_xs = [p[0] for p in _fp_pts]
+                    _fp_ys = [p[1] for p in _fp_pts]
+                    _narrowest_span = int(min(max(_fp_xs) - min(_fp_xs),
+                                             max(_fp_ys) - min(_fp_ys)))
+                except Exception:
+                    _narrowest_span = None
+            _zones_text = (
+                "  {:<30s}  {:>6} x {:>5} mm\n"
+            ).format(
+                "total core envelope (min)",  _core_w, _core_d,
+            )
+            _hints = [
+                "Minimum core width needed: {:,}mm. Current shell width: {:,}mm.".format(
+                    _core_w, int(_shell_w)),
+                "Minimum core depth needed: {:,}mm. Current shell length: {:,}mm.".format(
+                    _core_d, int(_shell_l)),
+                "Consider: reduce lift count, increase shell dimensions, or change building shape.",
+            ]
+            if _narrowest_span and _narrowest_span < _core_w:
+                _hints.append(
+                    "CRITICAL: Narrowest footprint span is {:,}mm — smaller than the required "
+                    "core width {:,}mm. The arm/wing is too narrow. "
+                    "Widen the narrowest arm to at least {:,}mm via floor_overrides, "
+                    "or reduce lift count.".format(_narrowest_span, _core_w, _core_w + 500))
+            if _shell_w and _core_w > _shell_w * 0.6:
+                _hints.append(
+                    "Core width ({:,}mm) exceeds 60% of shell width ({:,}mm) — "
+                    "suggest increasing shell.width to at least {:,}mm.".format(
+                        _core_w, int(_shell_w), int(_core_w / 0.55)))
+            if _shell_l and _core_d > _shell_l * 0.55:
+                _hints.append(
+                    "Core depth ({:,}mm) exceeds 55% of shell length ({:,}mm) — "
+                    "suggest increasing shell.length to at least {:,}mm.".format(
+                        _core_d, int(_shell_l), int(_core_d / 0.45)))
+            _narrow_note = (
+                " Narrowest footprint span: {:,}mm (arm/wing too narrow — must be ≥{:,}mm).".format(
+                    _narrowest_span, _core_w)
+                if (_narrowest_span and _narrowest_span < _core_w) else ""
+            )
+            return {
+                "status":             "CONFLICT",
+                "type":               "ORTOOLS_INFEASIBLE",
+                "description": (
+                    "OR-Tools could not fit the fire safety core ({} cluster(s)) within the "
+                    "given footprint. Minimum core envelope required: {:,}x{:,}mm. "
+                    "Shell bounding box: {:,}x{:,}mm.{}"
+                    .format(
+                        _oc["failed_set_count"], _core_w, _core_d,
+                        int(_shell_w), int(_shell_l), _narrow_note)
+                ),
+                "core_layout_summary": _zones_text,
+                "core_total_mm":       {"width": _core_w, "depth": _core_d},
+                "manifest_inputs": {
+                    "lift_count":       num_lifts,
+                    "shell_width_mm":   int(_shell_w),
+                    "shell_length_mm":  int(_shell_l),
+                    "level_height_mm":  round(typical_h_mm),
+                },
+                "resolution_hints": _hints,
+                "ortools_failure_details": _oc.get("failure_details", []),
+            }
+
+        # PAX bank row orientation. Odd lift counts are already rounded to even above
+        # so both rows are equal size (floor==ceil). flip_rows=False keeps Row1 north.
+        _psgr_flip = False
 
         # Collect door specs from fire-safety manifest + passenger lift doors
         _door_specs = list(unified_man.get("door_specs", []))
         try:
             psgr_doors = lift_logic.get_passenger_lift_door_positions(
-                num_lifts, center_pos=(f_center_mm[0], f_center_mm[1]),
-                lobby_width=lobby_w, levels_data=levels_manifest
+                _eff_lifts, center_pos=(f_center_mm[0], f_center_mm[1]),
+                lobby_width=lobby_w, levels_data=levels_manifest,
+                flip_rows=_psgr_flip,
             )
             _door_specs.extend(psgr_doors)
         except Exception as _pd_e:
@@ -3493,8 +5234,9 @@ class RevitWorkers:
         _fp_pts_val = shell.get("footprint_points")
         if _fp_pts_val and len(_fp_pts_val) >= 3:
             from revit_mcp.staircase_logic import _point_in_polygon
-            _fp_holes_val = shell.get("footprint_holes", [])
+            _fp_holes_val = _normalise_footprint_holes(shell.get("footprint_holes", []))
             _outside_zones = []
+            _hole_zones = []   # zones whose corners land inside a footprint_holes void
             _all_zone_rects = [list(lift_core_bounds_mm)] + [sb["rect"] for sb in (sub_bounds or [])]
             for _zr in _all_zone_rects:
                 _corners = [
@@ -3506,11 +5248,18 @@ class RevitWorkers:
                     any(_point_in_polygon(cx, cy, h) for h in _fp_holes_val)
                     for cx, cy in _corners
                 )
+                if _in_hole:
+                    _hole_zones.append(_zr)
                 if _outside or _in_hole:
                     _outside_zones.append(_zr)
             if _outside_zones:
+                self.log("[E1] lift_core={} | {} outside/hole zones: {}".format(
+                    "[{:.0f},{:.0f},{:.0f},{:.0f}]".format(*lift_core_bounds_mm),
+                    len(_outside_zones),
+                    " | ".join("[{:.0f},{:.0f},{:.0f},{:.0f}]".format(*z) for z in _outside_zones[:4])
+                ))
                 _zone_desc = "; ".join(
-                    "zone [{:.0f},{:.0f}]→[{:.0f},{:.0f}]mm".format(*z) for z in _outside_zones
+                    "zone [{:.0f},{:.0f}]->[{:.0f},{:.0f}]mm".format(*z) for z in _outside_zones
                 )
                 _fp_bbox = "Polygon bbox: X=[{:.0f},{:.0f}], Y=[{:.0f},{:.0f}]".format(
                     min(p[0] for p in _fp_pts_val), max(p[0] for p in _fp_pts_val),
@@ -3535,15 +5284,32 @@ class RevitWorkers:
                 ).format(_space_s, _space_n, _space_w, _space_e,
                          _lc[0], _lc[2], _lc[1], _lc[3])
 
-                # Determine whether the lift core itself is outside (position problem)
-                # or only fire safety sub-zones are outside (arm too narrow problem).
+                # Determine whether the failure is (a) core outside polygon, (b) zones in
+                # a footprint_holes courtyard void, or (c) arm too narrow for fire clusters.
                 _lc_rect = list(lift_core_bounds_mm)
                 _core_outside = any(
                     abs(_zr[0] - _lc_rect[0]) < 1 and abs(_zr[1] - _lc_rect[1]) < 1
                     for _zr in _outside_zones
                 )
 
-                if _core_outside:
+                if _hole_zones:
+                    # One or more zones clip into a courtyard/atrium void.
+                    # Compute approximate minimum safe distance from void edge.
+                    _all_hole_pts = [p for h in _fp_holes_val for p in h]
+                    _void_cx = sum(p[0] for p in _all_hole_pts) / max(len(_all_hole_pts), 1)
+                    _void_cy = sum(p[1] for p in _all_hole_pts) / max(len(_all_hole_pts), 1)
+                    _action = (
+                        "The fire safety cluster (shaft + lobby + staircase) clips into the "
+                        "courtyard/atrium void (footprint_holes). "
+                        "Move lifts.position further away from the void — place it at least "
+                        "8000mm from the nearest footprint_holes boundary, towards the outer "
+                        "perimeter of the building. "
+                        "The void centroid is approximately [{:.0f},{:.0f}]mm — move the core "
+                        "in the OPPOSITE direction. "
+                        "Do NOT change the building shape. "
+                        "Do NOT place any core zone inside the courtyard opening."
+                    ).format(_void_cx, _void_cy)
+                elif _core_outside:
                     # The passenger lift core itself is outside — reposition the core
                     _action = (
                         "The passenger lift core is outside the floor plate. "
@@ -3553,20 +5319,57 @@ class RevitWorkers:
                         "Do NOT change the building shape."
                     )
                 else:
-                    # Only fire safety sub-zones are outside — the arm is too narrow
+                    # Only fire safety sub-zones are outside — the arm is too narrow.
+                    # Compute per-direction overshoot from the outside zones to give Gemini
+                    # an exact number of mm to widen by.
+                    _oz_xmin = min(z[0] for z in _outside_zones)
+                    _oz_ymin = min(z[1] for z in _outside_zones)
+                    _oz_xmax = max(z[2] for z in _outside_zones)
+                    _oz_ymax = max(z[3] for z in _outside_zones)
+                    _overshoot_s = max(0, _poly_ymin - _oz_ymin)
+                    _overshoot_n = max(0, _oz_ymax - _poly_ymax)
+                    _overshoot_w = max(0, _poly_xmin - _oz_xmin)
+                    _overshoot_e = max(0, _oz_xmax - _poly_xmax)
+                    _widen_parts = []
+                    if _overshoot_n > 0:
+                        _widen_parts.append(
+                            "north by {:.0f}mm (cluster extends to Y={:.0f}, polygon ends at Y={:.0f} — "
+                            "move the concave north edge vertices to Y≥{:.0f})".format(
+                                _overshoot_n + 500, _oz_ymax, _poly_ymax, _oz_ymax + 500))
+                    if _overshoot_s > 0:
+                        _widen_parts.append(
+                            "south by {:.0f}mm (cluster extends to Y={:.0f}, polygon ends at Y={:.0f} — "
+                            "move the concave south edge vertices to Y≤{:.0f})".format(
+                                _overshoot_s + 500, _oz_ymin, _poly_ymin, _oz_ymin - 500))
+                    if _overshoot_e > 0:
+                        _widen_parts.append(
+                            "east by {:.0f}mm (cluster extends to X={:.0f}, polygon ends at X={:.0f} — "
+                            "move the concave east edge vertices to X≥{:.0f})".format(
+                                _overshoot_e + 500, _oz_xmax, _poly_xmax, _oz_xmax + 500))
+                    if _overshoot_w > 0:
+                        _widen_parts.append(
+                            "west by {:.0f}mm (cluster extends to X={:.0f}, polygon ends at X={:.0f} — "
+                            "move the concave west edge vertices to X≤{:.0f})".format(
+                                _overshoot_w + 500, _oz_xmin, _poly_xmin, _oz_xmin - 500))
                     _min_space = min(_space_s, _space_n, _space_w, _space_e)
                     _tightest = {_space_s: "south", _space_n: "north",
                                  _space_w: "west",  _space_e: "east"}[_min_space]
+                    _widen_instruction = (
+                        "Widen {} in footprint_points: {}.".format(
+                            _tightest, "; ".join(_widen_parts))
+                        if _widen_parts else
+                        "Widen the {} arm by at least 6000mm.".format(_tightest)
+                    )
                     _action = (
                         "The passenger lift core position is valid, but the fire safety clusters "
                         "(shaft + lobby + staircase) extend beyond the floor plate — the {} arm "
                         "of the building is too narrow to contain them. "
-                        "Fix by widening the {} arm: increase the relevant footprint_points "
-                        "coordinates to give at least 6000mm clear depth beyond the lift core on "
-                        "that side. "
+                        "{} "
+                        "Move ONLY the concave (inside-notch) edge vertices outward — "
+                        "do NOT move outer perimeter vertices. "
                         "Do NOT move lifts.position. "
                         "Do NOT change the building shape type (keep L/U/H/etc. as requested)."
-                    ).format(_tightest, _tightest)
+                    ).format(_tightest, _widen_instruction)
 
                 return {
                     "status": "CONFLICT",
@@ -3577,18 +5380,24 @@ class RevitWorkers:
                              _fp_bbox, _fp_summary, _arm_diag, _action)
                 }
 
-        # F1: Taper containment — verify the lift core fits inside the scaled footprint
-        # at every level that carries a non-unity scale override.
+        # F1: Taper containment — verify the full core cluster (pax lifts + all fire
+        # safety sub-bounds) fits inside the scaled footprint at every level with a
+        # non-unity scale override. Core walls are built at full height so they must
+        # fit at every level, not just the base.
         _taper_ovr = shell.get("footprint_scale_overrides")
         _fp_pts_base = shell.get("footprint_points")
         if _taper_ovr and _fp_pts_base and len(_fp_pts_base) >= 3:
             from revit_mcp.staircase_logic import _point_in_polygon as _pip_t
             _rot_ovr = shell.get("footprint_rotation_overrides", {})
             _lc_t = lift_core_bounds_mm
-            _core_corners_t = [
-                (_lc_t[0], _lc_t[1]), (_lc_t[2], _lc_t[1]),
-                (_lc_t[2], _lc_t[3]), (_lc_t[0], _lc_t[3]),
-            ]
+            # Build union of pax core + all sub-boundary rects
+            _all_rects_t = [_lc_t] + [sb["rect"] for sb in (sub_bounds or [])]
+            _core_corners_t = []
+            for _rt in _all_rects_t:
+                _core_corners_t += [
+                    (_rt[0], _rt[1]), (_rt[2], _rt[1]),
+                    (_rt[2], _rt[3]), (_rt[0], _rt[3]),
+                ]
             _taper_fail_levels = []
             for _lvl_1 in range(1, len(elevations) + 1):
                 _sf = _get_interpolated_scale(_taper_ovr, _lvl_1)
@@ -3601,16 +5410,20 @@ class RevitWorkers:
                     _taper_fail_levels.append(_lvl_1)
             if _taper_fail_levels:
                 _sf_min = min(_get_interpolated_scale(_taper_ovr, l) for l in _taper_fail_levels)
+                _all_x = [c[0] for c in _core_corners_t]; _all_y = [c[1] for c in _core_corners_t]
                 return {
                     "status": "CONFLICT",
                     "description": (
-                        "Taper containment failure: lift core X=[{:.0f},{:.0f}] Y=[{:.0f},{:.0f}]mm "
-                        "extends outside the scaled floor plate on {} level(s) (first: level {}). "
+                        "Taper containment failure: full core cluster X=[{:.0f},{:.0f}] Y=[{:.0f},{:.0f}]mm "
+                        "(passenger lifts + fire clusters + staircases) extends outside the scaled "
+                        "floor plate on {} level(s) (first: level {}). "
                         "Smallest plate scale at failing levels: {:.2f}×. "
-                        "Move lifts.position closer to the origin or reduce the number of lifts so "
-                        "the core footprint fits inside the building footprint at every scale level."
+                        "Core walls are built at full height and cannot shrink with the taper. "
+                        "Fix: (a) reduce lift count, (b) use 'parallel' arrangement to reduce cluster depth, "
+                        "or (c) keep lifts.position at [0,0] and ensure the smallest scaled plate "
+                        "is at least (total_core_width + 2×min_office_bay) wide."
                     ).format(
-                        _lc_t[0], _lc_t[2], _lc_t[1], _lc_t[3],
+                        min(_all_x), max(_all_x), min(_all_y), max(_all_y),
                         len(_taper_fail_levels), _taper_fail_levels[0], _sf_min,
                     )
                 }
@@ -3782,15 +5595,16 @@ class RevitWorkers:
         # the actual lift car enclosure walls visible in plan and section.
         try:
             psgr_man = lift_logic.generate_lift_shaft_manifest(
-                num_lifts,
+                _eff_lifts,
                 levels_manifest,
                 center_pos=(f_center_mm[0], f_center_mm[1]),
-                lobby_width=lobby_w
+                lobby_width=lobby_w,
+                flip_rows=_psgr_flip,
             )
             manifest["walls"].extend(psgr_man.get("walls", []))
             manifest["floors"].extend(psgr_man.get("floors", []))
-            self.log("Passenger lift shaft: {} walls, {} floors generated.".format(
-                len(psgr_man.get("walls", [])), len(psgr_man.get("floors", []))))
+            self.log("Passenger lift shaft: {} walls, {} floors generated (flip_rows={}).".format(
+                len(psgr_man.get("walls", [])), len(psgr_man.get("floors", [])), _psgr_flip))
         except Exception as _psgr_e:
             self.log("Passenger lift shaft generation failed (non-fatal): {}".format(_psgr_e))
 
@@ -3801,7 +5615,8 @@ class RevitWorkers:
         # Also add passenger lift shaft voids for floor slab cutouts
         try:
             psgr_void_rects = lift_logic.get_shaft_void_rectangles_mm(
-                num_lifts, center_pos=(f_center_mm[0], f_center_mm[1]), lobby_width=lobby_w
+                _eff_lifts, center_pos=(f_center_mm[0], f_center_mm[1]), lobby_width=lobby_w,
+                flip_rows=_psgr_flip,
             )
             for (vx1, vy1, vx2, vy2) in psgr_void_rects:
                 u_voids_ft.append((mm_to_ft(vx1), mm_to_ft(vy1), mm_to_ft(vx2), mm_to_ft(vy2)))
@@ -3896,10 +5711,13 @@ class RevitWorkers:
         
         stair_overrides = unified_man.get("stair_overrides", [])
         
+        _sc_rot_degs = [sc[3] if len(sc) > 3 else None for sc in stair_center_data] \
+               if stair_center_data else None
         self._stair_run_data = staircase_logic.get_stair_run_data(
             positions, levels_manifest, enc_w, stair_spec, typical_h_mm, lift_core_bounds_mm,
             floor_dims_mm=floor_dims, num_lifts=num_lifts, lobby_width=lobby_w,
-            rotated_indices=rotated_indices, base_y_overrides=stair_overrides
+            rotated_indices=rotated_indices, base_y_overrides=stair_overrides,
+            rotation_degs=_sc_rot_degs  # ← add this
         )
 
         # Stamp each run with the rotation parameters so _build_dogleg_in_scope
@@ -3909,6 +5727,11 @@ class RevitWorkers:
                 _rd['_global_rotation_rad'] = _crot_rad
                 _rd['_rotation_cx_ft']      = _crot_cx_ft
                 _rd['_rotation_cy_ft']      = _crot_cy_ft
+
+        # Per-staircase 90° rotation is now handled in get_stair_run_data():
+        # when _coords_prerotated=True, flight coords are already in world orientation
+        # and _build_dogleg_in_scope passes them directly to CreateStraightRun.
+        # No _global_rotation_rad stamping needed for solver-driven 90° rotation.
 
         # Summary for tracker
         self._stair_summary = {
@@ -4373,6 +6196,33 @@ class RevitWorkers:
                     scope.Commit(NuclearJoinGuard(doc))
                     scope.Dispose()
                     scope = None
+
+                    # EW rotation for this stair segment reference
+                    _seg_rot_deg = ref_rd.get('_rot_deg', 0.0)
+                    if _seg_rot_deg and abs(_seg_rot_deg) > 0.1:
+                        import math as _seg_math
+                        _seg_centre = ref_rd.get('_rot_centre_mm')
+                        _seg_rcx = mm_to_ft(_seg_centre[0]) if _seg_centre else 0.0
+                        _seg_rcy = mm_to_ft(_seg_centre[1]) if _seg_centre else 0.0
+                        _seg_axis = DB.Line.CreateBound(
+                            DB.XYZ(_seg_rcx, _seg_rcy, 0.0),
+                            DB.XYZ(_seg_rcx, _seg_rcy, 1.0))
+                        t_seg_rot = DB.Transaction(doc, "AI Stair Seg Rotate")
+                        try:
+                            t_seg_rot.Start()
+                            setup_failure_handling(t_seg_rot)
+                            from Autodesk.Revit.DB import ElementTransformUtils  # type: ignore
+                            ElementTransformUtils.RotateElement(
+                                doc, ref_stair_id, _seg_axis, _seg_math.radians(_seg_rot_deg))
+                            t_seg_rot.Commit()
+                        except Exception as _sre:
+                            self.log("  Seg rotate failed (non-fatal): {}".format(_sre))
+                            try: t_seg_rot.RollBack()
+                            except: pass
+                        finally:
+                            try: t_seg_rot.Dispose()
+                            except: pass
+
                 except Exception as e:
                     self.log("  Core {} h_idx {} ref FAILED: {}".format(core_tag, h_idx, e))
                     if t:
@@ -4728,13 +6578,52 @@ class RevitWorkers:
                 self.log("  Core {}: reference stair created (L{}-L{}).".format(
                     core_tag, ref_base_idx + 1, ref_top_idx + 1))
 
+                # --- EW rotation: rotate the whole Stairs element 90° ---
+                # The stair was created NS (CreateStraightRun ignores line direction).
+                # ElementTransformUtils.RotateElement rotates around a vertical axis
+                # through the staircase centre, matching the enclosure wall rotation.
+                _rot_deg_rd = ref_rd.get('_rot_deg', 0.0)
+                if _rot_deg_rd and abs(_rot_deg_rd) > 0.1:
+                    import math as _rot_math
+                    _rot_centre = ref_rd.get('_rot_centre_mm')
+                    if _rot_centre:
+                        _rcx_ft = mm_to_ft(_rot_centre[0])
+                        _rcy_ft = mm_to_ft(_rot_centre[1])
+                    else:
+                        # Fallback: use midpoint of flight_1 as centre
+                        _f1s = ref_rd['flight_1']['start']
+                        _f1e = ref_rd['flight_1']['end']
+                        _rcx_ft = mm_to_ft((_f1s[0] + _f1e[0]) / 2.0)
+                        _rcy_ft = mm_to_ft((_f1s[1] + _f1e[1]) / 2.0)
+                    _rot_rad = _rot_math.radians(_rot_deg_rd)
+                    _rot_axis = DB.Line.CreateBound(
+                        DB.XYZ(_rcx_ft, _rcy_ft, 0.0),
+                        DB.XYZ(_rcx_ft, _rcy_ft, 1.0))
+                    t_rot = DB.Transaction(doc, "AI Stair Rotate")
+                    try:
+                        t_rot.Start()
+                        setup_failure_handling(t_rot)
+                        from Autodesk.Revit.DB import ElementTransformUtils  # type: ignore
+                        ElementTransformUtils.RotateElement(doc, ref_stair_id, _rot_axis, _rot_rad)
+                        t_rot.Commit()
+                        self.log("  Core {}: stair rotated {}° around ({:.0f},{:.0f})mm".format(
+                            core_tag, _rot_deg_rd, _rot_centre[0] if _rot_centre else 0,
+                            _rot_centre[1] if _rot_centre else 0))
+                    except Exception as _re:
+                        self.log("  Core {}: stair rotation failed (non-fatal): {}".format(core_tag, _re))
+                        try: t_rot.RollBack()
+                        except: pass
+                    finally:
+                        try: t_rot.Dispose()
+                        except: pass
+
             except Exception as e:
                 self.log("  Core {} reference stair FAILED: {}".format(core_tag, e))
                 if t:
                     try: t.RollBack()
                     except: pass
                 if scope:
-                    try: 
+                    try:
                         scope.RollBack()
                         scope.Dispose()
                     except: pass
@@ -4858,6 +6747,32 @@ class RevitWorkers:
                     scope2.Commit(NuclearJoinGuard(doc))
                     scope2 = None
 
+                    # EW rotation for non-typical stairs
+                    _nt_rot_deg = rd.get('_rot_deg', 0.0)
+                    if _nt_rot_deg and abs(_nt_rot_deg) > 0.1:
+                        import math as _nt_math
+                        _nt_centre = rd.get('_rot_centre_mm')
+                        _nt_rcx = mm_to_ft(_nt_centre[0]) if _nt_centre else 0.0
+                        _nt_rcy = mm_to_ft(_nt_centre[1]) if _nt_centre else 0.0
+                        _nt_axis = DB.Line.CreateBound(
+                            DB.XYZ(_nt_rcx, _nt_rcy, 0.0),
+                            DB.XYZ(_nt_rcx, _nt_rcy, 1.0))
+                        t_nt_rot = DB.Transaction(doc, "AI Stair NT Rotate")
+                        try:
+                            t_nt_rot.Start()
+                            setup_failure_handling(t_nt_rot)
+                            from Autodesk.Revit.DB import ElementTransformUtils  # type: ignore
+                            ElementTransformUtils.RotateElement(
+                                doc, nt_stair_id, _nt_axis, _nt_math.radians(_nt_rot_deg))
+                            t_nt_rot.Commit()
+                        except Exception as _ntre:
+                            self.log("  NT rotate failed (non-fatal): {}".format(_ntre))
+                            try: t_nt_rot.RollBack()
+                            except: pass
+                        finally:
+                            try: t_nt_rot.Dispose()
+                            except: pass
+
                     all_stair_ids.append((nt_stair_id, core_tag))
                     self.log("  Core {}: non-typical stair L{}-L{} created.".format(
                         core_tag, bi + 1, ti + 1))
@@ -4926,49 +6841,26 @@ class RevitWorkers:
                                 _StairsRun, _StairsLanding, _StairsRunJust):
         """Build a single dogleg stair inside an already-open StairsEditScope.
 
-        Creates ONE dogleg: Run A (+Y left side), mid-landing (U-turn),
-        Run B (-Y right side). Used by typical single-pair floors.
+        Creates ONE dogleg: Run A (entry side → far side), mid-landing (U-turn),
+        Run B (far side → entry side). Used by typical single-pair floors.
+
+        When _coords_prerotated=True the flight_1/flight_2 start/end coords are
+        already in final Revit world coordinates (EW or NS) and are passed
+        directly to CreateStraightRun.  The landing polygon is derived as the
+        bounding box between the end of Run A and the start of Run B.
 
         Mid-landing elevation is computed EXPLICITLY as a_risers * riser_h_ft.
         We do NOT use run_a.TopElevation because Revit adds a nosing offset
         that makes it 1 riser height taller than the actual rise of the run.
         """
         import Autodesk.Revit.DB as DB  # type: ignore
-        import math as _dg_math
 
         base_z = base_lvl.ProjectElevation
 
-        # Build a point-rotation helper using params stamped on rd (0-deg = identity).
-        _dg_rot_rad = rd.get('_global_rotation_rad', 0.0)
-        if _dg_rot_rad:
-            _dg_cos = _dg_math.cos(_dg_rot_rad)
-            _dg_sin = _dg_math.sin(_dg_rot_rad)
-            _dg_cx  = rd['_rotation_cx_ft']
-            _dg_cy  = rd['_rotation_cy_ft']
-            def _rp(pt):
-                dx = pt.X - _dg_cx; dy = pt.Y - _dg_cy
-                return DB.XYZ(_dg_cx + dx*_dg_cos - dy*_dg_sin,
-                               _dg_cy + dx*_dg_sin + dy*_dg_cos, pt.Z)
-        else:
-            def _rp(pt):
-                return pt
-
         f1 = rd['flight_1']
         f2 = rd['flight_2']
-        f1_cx = mm_to_ft(f1['start'][0])
-        f2_cx = mm_to_ft(f2['start'][0])
-        flight_y_start_ft = mm_to_ft(f1['start'][1])
-        # Detect 180° rotation: after rotation f1 goes -Y. Use min/max for left/right.
-        f1_y_end = mm_to_ft(f1['end'][1])
-        is_rotated = (f1_y_end < flight_y_start_ft)
-        left_cx  = min(f1_cx, f2_cx)
-        right_cx = max(f1_cx, f2_cx)
-        land_x_left  = left_cx  - hw
-        land_x_right = right_cx + hw
 
         flight_list = rd.get('flight_list', [])
-        # --- Asymmetrical Riser Split Fix (Problem 1) ---
-        # If flight_list is strictly determined in manifest (e.g. 14/16 split), use it.
         if len(flight_list) >= 2:
             a_risers = flight_list[0]
             b_risers = flight_list[1]
@@ -4984,7 +6876,6 @@ class RevitWorkers:
 
         total_risers = a_risers + b_risers
 
-        # Compute actual riser height: scope height / total risers
         try:
             top_lvl = rd.get('_pair_top_level') or current_levels[rd['top_level_idx']]
             scope_height_ft = round(top_lvl.ProjectElevation - base_z, 8)
@@ -4992,25 +6883,53 @@ class RevitWorkers:
             scope_height_ft = round(mm_to_ft(spec_riser_mm * total_risers), 8)
         riser_h_ft = (scope_height_ft / total_risers) if total_risers > 0 else mm_to_ft(spec_riser_mm)
 
-        # Set DesiredNumberRisers on stair element to hint to Revit
         try:
             stair_el = doc.GetElement(stair_id)
             if stair_el:
-                from Autodesk.Revit.DB import BuiltInParameter as BIP2 # type: ignore
+                from Autodesk.Revit.DB import BuiltInParameter as BIP2  # type: ignore
                 p_desired = stair_el.get_Parameter(BIP2.STAIRS_DESIRED_NUMBER_OF_RISERS)
                 if p_desired and not p_desired.IsReadOnly:
                     p_desired.Set(total_risers)
-        except Exception: pass
+        except Exception:
+            pass
 
-        # --- Run A: direction depends on rotation ---
         a_run_len = max(a_risers - 1, 1) * tread_ft
+
+        # ── Standard build path (NS coordinates) ─────────────────────────────
+        # EW staircases use the same NS build; revit_workers rotates the whole
+        # Stairs element 90° via ElementTransformUtils.RotateElement() after creation.
+        import math as _dg_math
+        _dg_rot_rad = rd.get('_global_rotation_rad', 0.0)
+        if _dg_rot_rad:
+            _dg_cos = _dg_math.cos(_dg_rot_rad)
+            _dg_sin = _dg_math.sin(_dg_rot_rad)
+            _dg_cx  = rd['_rotation_cx_ft']
+            _dg_cy  = rd['_rotation_cy_ft']
+            def _rp(pt):
+                dx = pt.X - _dg_cx; dy = pt.Y - _dg_cy
+                return DB.XYZ(_dg_cx + dx*_dg_cos - dy*_dg_sin,
+                               _dg_cy + dx*_dg_sin + dy*_dg_cos, pt.Z)
+        else:
+            def _rp(pt):
+                return pt
+
+        f1_cx = mm_to_ft(f1['start'][0])
+        f2_cx = mm_to_ft(f2['start'][0])
+        flight_y_start_ft = mm_to_ft(f1['start'][1])
+        f1_y_end = mm_to_ft(f1['end'][1])
+        is_rotated = (f1_y_end < flight_y_start_ft)
+        left_cx  = min(f1_cx, f2_cx)
+        right_cx = max(f1_cx, f2_cx)
+        land_x_left  = left_cx  - hw
+        land_x_right = right_cx + hw
+
+        # --- Run A: direction depends on 180° rotation flag ---
         p_as = _rp(DB.XYZ(round(f1_cx, 8), round(flight_y_start_ft, 8), base_z))
         if is_rotated:
             p_ae = _rp(DB.XYZ(round(f1_cx, 8), round(flight_y_start_ft - a_run_len, 8), base_z))
         else:
             p_ae = _rp(DB.XYZ(round(f1_cx, 8), round(flight_y_start_ft + a_run_len, 8), base_z))
 
-        # Diagnostic Log
         if a_run_len < 0.001:
             self.log("  [Stair DIAGNOSTIC] {} - Run A length too short! a_risers={}, total_risers={}, total_h={:.4f}ft".format(
                 rd['tag'], a_risers, total_risers, scope_height_ft))
@@ -5056,11 +6975,9 @@ class RevitWorkers:
         # --- Run B: returns toward starting side ---
         b_run_len = max(b_risers - 1, 1) * tread_ft
         if is_rotated:
-            # Mid-landing is at lower Y; Run B goes back toward +Y (start side)
             p_bs = _rp(DB.XYZ(round(f2_cx, 8), round(flight_y_start_ft - a_run_len, 8), mid_elev_abs))
             p_be = _rp(DB.XYZ(round(f2_cx, 8), round(flight_y_start_ft - a_run_len + b_run_len, 8), mid_elev_abs))
         else:
-            # Mid-landing is at higher Y; Run B goes back toward -Y (start side)
             p_bs = _rp(DB.XYZ(round(f2_cx, 8), land_y_bot, mid_elev_abs))
             p_be = _rp(DB.XYZ(round(f2_cx, 8), round(land_y_bot - b_run_len, 8), mid_elev_abs))
         

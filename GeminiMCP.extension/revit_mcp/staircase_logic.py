@@ -44,6 +44,15 @@ def _load_sc():
 
 _SC, _SC2    = _load_sc()
 _STAIR_C     = _SC.get("staircase", {})
+
+def _sl_log(msg):
+    try:
+        import os, time
+        _lp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "fastmcp_server.log")
+        with open(_lp, "a") as _f:
+            _f.write("[{}] {}\n".format(time.strftime("%H:%M:%S"), msg))
+    except Exception:
+        pass
 # Authority minimums — sourced from compliance JSON files
 _WALL_THICKNESS  = _SC2.get("wall_thickness_mm", {}).get("core_structural",    350)
 _OVERRUN_HEIGHT  = _STAIR_C.get("overrun_height_mm",                          5000)
@@ -186,7 +195,7 @@ def get_shaft_dimensions(floor_height_mm, spec=None):
     spec = spec or {}
     riser = spec.get("riser", _STD_RISER)
     tread = spec.get("tread", _STD_TREAD)
-    w_flight = spec.get("width_of_flight", _STD_W_FLIGHT)
+    w_flight = max(spec.get("width_of_flight", _STD_W_FLIGHT), 1200)
     w_landing = spec.get("landing_width", _STD_LANDING)
     t = _WALL_THICKNESS
 
@@ -200,13 +209,17 @@ def get_shaft_dimensions(floor_height_mm, spec=None):
     shaft_width = 2 * w_flight + 3 * t
     shaft_depth = flight_length + w_landing + w_entry_landing + 2 * t  # entry + mid landing
 
+    _sl_log("[ShaftDims] fh={}mm riser={} tread={} flight_w={} landing={} entry_landing={} "
+            "wall_t={} num_risers={} max_treads={} flight_len={} -> sw={} sd={}".format(
+            floor_height_mm, riser, tread, w_flight, w_landing, w_entry_landing,
+            t, num_risers, max_treads, flight_length, shaft_width, shaft_depth))
     return shaft_width, shaft_depth
 
 
 def get_max_shaft_depth(levels_data, spec=None, typical_floor_height_mm=None):
     """Return the shaft depth for the staircase enclosure.
 
-    FIX: Automatically identifies the most common floor height if 
+    FIX: Automatically identifies the most common floor height if
     typical_floor_height_mm seems wrong (e.g. first floor is very tall).
     """
     # Robust Typical Floor Detection
@@ -215,17 +228,47 @@ def get_max_shaft_depth(levels_data, spec=None, typical_floor_height_mm=None):
     for i in range(len(levels_data) - 1):
         fh = levels_data[i + 1]['elevation'] - levels_data[i]['elevation']
         if fh > 0: heights.append(fh)
-    
+
     if heights:
         # If the passed typical_h is way larger than the average,
         # it's likely the first floor (lobby). Find the minimum height.
         min_h = min(heights)
         if not typ_h or typ_h > min_h * 1.5:
+            _sl_log("[MaxShaftDepth] passed_typ_h={} > min_h*1.5={:.0f} -> using min_h={}".format(
+                    typ_h, min_h * 1.5, min_h))
             typ_h = min_h
 
     if not typ_h or typ_h <= 0: typ_h = 4000.0
     _, d = get_shaft_dimensions(typ_h, spec)
+    _sl_log("[MaxShaftDepth] levels={} typical_h={}mm -> max_shaft_depth={}mm".format(
+            len(levels_data) if levels_data else 0, typ_h, d))
     return d
+
+
+def calc_required_flight_width(floor_area_mm2, num_staircases, compliance_overrides=None):
+    """Minimum stair flight width from occupant load (SCDF exit-width formula).
+
+    Distributes total exit-width units across ALL staircases (central + perimeter):
+        occupants      = floor_area_m2 / occupant_load_factor_m2
+        total_units    = ceil(occupants / persons_per_unit_width)
+        units_per_stair= ceil(total_units / num_staircases)
+        flight_width   = max(units_per_stair * exit_width_per_unit_mm, min_flight_width_mm)
+
+    Factors come from compliance_overrides (RAG-retrieved) with sensible fallbacks.
+    Returns flight width in mm.
+    """
+    co = compliance_overrides or {}
+    occ_factor   = co.get("occupant_load_factor_m2",  10.0)   # m² per person
+    persons_unit = co.get("persons_per_unit_width",   100)    # persons per unit of width
+    unit_mm      = co.get("exit_width_per_unit_mm",   550)    # mm per unit (SCDF: 550mm)
+    min_w        = co.get("min_flight_width_mm",      1000)   # code absolute minimum
+    if not floor_area_mm2 or not num_staircases or num_staircases <= 0:
+        return max(_STD_W_FLIGHT, int(min_w))
+    floor_area_m2 = floor_area_mm2 / 1e6
+    occupants     = math.ceil(floor_area_m2 / occ_factor)
+    total_units   = math.ceil(occupants / persons_unit)
+    per_stair     = math.ceil(total_units / num_staircases)
+    return max(per_stair * int(unit_mm), int(min_w))
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -591,27 +634,7 @@ def wall_overlaps_box(wall_start, wall_end, box_bounds, tol=100):
     return None
 
 def _calc_base_y(s_idx, s_cy, enc_d, lift_core_bounds_mm=None, num_lifts=None, lobby_width=3000):
-    """Internal helper to calculate stable base_y based on core proximity."""
-    if lift_core_bounds_mm:
-        lx_min, ly_min, lx_max, ly_max = lift_core_bounds_mm
-        core_cy = (ly_min + ly_max) / 2.0
-        
-        # Determine orientation based on position relative to core center
-        is_south = s_cy < core_cy - 100
-        is_north = s_cy > core_cy + 100
-        
-        if is_south:
-            # South staircase: Back wall (base_y + enc_d) must be at core_ymin
-            # Match calculate_staircase_positions logic for single row setback
-            offset = 0
-            if num_lifts is not None and num_lifts < 4:
-                offset = lobby_width
-            return ly_min - enc_d - offset
-        elif is_north:
-            # North staircase: Front wall (base_y) must be at core_ymax
-            return ly_max
-            
-    # Perimeter staircases or fallback: use the calculated centre (s_cy)
+    """Return staircase base_y centred on the spatial-solver position."""
     return s_cy - enc_d / 2.0
 
 
@@ -620,7 +643,8 @@ def generate_staircase_manifest(positions, levels_data, _enclosure_width_mm=None
                                 lift_core_bounds_mm=None, floor_dims_mm=None,
                                 num_lifts=None, lobby_width=3000,
                                 base_y_override=None, rotated_indices=[],
-                                stair_idx_offset=0, compliance_overrides=None):
+                                stair_idx_offset=0, compliance_overrides=None,
+                                rotation_degs=None):
     """Generate wall and floor manifest entries for all staircases.
 
     The enclosure footprint (plan size) is **fixed** for every level,
@@ -657,7 +681,7 @@ def generate_staircase_manifest(positions, levels_data, _enclosure_width_mm=None
     spec = spec or {}
     riser = spec.get("riser", _STD_RISER)
     tread = spec.get("tread", _STD_TREAD)
-    w_flight = spec.get("width_of_flight", _STD_W_FLIGHT)
+    w_flight = max(spec.get("width_of_flight", _STD_W_FLIGHT), 1200)
     w_landing = spec.get("landing_width", _STD_LANDING)
     t = _WALL_THICKNESS
 
@@ -669,6 +693,11 @@ def generate_staircase_manifest(positions, levels_data, _enclosure_width_mm=None
     enc_d = get_max_shaft_depth(levels_data, spec, typical_floor_height_mm)
     if enc_d <= 0:
         enc_d = get_shaft_dimensions(4000, spec)[1]  # safe fallback
+    # Guard: enc_d must be the long (N-S flight) axis. If geometry produces enc_d < enc_w
+    # (e.g. very low storey count) the enclosure is wider than deep — swap so flights always
+    # run along the longer axis and walls are oriented correctly.
+    if enc_d < enc_w:
+        enc_w, enc_d = enc_d, enc_w
 
     # --- Compute per-level landing extensions ---
     # The landing at level i+1 may need to extend deeper into the shaft
@@ -811,6 +840,17 @@ def generate_staircase_manifest(positions, levels_data, _enclosure_width_mm=None
     for s_idx, (s_cx, s_cy) in enumerate(positions):
         s_tag = "Stair_{}".format(s_idx + 1 + stair_idx_offset)
         is_rot_s = (s_idx in rotated_indices)
+        _w0 = len(walls)
+        _f0 = len(floors)
+        # Compute _rot_deg here so the landing-generation loop can guard _mirror_y.
+        # If a rotation matrix will be applied to this staircase, skip _mirror_y to
+        # avoid stacking two transforms that produce self-intersecting geometry.
+        _rot_deg = None
+        if rotation_degs is not None:
+            if isinstance(rotation_degs, (int, float)):
+                _rot_deg = float(rotation_degs) or None
+            elif s_idx < len(rotation_degs):
+                _rot_deg = float(rotation_degs[s_idx]) or None
 
         # --- Stable base coordinates [Alignment Fix] ---
         base_x = s_cx - enc_w / 2.0
@@ -941,7 +981,10 @@ def generate_staircase_manifest(positions, levels_data, _enclosure_width_mm=None
                 # 180° rotation around (s_cx, s_cy): y_rot = 2*s_cy - y
                 # For Y only (X is symmetric): mirror = 2*base_y + enc_d
                 # Left/right also swap because X mirrors around s_cx.
-                if is_rot_s:
+                # Apply 180° Y-mirror only when no rotation matrix will follow.
+                # If _rot_deg is set, the matrix handles orientation — stacking
+                # _mirror_y on top would produce self-intersecting geometry.
+                if is_rot_s and not _rot_deg:
                     _mirror_y = 2 * base_y + enc_d
                     front_y = base_y + enc_d - t
                     req_l, req_r = _mirror_y - req_r, _mirror_y - req_l
@@ -1002,14 +1045,30 @@ def generate_staircase_manifest(positions, levels_data, _enclosure_width_mm=None
                 })
                 continue
 
+        # Apply arbitrary rotation around staircase centre if requested.
+        if _rot_deg:
+            _rad = math.radians(_rot_deg)
+            _cos_r, _sin_r = math.cos(_rad), math.sin(_rad)
+            def _rot_pt(x, y, cx=s_cx, cy=s_cy, cr=_cos_r, sr=_sin_r):
+                dx, dy = x - cx, y - cy
+                return cx + dx * cr - dy * sr, cy + dx * sr + dy * cr
+            for _w in walls[_w0:]:
+                _wx, _wy = _rot_pt(_w["start"][0], _w["start"][1])
+                _w["start"] = [_wx, _wy, _w["start"][2]]
+                _wx, _wy = _rot_pt(_w["end"][0], _w["end"][1])
+                _w["end"] = [_wx, _wy, _w["end"][2]]
+            for _fl in floors[_f0:]:
+                _fl["points"] = [list(_rot_pt(p[0], p[1])) for p in _fl["points"]]
+
     return {"walls": walls, "floors": floors}
 
 # ─────────────────────────────────────────────────────────────────────
 #  Stair run geometry (for creating actual Revit stair elements)
 # ─────────────────────────────────────────────────────────────────────
 
-def get_stair_run_data(positions, levels_data, shaft_width_mm, spec, typical_floor_height_mm=4000, lift_core_bounds_mm=None, 
-                       floor_dims_mm=None, num_lifts=0, lobby_width=3000, rotated_indices=[], base_y_overrides=None):
+def get_stair_run_data(positions, levels_data, shaft_width_mm, spec, typical_floor_height_mm=4000,
+                       lift_core_bounds_mm=None, floor_dims_mm=None, num_lifts=0, lobby_width=3000,
+                       rotated_indices=[], base_y_overrides=None, rotation_degs=None):
     """Return geometry data for creating Revit stair runs.
 
     Supports rotation via rotated_indices (list of indices in positions).
@@ -1047,7 +1106,12 @@ def get_stair_run_data(positions, levels_data, shaft_width_mm, spec, typical_flo
         if not typ_h or typ_h > m_h * 1.5:
             typ_h = m_h
     if not typ_h or typ_h <= 0: typ_h = 4000.0
-            
+
+    _sl_log("[StairRunData] positions={} levels={} shaft_w={}mm typ_h={}mm enc_d={}mm "
+            "riser={} flight_w={} landing={} rotated_idx={} base_y_ovr={}".format(
+            positions, len(levels_data) if levels_data else 0, shaft_width_mm,
+            typ_h, enc_d, riser, w_flight, w_landing, list(rotated_indices),
+            base_y_overrides))
 
     runs = []
 
@@ -1068,12 +1132,27 @@ def get_stair_run_data(positions, levels_data, shaft_width_mm, spec, typical_flo
         f1_cx = stair_base_x + t + w_flight / 2.0
         f2_cx = stair_base_x + 2 * t + w_flight + w_flight / 2.0
 
+        # Determine per-staircase rotation angle (degrees).
+        _s_rot_deg = 0.0
+        if rotation_degs is not None:
+            if isinstance(rotation_degs, (list, tuple)):
+                _s_rot_deg = float(rotation_degs[s_idx]) if s_idx < len(rotation_degs) and rotation_degs[s_idx] else 0.0
+            else:
+                _s_rot_deg = float(rotation_degs) if rotation_degs else 0.0
+        _s_is_ew = abs(_s_rot_deg - 90.0) < 0.5
+
         def rotate_pt(pt_xy):
-            # 180-degree rotation (flip) around (s_cx, s_cy) if is_rot
-            if not is_rot: return pt_xy
+            # For EW staircases (_s_is_ew=True): return NS coords unchanged.
+            # revit_workers creates the stair NS first, then rotates the whole
+            # Stairs element 90° via ElementTransformUtils.RotateElement().
+            if _s_is_ew:
+                return pt_xy
+
+            # Legacy path: 180° flip for is_rot=True (NS entry flip).
+            if not is_rot:
+                return pt_xy
             vx, vy = pt_xy[0] - s_cx, pt_xy[1] - s_cy
             return [s_cx - vx, s_cy - vy]
-
         # Create stairs for all level pairs including up to the roof.
         for i in range(len(levels_data) - 1):
             floor_height = levels_data[i + 1]['elevation'] - levels_data[i]['elevation']
@@ -1142,6 +1221,7 @@ def get_stair_run_data(positions, levels_data, shaft_width_mm, spec, typical_flo
 
             run_data = {
                 "tag": "AI_{}_L{}_Run".format(s_tag, i + 1),
+                "stair_pos_idx": s_idx,
                 "base_level_idx": i,
                 "top_level_idx": i + 1,
                 "base_elev": levels_data[i]['elevation'],
@@ -1152,6 +1232,12 @@ def get_stair_run_data(positions, levels_data, shaft_width_mm, spec, typical_flo
                 "flight_list": flight_list,
                 "risers_per_flight": flight_list[0] if flight_list else 1,
                 "actual_riser_height_mm": actual_riser_h,
+                # _coords_prerotated: True when rotate_pt() already applied the 90° rotation.
+                # revit_workers uses ElementTransformUtils.RotateElement on the stair after
+                # creation to rotate it 90° around _rot_centre_mm.
+                "_coords_prerotated": _s_is_ew,
+                "_rot_centre_mm": [s_cx, s_cy] if _s_is_ew else None,
+                "_rot_deg": _s_rot_deg if _s_is_ew else 0.0,
                 "flight_1": {
                     "start": rotate_pt([f1_cx, flight_y_start]),
                     "end":   rotate_pt([f1_cx, flight_y_end]),

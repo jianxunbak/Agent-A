@@ -83,7 +83,7 @@ def svg_path_to_multiloop(svg_path, arc_segments=8):
             )
         result_loops.append(lp)
 
-    return {"outer": result_loops[0], "holes": result_loops[1:]}
+    return {"outer": result_loops[0], "holes": result_loops[1:], "offset": [dx, dy]}
 
 
 def svg_path_to_footprint_points(svg_path, arc_segments=8):

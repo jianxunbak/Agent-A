@@ -541,7 +541,9 @@ class BuildingSystem:
         # 2. Generate the Unified Manifest
         unified_man = fire_safety_logic.generate_fire_safety_manifest(
             safety_sets, new_levels, stair_spec, base_height, preset_fs, None, num_lifts, lobby_w,
-            all_floor_dims=all_floor_dims
+            all_floor_dims=all_floor_dims,
+            manifest_lifts=manifest.get("lifts"),
+            center_pos=center_pos,
         )
         
         if isinstance(unified_man, dict) and unified_man.get("status") == "CONFLICT":

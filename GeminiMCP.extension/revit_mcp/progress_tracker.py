@@ -252,12 +252,25 @@ class BuildProgressTracker:
 
             levels      = int(setup.get("levels", 0))
             storeys     = max(0, levels - 1)   # levels includes roof level
-            lh_mm       = setup.get("level_height", 0)
+            lh_raw      = setup.get("level_height", 0)
+            # level_height may be a per-floor list or a scalar
+            if isinstance(lh_raw, list):
+                _lh_list_pt = [int(v) for v in lh_raw if v]
+                lh_mm = _lh_list_pt[1] if len(_lh_list_pt) > 1 else (_lh_list_pt[0] if _lh_list_pt else 0)
+            else:
+                _lh_list_pt = None
+                lh_mm = lh_raw
             # Height overrides: recalculate total height properly
             h_overrides = setup.get("height_overrides", {})
             total_h_mm  = 0
             for i in range(1, levels):
-                total_h_mm += int(h_overrides.get(str(i), lh_mm) or lh_mm)
+                if str(i) in h_overrides:
+                    _h = h_overrides[str(i)]
+                elif _lh_list_pt and i <= len(_lh_list_pt):
+                    _h = _lh_list_pt[i - 1]
+                else:
+                    _h = lh_mm
+                total_h_mm += int(_h or lh_mm)
 
             width_mm  = shell.get("width", 0)
             length_mm = shell.get("length", 0)

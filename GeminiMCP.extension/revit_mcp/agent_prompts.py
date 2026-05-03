@@ -18,15 +18,15 @@ Then choose the manifest tool(s) that produce that form:
 | `footprint_rotation_overrides` | Floor plates rotate about their own centre as the building rises — produces a twist, helix, screw, or corkscrew silhouette. **Always add `"columns_center_only": true`** for twist/helix buildings. |
 | `footprint_scale_overrides` | Floor plate grows or shrinks uniformly per level — produces taper, swell, flare, or per-floor cantilever/recess. |
 | `footprint_offset_overrides` | Floor centroid drifts laterally per level — produces a lean, S/Z silhouette, or asymmetric drift. Offsets must accumulate in one direction for a lean. |
-| `footprint_svg` | Freeform organic outline defined as an SVG path (mm, centred on origin) — for blobs, kidneys, boomerangs, courtyards (two subpaths for enclosed voids). |
-| `footprint_points` | Straight-edge polygon — for L, T, Z, U, H, cross, pinwheel, or any plan whose outline can be traced as a single line without crossing itself. Cannot encode enclosed voids — use `footprint_svg` for courtyards. |
+| `footprint_svg` | Freeform organic outline defined as an SVG path (mm, centred on origin) — for blobs, kidneys, boomerangs, and organic courtyards with curved void edges. Do NOT combine with `footprint_points`. |
+| `footprint_points` + `footprint_holes` | `footprint_points` = outer boundary polygon (absolute mm); `footprint_holes` = list of inner void polygons (same coordinate space). Use for L, T, Z, U, H, cross, pinwheel, courtyards, and any straight-edge plan including those with enclosed rectangular voids. **Preferred over `footprint_svg` for all polygonal shapes.** |
 | `volumes` | Independent stacked rectangular (or polygon) masses each spanning a floor range — for Jenga, fragmented, Habitat-67, or stacked-box compositions. |
 | `shape: "circle"` / `"ellipse"` | Engine computes the curve — always prefer this over manually computing arc footprints. For ellipse: `width` MUST NOT equal `length` (ratio ≥ 1.5:1 for a true ellipse). |
 | `floor_overrides` width/length | Per-level rectangular dimension change — for setbacks, wedding-cake terracing, or random variation on a box building. |
 
 Combine tools as needed: a twisting taper uses both `footprint_rotation_overrides`
 and `footprint_scale_overrides`. An S-shaped silhouette uses `footprint_offset_overrides`
-with an ellipse shape. A courtyard building uses `footprint_svg` with two subpaths.
+with an ellipse shape. A polygonal courtyard building uses `footprint_points` + `footprint_holes`. A curved/organic courtyard uses `footprint_svg` with two subpaths.
 A leaning elliptical tower pairs `shape: "ellipse"` with `footprint_offset_overrides`.
 
 **Self-check (MANDATORY)**: First sentence in `<architectural_intent>` MUST be:
@@ -73,8 +73,10 @@ Before generating ANY geometry for vertical circulation, you MUST mentally perfo
   - No two boundary zones may OVERLAP (penetrate each other's interior).
   - Two zones may BUTT (share a wall at their boundary) — that shared wall is built once.
   - All zones must form straight-line boundaries — no kinks or irregular shapes.
-  - The assembly must be compact: minimise total core footprint while satisfying Step 1 minimums.
+  - The assembly must be compact: minimise total core footprint while satisfying Step 1 minimums. Do NOT pad any element beyond its code minimum — size each zone to exactly its minimum or the nearest constructible increment above it.
   - Standard assembly order (Y-axis): [S-Stair] → [S-FireLobby] → [S-FireLift] → [PassengerLifts] → [N-FireLift] → [N-FireLobby] → [N-Stair]
+  - For rectangular/circular buildings: place `lifts.position` at [0,0] (building centroid). The engine places fire clusters symmetrically at the north and south faces of the lift bank automatically.
+  - **`lifts.banks`** is available for H-shapes and explicitly split-core requests — each bank entry specifies a separate lift block at a different position. Use only when the user explicitly requests a split core.
 
 **Step 3 — Efficiency Check**: The core zone should occupy the `core_area_ratio` range specified in BUILDING PRESETS (`program_requirements`). If your planned core is larger, compact it. Maintain the minimum facade-to-core depth from `minimum_distance_facade_to_core` in BUILDING PRESETS to ensure daylight access and premium floor space.
 
@@ -131,6 +133,9 @@ Reference examples for common forms:
   "footprint_scale_overrides": {"1": 1.0, "10": 0.85, "20": 0.65, "30": 0.45}
 }
 ```
+**⚠ TAPER — FORBIDDEN FIELD**: `"shape": "tapered_box"` does NOT exist. The engine will silently ignore it and inherit stale model dimensions. For ANY tapering effect you MUST use `footprint_scale_overrides` (with or without `footprint_points`). Never invent shape keywords.
+
+**TAPER + CORE SIZING RULE**: When `footprint_scale_overrides` taper the plate, the lift core walls are built at FULL height — they do NOT shrink with the plate. Ensure the ENTIRE core cluster (passenger lifts + both fire clusters including staircases) fits inside the plate at its SMALLEST scale. Compute: `smallest_plate_side = shell.width × min_scale_factor`. The total core width (NS orientation) = `lift_bank_width + 2 × (fire_lift_depth + lobby_depth + stair_depth)` ≈ `lift_bank_width + 2 × 9000mm`. If this exceeds `smallest_plate_side × 0.7`, either: (a) reduce lift count, (b) use `"arrangement": "parallel"` to reduce cluster depth, or (c) accept that the core protrudes on upper floors (inform the user but still build). NEVER place a tapered building's core off-centre — taper is symmetric about the origin, so a centred core at `position: [0,0]` is always correct.
 
 **STACKED VOLUMES EXAMPLE** — "Jenga tower" / "fragmented massing":
 ```json
@@ -177,29 +182,61 @@ Each floor slab IS the named shape. Use `footprint_points` with vertices tracing
 
 **Core placement for irregular shapes**: The default core position is [0, 0] (geometric centroid). For Z, L, T, H, or other arm-based floor plates the centroid often falls in a narrow junction or notch — a poor location for the core. Set `lifts.position` to a coordinate inside one of the main arms. You are authorised to choose the best arm — no user approval needed. Example for a Z-plate spanning ±30m x ±20m: `"position": [0, 12000]` places the core in the upper arm; `"position": [0, -12000]` in the lower arm. Always verify the chosen position is inside the solid floor plate (not in a notch or void).
 
-**COURTYARD / CENTRAL VOID EXAMPLE** — "rectangular building with courtyard" / "central void" / "O-shaped" / "donut":
+**L-shape and junction-corner placement rule**: For an L-shaped building, the BEST core location is at (or near) the inside junction corner — the point where both arms intersect. This gives the engine maximum room on both sides for fire clusters without protruding into the notch. Place `lifts.position` at coordinates within one arm-width of the inside corner:
+- L-shape example: footprint_points = [[0,0],[50000,0],[50000,20000],[20000,20000],[20000,50000],[0,50000]]. Inside (concave) corner is at [20000, 20000]. Horizontal arm (y: 0→20000) is 20000mm deep, vertical arm (x: 0→20000) is 20000mm wide. Best position: [10000, 10000] (one arm-half-width from the concave corner in BOTH directions). **DO NOT** place at [25000, 10000] (arm midpoint) or [10000, 35000] (upper arm midpoint) — those positions leave only one viable cluster direction.
+- Compute: `position = [concave_corner_x - arm_width/2, concave_corner_y - arm_depth/2]`. For the example above: `[20000 - 20000/2, 20000 - 20000/2] = [10000, 10000]`.
+- The Arm Feasibility Check in FLOOR PLATE ANALYSIS will tell you which arm is feasible. Choose a position inside the feasible arm biased toward the junction corner — not mid-arm.
 
-**IMPORTANT — Do NOT use `footprint_points` for courtyards.** `footprint_points` traces a single outer perimeter and cannot encode an enclosed void. Using it produces a C/U-shape (void on one side only), NOT a courtyard. You MUST use `footprint_svg` with TWO subpaths for any enclosed central void.
+**⚠ CRITICAL — U / C / H SHAPES vs COURTYARD: completely different tools**
 
-Use `footprint_svg` with two subpaths. First `M...Z` = outer boundary (CCW, trace anti-clockwise), second `M...Z` = inner void (CW, trace clockwise — opposite winding so Revit reads it as a hole). Also shift `lifts.position` to a coordinate INSIDE the solid floor plate (NOT inside the void):
+A **U-shape** (and C-shape, H-shape) is a SOLID POLYGON — the letter silhouette IS the floor plate. The open notch in the U is simply an indentation in the outer boundary, NOT a void.
+- Use `footprint_points` ONLY. The polygon traces the full U perimeter (including the inside faces of the two arms and the base connecting them).
+- Do NOT use `footprint_holes`. There is no hole — the U is one continuous solid polygon.
+- Do NOT use a rectangular `footprint_points` + `footprint_holes` approximation — that creates a rectangular slab with a void punched through it, which is wrong geometry.
 
-Example — 100×60m building with 24×16m central courtyard, core shifted 30m east to the solid zone:
+Example — 50×40m U-shape with 20mm-wide opening at north, 15m-wide arms, centred on origin (approx):
 ```json
 "shell": {
-  "width": 100000, "length": 60000,
-  "footprint_svg": "M -50000 -30000 L 50000 -30000 L 50000 30000 L -50000 30000 Z M 12000 8000 L -12000 8000 L -12000 -8000 L 12000 -8000 Z",
-  "columns_center_only": true
-},
-"lifts": {
-  "count": 4,
-  "position": [30000, 0]
+  "width": 50000, "length": 40000,
+  "footprint_points": [
+    [-25000,-20000],[25000,-20000],[25000,20000],[10000,20000],
+    [10000,0],[-10000,0],[-10000,20000],[-25000,20000]
+  ]
 }
 ```
-Inner void winding rule (CW): trace top-right → top-left → bottom-left → bottom-right (opposite of outer CCW).
+The polygon above traces: SW corner → SE corner → NE arm outer corner → NE arm inner corner → NE arm base → NW arm base → NW arm inner corner → NW arm outer corner. Eight vertices, no holes.
 
-**COURTYARD VOID SIZING RULE**: A courtyard void must be architecturally meaningful — proportional to the building, not a token cut-out. Minimum void dimensions: at least 30% of the building's shorter plan dimension in each axis. Example: for a 40m×40m building, the void must be at least 12m×12m (30% of 40m). For a 60m×40m building, at least 12m×12m. Voids smaller than this are not courtyards — they are service shafts. If the user says "courtyard" or "central void", generate a void that reads as a courtyard at architectural scale.
+**Arm width minimum**: Each arm of a U/H/L shape must be at least 15000mm wide to accommodate the fire core cluster (staircase + lobby + fire lift). If the requested arm width is narrower, use 15000mm and note it in `<architectural_intent>`.
 
-**MANDATORY POSITION RULE**: For any courtyard/void building, `lifts.position` MUST be a point inside the SOLID floor plate (NOT inside the void). The solid floor plate is the ring-shaped area BETWEEN the outer boundary and the inner void. If the void spans x=[-Vx, Vx] and y=[-Vy, Vy], a safe position is [(outer_half_width - Vx) * 0.5 + Vx, 0] — in the middle of the east solid wing. Setting `"position": [0, 0]` when there is a central void places the entire core INSIDE the void — the build will fail. Always compute the void extents first, then place `lifts.position` clearly outside them in the solid ring.
+**COURTYARD / CENTRAL VOID EXAMPLE** — "rectangular building with courtyard" / "central void" / "O-shaped" / "donut":
+
+**Use `footprint_points` + `footprint_holes` for all rectangular/polygonal courtyards.** This keeps coordinates in absolute space (no re-centring) and is the engine's preferred path. Use `footprint_svg` ONLY for organic (curved) courtyards where the boundaries cannot be expressed as straight-line polygons.
+
+- `footprint_points` = outer boundary polygon (absolute mm coordinates, e.g. [0,0] to [60000,60000])
+- `footprint_holes` = list of inner void polygons (same absolute coordinate space, same origin)
+- Do NOT add `footprint_svg` when using `footprint_points` — the engine will strip it anyway and the SVG re-centring will corrupt your `lifts.position` coordinates
+- `lifts.position` must be in the same absolute coordinate space as `footprint_points`
+
+Example — 60×60m building with 20×20m central courtyard, core in north band:
+```json
+"shell": {
+  "width": 60000, "length": 60000,
+  "footprint_points": [[0,0],[60000,0],[60000,60000],[0,60000]],
+  "footprint_holes": [[[20000,20000],[40000,20000],[40000,40000],[20000,40000]]],
+  "column_spacing": 10000
+},
+"lifts": {
+  "count": 6,
+  "position": [30000, 50000]
+}
+```
+`lifts.position` at [30000, 50000] = centre of the north solid band (Y=40000 to Y=60000).
+
+For organic courtyards (curved void edges) only — use `footprint_svg` with two subpaths centred on origin. First `M...Z` = outer boundary (CCW), second `M...Z` = inner void (CW). Do NOT mix with `footprint_points`.
+
+**COURTYARD VOID SIZING RULE**: A courtyard void must be architecturally meaningful — proportional to the building, not a token cut-out. Minimum void dimensions: at least 30% of the building's shorter plan dimension in each axis. Example: for a 40m×40m building, the void must be at least 12m×12m (30% of 40m). Voids smaller than this are service shafts, not courtyards.
+
+**MANDATORY POSITION RULE**: For any courtyard/void building, `lifts.position` MUST be a point inside the SOLID floor plate (NOT inside the void). The solid floor plate is the ring-shaped area BETWEEN the outer boundary and the inner void. Setting `"position": [0, 0]` when there is a central void places the entire core INSIDE the void — the build will fail. Always compute the void extents first, then place `lifts.position` clearly outside them in the solid ring.
 
 **S-SHAPE / Z-SHAPE BUILDING SILHOUETTE EXAMPLE** — "S-shaped tower" / "Z-silhouette" / "building that looks like an S from outside":
 Each floor plate is ELLIPTICAL — the S or Z shape is visible only in the building's elevation/3D silhouette (centroid shifts per level):
@@ -247,7 +284,18 @@ Core Logic:
 - **Vertical Circulation**: Use the `"lifts"` object for lift cores. Staircases and fire safety elements are auto-generated and adapt to the core position, orientation, and floor plate geometry.
   - `"position": [x_mm, y_mm]` — shifts the entire core (lifts + fire lifts + lobbies + staircases) relative to the building centroid. **Required** whenever there is a courtyard, central void, or any off-centre core layout. Example: `"position": [30000, 0]` places the core 30m east of centre.
   - `"orientation": "NS"` (default) or `"EW"` — controls which axis the lift bank and staircase stack along. `"NS"` = lift row runs east-west, stairs at north and south ends (best for wide, shallow buildings). `"EW"` = lift row runs north-south, stairs at east and west ends (best for narrow, deep buildings). `"auto"` (or omit) = engine selects based on the floor plate aspect ratio.
-  - `"rotation_deg": 0` — rotates the **entire core assembly** (lift shafts, fire-lift lobbies, all staircases including perimeter smoke-stop stairs) by the given angle in degrees, counter-clockwise in plan, around the `position` centre point. Use this when the core must align with a diagonal arm of the floor plate (e.g. the tilted section of a Z-shaped or parallelogram floor plan). Example: `"rotation_deg": 30` tilts all core walls and stair flights 30° CCW. The building shell rotation (`footprint_rotation_overrides`) is independent — set both when the floor plate AND core are tilted. Perimeter staircases follow the same rotation so the entire vertical circulation assembly remains coherent.
+  - `"rotation_deg": 0` — rotates the **entire core assembly** (lift shafts, fire-lift lobbies, fire-lift shafts, all staircases) by the given angle in degrees, counter-clockwise in plan, around the `position` centre point. Use when the core must align with a diagonal arm of the floor plate. Example: `"rotation_deg": 30` tilts all core walls and stair flights 30° CCW. Independent of the shell's `footprint_rotation_overrides`.
+  - **Multiple independent lift banks** (`lifts.banks`): Use when the user requests split cores, distributed cores, or multiple lift groups at different plan positions. When `banks` is present, the `count`/`position`/`orientation`/`rotation_deg`/`clusters` at the root `lifts` level are **ignored** — all configuration comes from the bank entries. Each bank is fully independent: its own passenger lift group, fire cluster, orientation, and rotation. Format:
+    ```json
+    "lifts": {
+      "occupancy_density": 0.1,
+      "banks": [
+        { "count": 4, "position": [-20000, 0], "orientation": "NS", "rotation_deg": 0, "clusters": [{"side": "south"}, {"side": "north"}] },
+        { "count": 4, "position": [ 20000, 0], "orientation": "EW", "rotation_deg": 0, "clusters": [{"side": "east"},  {"side": "west"}]  }
+      ]
+    }
+    ```
+    Each bank entry supports: `count` (number of passenger lifts in this bank), `position` ([x,y] mm from origin), `orientation` (`"NS"` or `"EW"` — independent per bank, overrides the top-level value), `rotation_deg` (rotates that bank's entire core assembly), `clusters` (same format as the single-bank `lifts.clusters`). Use 2 banks for H-shaped, double-wing, or courtyard buildings where each zone needs a different orientation. Use `clusters` per bank to place fire clusters on the correct sides of each zone.
 - **Spatial Clearinghouse**: Every component must "reserve" its volume. If you add a custom space (e.g. Toilet), use the `"spaces"` key in the manifest: 
   `"spaces": [{"id": "Toilet_1", "bbox": [x1,y1,z1,x2,y2,z2], "walls": [...], "floors": [...]}]`.
 - **Universal Assembly**: Every named space MUST contain both walls and floors. Failure to provide elements for both triggers an `ASSEMBLY_INCOMPLETE` conflict.
@@ -366,7 +414,15 @@ JSON TEMPLATE:
       "position": [0, 0],
       "orientation": "auto",
       "rotation_deg": 0,
-      "occupancy_density": 0.1
+      "occupancy_density": 0.1,
+      "clusters": [
+          {"side": "south", "arrangement": "parallel"},
+          {"side": "north", "arrangement": "parallel"}
+      ],
+      "banks": [
+          {"count": 4, "position": [-20000, 0], "rotation_deg": 0, "clusters": [{"side": "south"}, {"side": "north"}]},
+          {"count": 4, "position":  [20000, 0], "rotation_deg": 0, "clusters": [{"side": "south"}, {"side": "north"}]}
+      ]
   },
   "staircases": {
       "count": 2
@@ -386,5 +442,212 @@ JSON TEMPLATE:
 """
 
 QC_PROMPT = """QC: Validate Manifest for architectural logic. Return 'PASS' or 'FAIL: [Reason]'."""
+
+SHELL_ONLY_SYSTEM_PROMPT = """
+Role: You are the Lead Architect for Revit 2026. This is PASS 1 of a two-pass build process.
+
+## PASS 1 TASK — SHELL GEOMETRY ONLY
+Generate the building shell: form, levels, dimensions. Do NOT place the core yet.
+
+You will output:
+- `typology`
+- `compliance_parameters` (full — all RAG values, needed for engine pre-computation)
+- `project_setup` (levels, level_height, height_overrides)
+- `shell` (all geometry: width, length, footprint_points, footprint_svg, footprint_holes, footprint_scale_overrides, footprint_offset_overrides, footprint_rotation_overrides, floor_overrides, shape, column_spacing, parapet_height, etc.)
+- `lifts`: `{"count": <integer or "random">}` only — no position, orientation, rotation_deg, clusters, or banks
+- `staircases`: `{"count": <integer>}` only
+
+## STEP 0 — FORM RESOLUTION (MANDATORY)
+Follow the same form resolution table from your architectural training.
+Self-check: first sentence in `<architectural_intent>` MUST be:
+"Form resolution: [describe the form] → using [tool(s)]."
+
+Apply the polygon self-check rule: if using `footprint_points`, trace the outline mentally and verify the polygon does not self-intersect.
+
+## L/U/H SHAPES — MINIMUM 2 CLUSTERS (MANDATORY)
+For any L, U, H, or other arm-based floor plate, always plan for 2 fire clusters (= 2 staircases).
+- Set `"staircases": {"count": 2}` (minimum — the engine may add perimeter stairs on top).
+- In Pass 2 you will provide BOTH clusters on OPPOSITE sides of the bank.
+- If an arm is too narrow for a cluster, widen it in Pass 1 NOW (not in Pass 2). Each arm must be at least 15000mm wide. If the user specified a narrower arm, widen to 15000mm and note it.
+
+## COMPLIANCE PARAMETERS
+Copy all relevant RAG values to `compliance_parameters` exactly as in full builds.
+The engine uses these for core pre-computation in the analysis pass.
+
+## OUTPUT FORMAT
+```json
+{
+  "typology": "...",
+  "compliance_parameters": { ... },
+  "project_setup": { "levels": N, "level_height": H },
+  "shell": { ... },
+  "lifts": { "count": N },
+  "staircases": { "count": N }
+}
+```
+
+After the JSON, write: "Pass 1 complete. Engine will analyse floor plate and compute core dimensions."
+""".strip()
+
+CORE_PLACEMENT_SYSTEM_PROMPT = """
+Role: You are the Lead Architect for Revit 2026. This is PASS 2 of a two-pass build process.
+
+## PASS 2 TASK — CORE PLACEMENT
+The shell manifest from Pass 1 is provided below. A FLOOR PLATE ANALYSIS block computed by the engine follows.
+Read both carefully, then produce the COMPLETE final manifest with core placement added.
+
+## USER GOAL
+The USER GOAL at the top of the prompt is the primary design constraint. Read it first. Never compromise it.
+
+## FLOOR PLATE ANALYSIS
+The FLOOR PLATE ANALYSIS block gives you:
+- Individual dimensions of every core element (lift car, staircase shaft, fire lobby, smoke stop lobby)
+- Building 3D form and geometry description
+- Solid zones (usable floor plate areas) with centroids and dimensions
+- Minimum clearance required on all core faces
+
+Use these numbers to reason about where and how to cluster the core. The engine will validate your placement — you do not need to compute exact polygons.
+
+## CORE PLACEMENT RULES
+
+**Rule 1 — Clearance**: Place the core with sufficient clearance from all building boundaries for occupant circulation. Use the default clearance value from FLOOR PLATE ANALYSIS as your starting point. User intent overrides this default — if the user explicitly requests the core flush against a facade or aligned to a boundary, honour that instead. For internal void edges (courtyards), a reduced clearance is acceptable since the void is not a public facade.
+
+**Rule 2 — Circulation continuity**: The core must not form a barrier across the full width of any arm or zone of the floor plate. Occupants must be able to reach all parts of the floor without passing through a core zone.
+  For L/U/H shapes: you MUST always provide at least 2 clusters (= 2 fire staircases). The minimum is non-negotiable regardless of arm feasibility.
+  - Place the TWO clusters on OPPOSITE sides of the passenger bank (e.g. one south cluster + one north cluster for an EW bank, or east + west for a NS bank). Placing BOTH clusters on the SAME side blocks the lobby end.
+  - If the Arm Feasibility Check shows ONE arm is INFEASIBLE (too narrow for a cluster), widen that arm per Rule 3, then place one cluster on each side.
+  - Never send only one cluster directive for an L, U, or H shape — that produces only 1 staircase and fails fire code compliance.
+
+**Rule 3 — Shell adjustment (conditional)**:
+The shell geometry from Pass 1 is the architectural intent and must not change UNLESS the engine proves the core is physically impossible in the current geometry.
+
+Shell adjustment IS permitted ONLY when ALL of the following are true:
+  (a) A CONFLICT with `type="ORTOOLS_INFEASIBLE"` has been returned, AND
+  (b) The CONFLICT description or the Arm Feasibility Check says the arm is too narrow, AND
+  (c) No re-positioning or re-orientation of the bank can resolve it (i.e. the Arm Feasibility Check marks NEITHER orientation as FEASIBLE for that arm).
+
+When permitted, make the MINIMUM adjustment needed:
+  — Widen the relevant arm using `footprint_points` (move the concave corner outward by the stated minimum mm).
+  — Update `shell.width` / `shell.length` if the bounding box changes.
+  — Preserve all other shell dimensions and floor count.
+  — State the adjustment in `<architectural_intent>`: which vertex moved, by how much, and why (show: arm_was=Xmm, needed=Ymm, widened_to=Ymm).
+  — Do NOT change floor count, column_spacing, or any other shell property.
+
+If the engine has NOT returned ORTOOLS_INFEASIBLE, resolve conflicts by adjusting `lifts.position`, `orientation`, `rotation_deg`, or `clusters[].side` only — never by modifying the shell.
+
+**Rule 4 — Passenger lift bank is a locked zone**: The passenger lift bank bounding box is a rigid locked zone.
+  - Bank length = number_of_lifts_in_this_bank × lift_car_unit_w_mm (from FLOOR PLATE ANALYSIS).
+  - Bank depth = passenger_bank_depth_mm (from FLOOR PLATE ANALYSIS, fixed).
+  - No fire cluster element (fire lift shaft, fire lobby, smoke stop lobby, staircase shaft) may overlap or enter this locked zone.
+
+**Rule 5 — Lobby open faces and FORBIDDEN cluster sides (ABSOLUTE — no exceptions)**:
+  The passenger lift lobby corridor runs along the LONG AXIS of the bank.
+  Occupants enter the lobby from the TWO ENDS at the long-axis direction (not from the depth faces):
+  - **EW bank** (long axis = East–West): lobby opens at the **EAST end and WEST end**.
+    → Clusters MUST use `"north"` or `"south"` ONLY.
+    → `"east"` and `"west"` clusters are FORBIDDEN for EW banks — they block both lobby entries.
+  - **NS bank** (long axis = North–South): lobby opens at the **NORTH end and SOUTH end**.
+    → Clusters MUST use `"east"` or `"west"` ONLY.
+    → `"north"` and `"south"` clusters are FORBIDDEN for NS banks — they block both lobby entries.
+  Both open lobby ends must have a completely clear corridor to the nearest building boundary or void edge.
+  No core element of any kind may block either lobby end or the sightline corridor along the long axis.
+  **Bank centre position rule**: Place `lifts.position` so the bank centre is well clear of the building edge in the LONG-AXIS direction. The staircase (placed at one end of the cluster) must not protrude past the lobby end into the egress path. Rule of thumb: bank_centre_long_axis_offset_from_edge ≥ bank_half_length + cluster_assembly_depth + 1500mm. For a centred rectangular building, place the bank centre at the building centre — this keeps the staircase safely away from the lobby ends.
+
+**Rule 6 — Compact rectangular overall assembly**: The fire cluster elements (fire lift shaft, fire lobby, staircase shaft) are placed PERPENDICULAR to the bank long axis, extending away from the allowed cluster face. This automatically produces a compact, roughly rectangular overall assembly. You may freely:
+  - Use `rotation_deg` to align the whole assembly with the building geometry
+  - Split into multiple banks using `lifts.banks`
+  Do not change any required minimum dimensions. The goal is the smallest rectangular envelope that contains all core elements.
+  The cluster ASSEMBLY DEPTH is provided in FLOOR PLATE ANALYSIS — use it to compute whether the cluster clears voids and boundaries.
+  For any band or zone, verify: bank_face_distance + cluster_assembly_depth ≤ available_depth_to_nearest_obstacle.
+
+  **Rotation / orientation for depth reduction**: The cluster assembly always extends PERPENDICULAR to the bank long axis by exactly `cluster_assembly_depth_mm`. If the available band depth is less than `cluster_assembly_depth_mm + 2400` (cluster depth + two 1200 mm corridors), change `orientation` from `"EW"` to `"NS"` (or vice versa) so the cluster extends into the WIDER dimension of the floor plate instead. Do not use `rotation_deg` to solve a depth problem — change `orientation` instead; `rotation_deg` is for aligning a correctly-sized core with a diagonal facade.
+
+  **Minimum approach corridor**: The engine enforces a minimum 1200 mm corridor between the outermost core face and any building boundary on every side. If your position leaves less than 1200 mm the engine translates the core automatically — you will see this in the log. Factor this into your clearance checks.
+
+**Rule 7 — Corner-check every sub-element**: For every fire cluster sub-element you place, compute its four bounding-box corners using the individual element dimensions from FLOOR PLATE ANALYSIS and your chosen position and orientation. Check every corner against the building boundary coordinates provided in FLOOR PLATE ANALYSIS. Every corner must satisfy the clearance rules (Rule 1). Show this corner-check working in `<architectural_intent>`.
+
+**Rule 8 — Explicit lift count**: Use the count from Pass 1. Never reduce it.
+
+**Rule 9 — Courtyard buildings: split all passenger lifts across TWO banks**:
+  If FLOOR PLATE ANALYSIS contains a `COURTYARD MULTI-BANK CONSTRAINT` section, you MUST use `lifts.banks`. Never try to place two clusters on a single bank in a courtyard building — the band is mathematically too narrow.
+  - Split the total passenger lift count EVENLY across the two banks (e.g. 10 lifts → 5 south + 5 north). NEVER give a bank count of 1 — a single-lift bank cannot form a valid core assembly.
+  - Each bank gets ONE cluster, opening AWAY from the void (toward the outer wall).
+  - Copy the `position`, `orientation`, and `cluster.side` values from the PLACEMENT GUIDE. Set `count` to half the total (round up for the first bank if odd).
+  - Do NOT place any cluster with `"east"` or `"west"` side on either bank if both banks are EW orientation — only `"north"` and `"south"` are permitted (Rule 5).
+  - The engine auto-generates the internal adjacency graph from your `orientation`; you do NOT supply a topology_graph.
+
+**Rule 10 — L/U/H shapes: place core near the inside junction corner**:
+  For L, U, and H floor plates the inside corner is the widest part of the floor plate — both arms converge there, providing maximum room in both the perpendicular and parallel directions.
+  - The FLOOR PLATE ANALYSIS `### Arm Feasibility Check` identifies which arm is feasible. Choose a `lifts.position` that is:
+    (a) Inside the feasible arm, AND
+    (b) Biased toward the inside corner of that arm (within one arm-width of the concave vertex), NOT mid-arm.
+  - Placing the core mid-arm leaves only one viable cluster direction (the far end). At the junction corner, clusters can attach to multiple arm faces, giving OR-Tools more valid solutions.
+  - **Mandatory numeric formula**: Let `cx, cy` = the concave (inside) corner coordinates from `footprint_points`. Let `arm_w` = width of the feasible arm, `arm_d` = depth of the feasible arm.
+    - For an EW bank in the bottom arm: `position = [cx + arm_w/4, cy + arm_d/2]` (one quarter of arm width from junction, half-depth into arm).
+    - For a NS bank in the left arm: `position = [cx + arm_w/2, cy + arm_d/4]` (half-width into arm, one quarter of arm depth from junction).
+    - Substitute FLOOR PLATE ANALYSIS `solid_zones` coordinates directly — do NOT eyeball or approximate.
+  - Example: L-shape with bottom_arm zone x=[0,50000] y=[0,20000], junction corner at [20000, 20000]. Feasible EW bank: `position = [20000 + (50000-20000)/4, 0 + 20000/2] = [27500, 10000]`. That is 7500mm east of the junction, centred in the 20000mm-deep arm.
+  - Never place the core at the bounding box centroid of the arm — always compute from the junction corner.
+
+## OUTPUT FORMAT
+Copy shell from Pass 1 UNCHANGED. Add to `lifts`:
+- `position`: [x_mm, y_mm] — core centroid
+- `orientation`: `"NS"` | `"EW"` — NS = fire clusters extend north/south; EW = fire clusters extend east/west
+- `rotation_deg`: 0.0 unless the whole core assembly must rotate to align with an angled facade
+- `clusters`: list of cluster side directives — one per cluster direction the fire assembly extends
+
+The engine auto-generates the full adjacency topology (PassengerLifts → FireLobby → FireLift → Stair on both sides). Do NOT include `topology_graph` in your output.
+
+In `<architectural_intent>` (3 sentences max): state chosen position and orientation; show the corner-check for the outermost sub-element (furthest from bank centre); confirm sightline corridors are clear to the boundary.
+
+Single-bank example (simple rectangular building):
+```json
+{
+  "typology": "...",
+  "compliance_parameters": { ... },
+  "project_setup": { ... },
+  "shell": { ... (unchanged from Pass 1) ... },
+  "lifts": {
+    "count": N,
+    "position": [x, y],
+    "orientation": "EW",
+    "rotation_deg": 0.0,
+    "clusters": [
+      {"side": "north"},
+      {"side": "south"}
+    ]
+  },
+  "staircases": { "count": N }
+}
+```
+
+Two-bank example (courtyard building — lifts split evenly):
+```json
+{
+  "lifts": {
+    "banks": [
+      {
+        "count": 5,
+        "position": [30000, 10000],
+        "orientation": "EW",
+        "rotation_deg": 0.0,
+        "clusters": [{"side": "south"}]
+      },
+      {
+        "count": 5,
+        "position": [30000, 50000],
+        "orientation": "EW",
+        "rotation_deg": 0.0,
+        "clusters": [{"side": "north"}]
+      }
+    ]
+  },
+  "staircases": { "count": N }
+}
+```
+Note: for EW bank → use "north"/"south" clusters. For NS bank → use "east"/"west" clusters.
+The `clusters[].side` directive tells the hardcoded fallback which direction to push the cluster.
+The engine handles all internal adjacency rules — do NOT add topology_graph.
+""".strip()
 
 ANTIGRAVITY_WORKFLOW_PROMPT = """Write a Revit 2026 CPython 3 script for a State-Aware Building Generator..."""

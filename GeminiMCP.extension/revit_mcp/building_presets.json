@@ -31,7 +31,7 @@
         "tread": 300,
         "width_of_flight": 1200,
         "landing_width": 1200,
-        "entry_landing_width": 2400
+        "entry_landing_width": 1200
       }
     }
   },
@@ -67,7 +67,7 @@
         "tread": 300,
         "width_of_flight": 1500,
         "landing_width": 1500,
-        "entry_landing_width": 2800
+        "entry_landing_width": 1500
       }
     }
   }

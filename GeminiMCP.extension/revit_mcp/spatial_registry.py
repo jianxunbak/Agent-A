@@ -37,6 +37,8 @@ class SpatialRegistry:
         """
         Checks if a bbox overlaps with any existing reservation.
         Touching edges (at tolerance) is allowed.
+        Corner/edge contact with overlap volume below min_overlap_vol_mm3 is also allowed
+        (handles L-shape junction false positives where adjacent clusters share a wall face).
         """
         x1, y1, z1, x2, y2, z2 = bbox
         conflicts = []
@@ -54,6 +56,15 @@ class SpatialRegistry:
             overlap_z = (z1 < oz2 - self.tolerance) and (z2 > oz1 + self.tolerance)
 
             if overlap_x and overlap_y and overlap_z:
+                # Compute actual overlap volume to distinguish real intrusion from wall/corner contact
+                ov_x = min(x2, ox2) - max(x1, ox1)
+                ov_y = min(y2, oy2) - max(y1, oy1)
+                ov_z = min(z2, oz2) - max(z1, oz1)
+                overlap_vol = max(0.0, ov_x) * max(0.0, ov_y) * max(0.0, ov_z)
+                # 100mm × 100mm × full_height is ~50,000,000 mm³ — anything below 500,000 mm³
+                # is a wall-face or corner contact (two clusters sharing a boundary surface).
+                if overlap_vol < 500000.0:
+                    continue
                 conflicts.append({
                     "id": sid,
                     "bbox": res["bbox"],

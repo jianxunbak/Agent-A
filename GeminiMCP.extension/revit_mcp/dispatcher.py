@@ -550,6 +550,38 @@ class Orchestrator:
         self.log(f"Sending to Gemini AI ({client.model}) — {creativity_label} mode (temp={temperature})...")
         if tracker: tracker.set_status("Main agent: generating building manifest ({} mode)...".format(creativity_label))
 
+        def _generate_with_heartbeat(prompt, phase_label, attempt_label=""):
+            """Call client.generate_content() with a background thread that updates the
+            tracker status every 10s so the user sees live elapsed time instead of silence."""
+            import threading as _threading
+            import time as _hb_time
+            _result_holder = [None]
+            _error_holder  = [None]
+            _start = _hb_time.time()
+
+            def _worker():
+                try:
+                    _result_holder[0] = client.generate_content(
+                        prompt, thinking_budget=thinking_budget, temperature=temperature)
+                except Exception as _e:
+                    _error_holder[0] = _e
+
+            _t = _threading.Thread(target=_worker, daemon=True)
+            _t.start()
+            _interval = 10
+            while _t.is_alive():
+                _t.join(timeout=_interval)
+                if _t.is_alive():
+                    _elapsed = int(_hb_time.time() - _start)
+                    self.log("{}{} — waiting for Gemini ({:d}s elapsed)...".format(
+                        phase_label, attempt_label, _elapsed))
+                    if tracker:
+                        tracker.set_status("{}{} — waiting for Gemini ({:d}s elapsed)...".format(
+                            phase_label, attempt_label, _elapsed))
+            if _error_holder[0] is not None:
+                raise _error_holder[0]
+            return _result_holder[0]
+
         # Build conversation history block for the main prompt.
         # Always include when there is history — Gemini uses it to:
         #   (a) understand what was previously attempted and what went wrong
@@ -581,6 +613,105 @@ class Orchestrator:
                 "not just what the manifest contains.\n"
             ).format(_inferred_goal)
         current_prompt = DISPATCHER_PROMPT + presets_text + compliance_text + "\n" + state_text + history_block + _goal_block + "\nUser Request: " + user_prompt
+
+        # Save user goal for Pass 2 and all retry conflict blocks
+        _user_goal = user_prompt
+        self._last_user_goal = _user_goal
+
+        # ── Two-pass branch: ALWAYS used for new_build intents ───────────────
+        # Pass 1 generates the shell-only manifest; the engine runs OR-Tools
+        # pre-analysis; Pass 2 adds core placement with computed position constraints.
+        # This ensures Gemini always receives a FLOOR PLATE ANALYSIS + VALID
+        # LIFTS.POSITION RANGE before placing the core — for both simple rectangular
+        # buildings and complex footprints (L/U/H/courtyard etc.).
+        _intent_for_twopass = (classified or {}).get("intent", "") if classified else ""
+        _fp_complexity = (classified or {}).get("footprint_complexity", "simple")
+        _run_two_pass = (_intent_for_twopass == "new_build")
+
+        if _run_two_pass:
+            try:
+                from revit_mcp.agent_prompts import SHELL_ONLY_SYSTEM_PROMPT, CORE_PLACEMENT_SYSTEM_PROMPT
+                from revit_mcp.revit_workers import pre_analyse_floor_plate
+                self.log("[TwoPass] new_build intent (footprint_complexity={}) — running Pass 1 (shell only).".format(_fp_complexity))
+                _pass1_prompt = (SHELL_ONLY_SYSTEM_PROMPT + "\n" + presets_text + compliance_text
+                                 + "\n" + state_text + history_block
+                                 + "\nUser Request: " + user_prompt)
+                if tracker: tracker.set_status("Pass 1: generating floor plate geometry (shell only)...")
+                _pass1_json = _generate_with_heartbeat(_pass1_prompt, "Pass 1: generating floor plate geometry")
+                _pass1_manifest = None
+                try:
+                    import json as _p1json
+                    _p1_block = _pass1_json
+                    import re as _p1re
+                    _p1_match = _p1re.search(r"```(?:json)?\s*(\{.*?\})\s*```", _p1_block, _p1re.DOTALL)
+                    if _p1_match:
+                        _pass1_manifest = _p1json.loads(_p1_match.group(1))
+                    else:
+                        _pass1_manifest = _p1json.loads(_p1_block)
+                except Exception as _p1err:
+                    self.log("[TwoPass] Pass 1 JSON parse failed: {} — falling back to single-pass.".format(_p1err))
+
+                # Retry Pass 1 once when response had no JSON at all (Gemini wrote prose instead)
+                if _pass1_manifest is None and "{" not in (_pass1_json or ""):
+                    self.log("[TwoPass] Pass 1 no-JSON response — retrying with OUTPUT-ONLY instruction.")
+                    _p1_retry_prompt = _pass1_prompt + (
+                        "\n\n[SYSTEM: Your previous response contained no JSON manifest block. "
+                        "OUTPUT THE SHELL-ONLY JSON MANIFEST NOW. "
+                        "Start your response with ```json and end with ```. "
+                        "No reasoning text. No explanation. Only the JSON manifest.]\n"
+                    )
+                    _p1_retry_raw = _generate_with_heartbeat(_p1_retry_prompt, "Pass 1 retry: shell geometry")
+                    try:
+                        import json as _p1rjson, re as _p1rre
+                        _p1r_match = _p1rre.search(r"```(?:json)?\s*(\{.*?\})\s*```", _p1_retry_raw or "", _p1rre.DOTALL)
+                        if _p1r_match:
+                            _pass1_manifest = _p1rjson.loads(_p1r_match.group(1))
+                        elif _p1_retry_raw:
+                            _pass1_manifest = _p1rjson.loads(_p1_retry_raw)
+                    except Exception as _p1rerr:
+                        self.log("[TwoPass] Pass 1 retry also failed: {} — falling back to single-pass.".format(_p1rerr))
+
+                if _pass1_manifest:
+                    self.log("[TwoPass] Pass 1 succeeded — running engine core analysis.")
+                    if tracker: tracker.set_status("Pass 1 complete — analysing floor plate for core placement...")
+                    _cp_for_analysis = _pass1_manifest.get("compliance_parameters", {})
+                    _analysis = pre_analyse_floor_plate(_pass1_manifest, compliance_overrides=_cp_for_analysis, user_goal=_user_goal)
+                    # ── DIAG: log key floor-plate analysis numbers ──────────────
+                    _fc_diag = _analysis.get("fire_cluster_elements", {})
+                    _fp_diag = _analysis.get("floor_plate", {})
+                    self.log("[TwoPass][DIAG] floor_plate analysis:"
+                             " bank_depth={}mm bank_count={}"
+                             " cluster_chain_depth={}mm"
+                             " fp_outer={}".format(
+                        _fp_diag.get("passenger_bank_total_depth_mm","?"),
+                        _fp_diag.get("num_banks","?"),
+                        _fc_diag.get("cluster_assembly_depth_mm","?"),
+                        _analysis.get("outer_bbox_mm","?"),
+                    ))
+                    _void_diag = _analysis.get("void_bounds_mm")
+                    if _void_diag:
+                        self.log("[TwoPass][DIAG] void_bounds_mm={}".format(_void_diag))
+                    _guide_diag = _analysis.get("placement_guide_bands")
+                    if _guide_diag:
+                        self.log("[TwoPass][DIAG] placement_guide_bands={}".format(_guide_diag))
+                    # ────────────────────────────────────────────────────────────
+                    _analysis_block = self._format_floor_plate_analysis(_analysis)
+                    _shell_block = "\n\n## PASS 1 SHELL MANIFEST (do not change shell — add core placement only)\n```json\n{}\n```\n".format(
+                        __import__("json").dumps(_pass1_manifest, indent=2))
+                    current_prompt = (
+                        CORE_PLACEMENT_SYSTEM_PROMPT
+                        + "\n\n## USER GOAL (do not compromise under any circumstances)\n" + _user_goal
+                        + "\n" + presets_text + compliance_text
+                        + _shell_block
+                        + "\n\n" + _analysis_block
+                        + "\n\nNow produce the complete final manifest with core placement."
+                    )
+                    self.log("[TwoPass] Pass 2 prompt assembled ({} chars). Proceeding to retry loop.".format(len(current_prompt)))
+                else:
+                    self.log("[TwoPass] Pass 1 produced no manifest — falling back to single-pass.")
+            except Exception as _tp_err:
+                self.log("[TwoPass] Two-pass setup error: {} — falling back to single-pass.".format(_tp_err))
+
         max_attempts = 3
         intent_text = None  # Captured from Gemini's <architectural_intent> for build_memory naming
 
@@ -590,7 +721,7 @@ class Orchestrator:
             "=== PROMPT SECTIONS SENT TO AI ===\n"
             "[1] SYSTEM INSTRUCTION: {} chars\n"
             "[2] PRESETS: {} chars\n"
-            "[3] COMPLIANCE ({}):\n{}\n"
+            "[3] COMPLIANCE ({}): {} chars — full content in dispatcher.py build_memory / RAG snapshot\n"
             "[4] BIM STATE:\n{}\n"
             "[5] HISTORY: {} turns\n"
             "[6] USER REQUEST: {}\n"
@@ -598,7 +729,7 @@ class Orchestrator:
                 len(DISPATCHER_PROMPT),
                 len(presets_text),
                 rag_source,
-                compliance_text[:2000] + ("... [truncated]" if len(compliance_text) > 2000 else ""),
+                len(compliance_text),
                 state_text,
                 len(_recent) if history else 0,
                 user_prompt,
@@ -610,9 +741,12 @@ class Orchestrator:
             check_cancelled("attempt {}".format(attempt + 1))
 
             ai_start = time.time()
-            manifest_json = client.generate_content(current_prompt, thinking_budget=thinking_budget, temperature=temperature)
+            _pass_label = "Pass 2: placing core" if _run_two_pass else "Generating manifest"
+            _attempt_label = " (attempt {}/{})".format(attempt + 1, max_attempts) if max_attempts > 1 else ""
+            if tracker: tracker.set_status("{}{} — sending to Gemini...".format(_pass_label, _attempt_label))
+            manifest_json = _generate_with_heartbeat(current_prompt, _pass_label, _attempt_label)
             ai_duration = time.time() - ai_start
-            
+
             self.log("Manifest received from AI. (Time: {:.2f}s). Parsing...".format(ai_duration))
             if tracker: tracker.set_status("Manifest received in {:.0f}s — parsing building design...".format(ai_duration))
 
@@ -640,6 +774,15 @@ class Orchestrator:
                 # Log full manifest to runner/console for debugging
                 self.log("=== BUILDING MANIFEST (compliance source: {}) ===\n{}\n=== END MANIFEST ===".format(
                     rag_source, json.dumps(manifest, indent=2)))
+                # ── DIAG: log Gemini's core placement decision ──────────────────
+                _lft = manifest.get("lifts", {})
+                _sh_diag = manifest.get("shell", {})
+                self.log("[DIAG][Gemini→Core] shell: width={}mm length={}mm".format(
+                    _sh_diag.get("width","?"), _sh_diag.get("length","?")))
+                self.log("[DIAG][Gemini→Core] lifts: count={} orientation={} position={} banks={}".format(
+                    _lft.get("count","?"), _lft.get("orientation","?"),
+                    _lft.get("position","?"), _lft.get("banks","(none)")))
+                # ────────────────────────────────────────────────────────────────
 
                 # Show manifest shell as a transient status (it will be superseded by build phases)
                 if tracker:
@@ -681,7 +824,11 @@ class Orchestrator:
                 # CHECK FOR CONFLICTS
                 if isinstance(results, dict) and results.get("status") == "CONFLICT":
                     conflict_desc = results.get("description", "Unknown Spatial Conflict")
-                    self.log(f"CONFLICT DETECTED in Attempt {attempt+1}: {conflict_desc}")
+                    _cd_safe = conflict_desc.encode("ascii", "replace").decode("ascii")
+                    # ── DIAG: log full conflict description ──────────────────────
+                    self.log("[DIAG][CONFLICT] Attempt {} full description:\n{}".format(
+                        attempt+1, _cd_safe))
+                    # ────────────────────────────────────────────────────────────
                     if tracker:
                         tracker.report(f"### [Validation Failed] Attempt {attempt+1}\n{conflict_desc}")
 
@@ -691,8 +838,11 @@ class Orchestrator:
                         _layout = results.get("core_layout_summary", "")
                         _hints = results.get("resolution_hints", [])
                         _core_mm = results.get("core_total_mm", {})
+                        _fd_list = results.get("ortools_failure_details", [])
 
                         _conflict_block = "[SPATIAL CONFLICT — ATTEMPT {} FAILED]\n\n".format(attempt + 1)
+                        if getattr(self, "_last_user_goal", ""):
+                            _conflict_block += "USER GOAL (do not compromise): {}\n\n".format(self._last_user_goal)
                         _conflict_block += "Engine reported: {}\n\n".format(conflict_desc)
 
                         if _layout:
@@ -706,6 +856,28 @@ class Orchestrator:
                                 _core_mm.get("width", "?"),
                                 _core_mm.get("depth", "?"),
                             )
+
+                        # Per-bank failure details: exact bank position, clearance vs. needed
+                        if _fd_list:
+                            _conflict_block += "Per-bank OR-Tools failure details:\n"
+                            for _fd in _fd_list:
+                                _bp = _fd.get("bank_pos_mm", ["?", "?"])
+                                _ts = _fd.get("tried_side", "?")
+                                _dn = _fd.get("cluster_d_needed", "?")
+                                _ca = _fd.get("clearance_avail")
+                                _vr = _fd.get("valid_range", "")
+                                _conflict_block += (
+                                    "  Bank set {}: position [{}, {}] mm\n"
+                                    "    Tried {} face — cluster needs {}mm clearance, "
+                                    "{}mm available.\n"
+                                ).format(
+                                    _fd.get("set_index", "?"),
+                                    _bp[0], _bp[1], _ts, _dn,
+                                    _ca if _ca is not None else "unknown",
+                                )
+                                if _vr:
+                                    _conflict_block += "    Fix: {}\n".format(_vr)
+                            _conflict_block += "\n"
 
                         if _mi:
                             _conflict_block += (
@@ -727,18 +899,33 @@ class Orchestrator:
                                 _conflict_block += "  • {}\n".format(_h)
                             _conflict_block += "\n"
 
-                        _conflict_block += (
-                            "You are the Lead Architect. The engine has given you its diagnosis above — "
-                            "use it as a starting point, but you are not bound to follow it mechanically. "
-                            "If you see a better solution (different typology, different core arrangement, "
-                            "rethinking the floor count or shape), use your architectural judgement. "
-                            "The only hard rules are: no two core zones may overlap, and all code-minimum "
-                            "dimensions must be satisfied.\n\n"
-                            "In <resolution_thoughts>, write ONE sentence naming the specific change you made "
-                            "and your reasoning — e.g. 'Reduced lift count from 8 to 6 to shrink core width "
-                            "from 9200mm to 7400mm, fitting within the 25000mm shell.' "
-                            "Then generate the corrected manifest."
-                        )
+                        _all_bands_inf = results.get("all_bands_infeasible", False)
+                        _min_bldg_mm   = results.get("min_building_mm", 0)
+                        if _all_bands_inf and _min_bldg_mm:
+                            _conflict_block += (
+                                "BUILDING TOO SMALL — repositioning the core will NOT fix this.\n"
+                                "You MUST choose ONE of:\n"
+                                "  (a) Increase shell.length OR shell.width to ≥ {} mm, OR\n"
+                                "  (b) Reduce lifts.count to decrease chain depth.\n"
+                                "The floor plate geometry and void are in the PLACEMENT GUIDE above — "
+                                "verify your new dimensions satisfy the band constraints before generating the manifest.\n\n"
+                                "In <resolution_thoughts>, write ONE sentence naming the specific change — "
+                                "e.g. 'Increased shell.length from 60000mm to {}mm so the south/north band is wide enough for the core chain.' "
+                                "Then generate the corrected manifest."
+                            ).format(_min_bldg_mm, _min_bldg_mm)
+                        else:
+                            _conflict_block += (
+                                "You are the Lead Architect. The engine has given you its diagnosis above — "
+                                "use it as a starting point, but you are not bound to follow it mechanically. "
+                                "If you see a better solution (different typology, different core arrangement, "
+                                "rethinking the floor count or shape), use your architectural judgement. "
+                                "The only hard rules are: no two core zones may overlap, and all code-minimum "
+                                "dimensions must be satisfied.\n\n"
+                                "In <resolution_thoughts>, write ONE sentence naming the specific change you made "
+                                "and your reasoning — e.g. 'Reduced lift count from 8 to 6 to shrink core width "
+                                "from 9200mm to 7400mm, fitting within the 25000mm shell.' "
+                                "Then generate the corrected manifest."
+                            )
 
                         current_prompt += "\n\n" + _conflict_block
                         self.log(f"Retry prompt conflict block ({len(_conflict_block)} chars) appended for attempt {attempt+2}.")
@@ -811,6 +998,15 @@ class Orchestrator:
                 # If the failure was a missing JSON block (model produced prose instead),
                 # give a laser-focused retry that forbids all prose output.
                 if "Expecting value" in str(e) or "no JSON" in str(e).lower():
+                    _raw_resp = manifest_json if isinstance(manifest_json, str) else ""
+                    _no_json_brace = "{" not in _raw_resp
+                    self.log("_orchestrate: no-JSON response detected (no_brace={}) — injecting OUTPUT-ONLY reprompt".format(
+                        _no_json_brace))
+                    _shell_adj_note = (
+                        "\nREMINDER — if the core cannot fit in the current arm geometry, "
+                        "you ARE permitted to widen the relevant arm (Rule 3 conditional exception). "
+                        "Do NOT write an essay explaining why it cannot fit — widen the arm and output the manifest."
+                    ) if _no_json_brace else ""
                     current_prompt += (
                         "\n\n[CRITICAL — PREVIOUS RESPONSE HAD NO JSON BLOCK]:\n"
                         "Your last response contained only prose/reasoning text — no ```json block was found.\n"
@@ -819,6 +1015,7 @@ class Orchestrator:
                         "2. The ```json\\n{...}\\n``` manifest block\n"
                         "Do NOT write any analysis, tables, bullet lists, or explanations outside these two blocks.\n"
                         "Use sparse footprint_scale_overrides (5-8 control points only, NOT one entry per floor)."
+                        + _shell_adj_note
                     )
                 else:
                     current_prompt += f"\n\n[ERROR IN PREVIOUS ATTEMPT]:\n{str(e)}\n\nPlease ensure you follow the JSON schema strictly."
@@ -845,6 +1042,360 @@ class Orchestrator:
                 tracker.report(f"**Conflict Resolution Logic:**\n{res_text}", is_narrative=True)
 
         return captured_intent
+
+    def _is_complex_footprint(self, manifest):
+        """Return True if the manifest describes a footprint that requires two-pass placement."""
+        shell = manifest.get("shell", {})
+        if shell.get("footprint_points"):           return True
+        if shell.get("footprint_svg"):              return True
+        if shell.get("footprint_holes"):            return True
+        if shell.get("footprint_offset_overrides"): return True
+        if manifest.get("volumes"):                 return True
+        return False
+
+    def _format_floor_plate_analysis(self, analysis):
+        """Format pre_analyse_floor_plate() result into a text block for the Pass 2 prompt."""
+        a = analysis
+        fp = a.get("passenger_lift_elements", {})
+        fc = a.get("fire_cluster_elements", {})
+        fv = a.get("floor_plate_variation", {})
+        b3 = a.get("building_form_3d", {})
+        zones = a.get("solid_zones", [])
+        vbounds = b3.get("void_boundaries_mm")
+        area_m2 = a.get("floor_plate_area_mm2", 0) / 1e6
+
+        _bbox = a.get("bounding_box_mm", [])
+        _coord_note = ""
+        if _bbox and len(_bbox) == 4 and (_bbox[0] < 0 or _bbox[1] < 0):
+            _coord_note = (" COORDINATE SYSTEM: all coordinates below are centred on [0,0] "
+                           "(bounding box [{},{},{},{}] mm). "
+                           "Use these centred coordinates for lifts.position — do NOT use the "
+                           "absolute coordinates from the SVG in the shell manifest.").format(
+                               _bbox[0], _bbox[1], _bbox[2], _bbox[3])
+
+        lines = [
+            "## FLOOR PLATE ANALYSIS (engine-computed — use this to plan core placement)",
+            "",
+            "Shape: {} | Floor area: {:.0f} m²{}".format(
+                a.get("shape_classification", "?"), area_m2, _coord_note),
+            "",
+            "### 3D Building Form",
+            "Form type: {}".format(b3.get("form_type", "?")),
+            b3.get("description", ""),
+            "Floor plate variation: {}".format(fv.get("description", "uniform")),
+            "Smallest plate: {} × {} mm (governs minimum clearance on all levels)".format(
+                fv.get("smallest_plate_mm", ["?", "?"])[0],
+                fv.get("smallest_plate_mm", ["?", "?"])[1]),
+            "",
+            "### Passenger Lift Bank (per bank — engine-computed)",
+            "  Unit width per lift car: {} mm  →  bank length = N_lifts × {} mm".format(
+                fp.get("lift_car_unit_w_mm", "?"), fp.get("lift_car_unit_w_mm", "?")),
+            "  Bank depth (fixed, locked): {} mm  (both rows of cars + lobby + shaft walls combined)".format(
+                fp.get("passenger_bank_total_depth_mm", "?")),
+            "  Shaft wall thickness: {} mm  |  Car: {} mm wide × {} mm deep  |  Lobby gap: {} mm deep".format(
+                fp.get("lift_wall_thickness_mm", "?"), fp.get("lift_car_w_mm", "?"),
+                fp.get("lift_car_d_mm", "?"), fp.get("passenger_lobby_depth_mm", "?")),
+            "  LOBBY OPEN FACES — passengers enter the lobby from the TWO ENDS of the long axis:",
+            "    EW bank → lobby open faces = EAST end + WEST end → clusters MUST be 'north' or 'south'",
+            "    NS bank → lobby open faces = NORTH end + SOUTH end → clusters MUST be 'east' or 'west'",
+            "  RULE: Never place a cluster on a face that is a lobby open face. This is ABSOLUTE.",
+            "  LOCKED ZONE: the full bank bounding box (length × depth above) — no fire cluster",
+            "  element may overlap or enter it.",
+            "",
+            "### Fire Cluster Elements ({} clusters required)".format(fc.get("num_clusters", "?")),
+            "  Fire lift shaft: {} mm wide × {} mm deep".format(
+                fc.get("fire_lift_shaft_w_mm", "?"), fc.get("fire_lift_shaft_d_mm", "?")),
+            "  Fire lift lobby (min): {} mm deep, {:.1f} m² area".format(
+                fc.get("fire_lobby_min_depth_mm", "?"),
+                fc.get("fire_lobby_min_area_mm2", 0) / 1e6),
+            "  Smoke stop lobby (min): {} mm deep, {:.1f} m² area".format(
+                fc.get("smoke_stop_lobby_min_depth_mm", "?"),
+                fc.get("smoke_stop_lobby_min_area_mm2", 0) / 1e6),
+            "  Staircase shaft: {} mm wide × {} mm deep (flight width: {} mm)".format(
+                fc.get("staircase_shaft_w_mm", "?"), fc.get("staircase_shaft_d_mm", "?"),
+                fc.get("staircase_flight_w_mm", "?")),
+            "  CLUSTER ASSEMBLY DEPTH (fire_lift + lobby + staircase stacked perpendicular to bank face): {} mm".format(
+                fc.get("cluster_assembly_depth_mm", "?")),
+            "  → This is the FULL chain depth. For EW banks: the chain extends N or S by this amount.",
+            "  → Verify: bank_face_to_obstacle_mm ≥ cluster_assembly_depth_mm.",
+            "  → Verify: bank_face_Y + cluster_assembly_depth_mm ≤ fp_ymin (S cluster) or ≥ fp_ymax (N cluster).",
+            "",
+            "### Escape Staircases Required: {}".format(a.get("staircase_count_required", 2)),
+            "### Default clearance from core to floor plate boundary: {} mm".format(
+                a.get("minimum_clearance_mm", 6000)),
+            "  (User intent overrides this default — if the user requests facade alignment, override.)",
+        ]
+
+        # Outer boundary coordinates for corner-check arithmetic
+        _fp_poly = a.get("footprint_polygon_mm")
+        _outer_bbox = a.get("bounding_box_mm", [])
+        if _fp_poly and len(_fp_poly) >= 3:
+            lines.append("")
+            lines.append("### Building Boundary Coordinates (use for corner-check arithmetic)")
+            lines.append("  Outer polygon vertices (mm): {}".format(
+                ", ".join("[{},{}]".format(int(p[0]), int(p[1])) for p in _fp_poly)))
+        elif _outer_bbox and len(_outer_bbox) == 4:
+            lines.append("")
+            lines.append("### Building Boundary Coordinates (use for corner-check arithmetic)")
+            lines.append("  Outer bounding box (mm): xmin={} ymin={} xmax={} ymax={}".format(
+                int(_outer_bbox[0]), int(_outer_bbox[1]), int(_outer_bbox[2]), int(_outer_bbox[3])))
+
+        if vbounds:
+            _void_xmin, _void_ymin, _void_xmax, _void_ymax = (
+                int(vbounds[0]), int(vbounds[1]), int(vbounds[2]), int(vbounds[3]))
+            lines.append("  Inner void (mm): xmin={} ymin={} xmax={} ymax={}".format(
+                _void_xmin, _void_ymin, _void_xmax, _void_ymax))
+            lines.append("  Void centre: [{}, {}] mm".format(
+                int((_void_xmin + _void_xmax) / 2), int((_void_ymin + _void_ymax) / 2)))
+            if _coord_note:
+                lines.append("  NOTE: coordinates above are centred on [0,0] — use them directly for lifts.position.")
+            # Placement guidance: compute ACTUAL valid bank_centre ranges for each band.
+            # For each band, the bank must:
+            #   (a) sit entirely outside the void (bank face clears void edge)
+            #   (b) leave enough room for the fire cluster chain on the outer side
+            # Valid ranges are [lo, hi]; if lo > hi the band is INFEASIBLE.
+            _clust_d = fc.get("cluster_assembly_depth_mm", 0)
+            _bank_d_half = int(fp.get("passenger_bank_total_depth_mm", 0)) // 2
+            if _clust_d and _bank_d_half:
+                # Footprint outer bounds (use outer_bbox when available, else void ± generous margin)
+                if _outer_bbox and len(_outer_bbox) == 4:
+                    _fp_xmin_pg, _fp_ymin_pg = int(_outer_bbox[0]), int(_outer_bbox[1])
+                    _fp_xmax_pg, _fp_ymax_pg = int(_outer_bbox[2]), int(_outer_bbox[3])
+                else:
+                    # Fallback: pad void by a generous margin
+                    _fp_xmin_pg = _void_xmin - 20000; _fp_xmax_pg = _void_xmax + 20000
+                    _fp_ymin_pg = _void_ymin - 20000; _fp_ymax_pg = _void_ymax + 20000
+                # South band: bank sits between fp_ymin and void_ymin, cluster goes south (outer)
+                #   bank_y1 ≥ fp_ymin + cluster_depth  →  bank_cy ≥ fp_ymin + cluster_depth + bank_hd
+                #   bank_y2 ≤ void_ymin                →  bank_cy ≤ void_ymin - bank_hd
+                _s_lo = _fp_ymin_pg + _clust_d + _bank_d_half
+                _s_hi = _void_ymin - _bank_d_half
+                # North band: bank sits between void_ymax and fp_ymax, cluster goes north (outer)
+                #   bank_y1 ≥ void_ymax                →  bank_cy ≥ void_ymax + bank_hd
+                #   bank_y2 ≤ fp_ymax - cluster_depth  →  bank_cy ≤ fp_ymax - cluster_depth - bank_hd
+                _n_lo = _void_ymax + _bank_d_half
+                _n_hi = _fp_ymax_pg - _clust_d - _bank_d_half
+                # East band: bank between void_xmax and fp_xmax, cluster goes east
+                _e_lo = _void_xmax + _bank_d_half
+                _e_hi = _fp_xmax_pg - _clust_d - _bank_d_half
+                # West band: bank between fp_xmin and void_xmin, cluster goes west
+                _w_lo = _fp_xmin_pg + _clust_d + _bank_d_half
+                _w_hi = _void_xmin - _bank_d_half
+
+                lines.append("  PLACEMENT GUIDE — valid bank_centre ranges for EW bank (cluster goes N or S):")
+                lines.append("    Cluster chain depth = {} mm (fire_lift + lobby + stair stacked)".format(_clust_d))
+                lines.append("    Bank half-depth = {} mm".format(_bank_d_half))
+                if _s_lo <= _s_hi:
+                    lines.append("    South band — FEASIBLE: bank_centre_y in [{}, {}] mm  (bank south of void, cluster toward south wall)".format(
+                        _s_lo, _s_hi))
+                else:
+                    lines.append("    South band — INFEASIBLE: need bank_cy in [{}, {}] mm but lo>hi "
+                                 "(south band {}mm deep, need chain {}mm + bank_depth {}mm = {}mm total)".format(
+                        _s_lo, _s_hi,
+                        _void_ymin - _fp_ymin_pg,
+                        _clust_d, _bank_d_half * 2, _clust_d + _bank_d_half * 2))
+                if _n_lo <= _n_hi:
+                    lines.append("    North band — FEASIBLE: bank_centre_y in [{}, {}] mm  (bank north of void, cluster toward north wall)".format(
+                        _n_lo, _n_hi))
+                else:
+                    lines.append("    North band — INFEASIBLE: need bank_cy in [{}, {}] mm but lo>hi "
+                                 "(north band {}mm deep, need chain {}mm + bank_depth {}mm = {}mm total)".format(
+                        _n_lo, _n_hi,
+                        _fp_ymax_pg - _void_ymax,
+                        _clust_d, _bank_d_half * 2, _clust_d + _bank_d_half * 2))
+                lines.append("  PLACEMENT GUIDE — valid bank_centre ranges for NS bank (cluster goes E or W):")
+                if _e_lo <= _e_hi:
+                    lines.append("    East band — FEASIBLE: bank_centre_x in [{}, {}] mm  (bank east of void, cluster toward east wall)".format(
+                        _e_lo, _e_hi))
+                else:
+                    lines.append("    East band — INFEASIBLE: need bank_cx in [{}, {}] mm but lo>hi "
+                                 "(east band {}mm wide, need chain {}mm + bank_depth {}mm = {}mm total)".format(
+                        _e_lo, _e_hi,
+                        _fp_xmax_pg - _void_xmax,
+                        _clust_d, _bank_d_half * 2, _clust_d + _bank_d_half * 2))
+                if _w_lo <= _w_hi:
+                    lines.append("    West band — FEASIBLE: bank_centre_x in [{}, {}] mm  (bank west of void, cluster toward west wall)".format(
+                        _w_lo, _w_hi))
+                else:
+                    lines.append("    West band — INFEASIBLE: need bank_cx in [{}, {}] mm but lo>hi "
+                                 "(west band {}mm wide, need chain {}mm + bank_depth {}mm = {}mm total)".format(
+                        _w_lo, _w_hi,
+                        _void_xmin - _fp_xmin_pg,
+                        _clust_d, _bank_d_half * 2, _clust_d + _bank_d_half * 2))
+                _any_feasible = any([_s_lo <= _s_hi, _n_lo <= _n_hi, _e_lo <= _e_hi, _w_lo <= _w_hi])
+                if not _any_feasible:
+                    _min_band_sz = _clust_d + _bank_d_half * 2 + 1000
+                    _void_y_depth = _void_ymax - _void_ymin
+                    _void_x_depth = _void_xmax - _void_xmin
+                    _min_bldg_ew = int(_void_y_depth + 2 * _min_band_sz)
+                    _min_bldg_ns = int(_void_x_depth + 2 * _min_band_sz)
+                    _cur_ew = int(_fp_ymax_pg - _fp_ymin_pg)
+                    _cur_ns = int(_fp_xmax_pg - _fp_xmin_pg)
+                    lines.append("  *** ALL BANDS INFEASIBLE *** The courtyard bands are too narrow for this bank size.")
+                    lines.append("  Minimum building size needed:")
+                    lines.append("    shell.length ≥ {} mm  (EW bank, shortfall: {} mm)".format(
+                        _min_bldg_ew, max(0, _min_bldg_ew - _cur_ew)))
+                    lines.append("    shell.width  ≥ {} mm  (NS bank, shortfall: {} mm)".format(
+                        _min_bldg_ns, max(0, _min_bldg_ns - _cur_ns)))
+                    lines.append("  Fix options (choose one):")
+                    lines.append("    1. Increase shell.length to ≥ {} mm (EW bank) OR shell.width to ≥ {} mm (NS bank).".format(
+                        _min_bldg_ew, _min_bldg_ns))
+                    lines.append("    2. Reduce lifts.count so chain depth decreases.")
+                    lines.append("    3. Shrink the courtyard void (reduce footprint_holes dimensions).")
+                    lines.append("  MANDATORY: Do NOT just move lifts.position — there is no valid position at the current building size.")
+                lines.append("  CRITICAL: lifts.position MUST land inside one of the FEASIBLE ranges above. "
+                             "Do NOT place the bank overlapping the void or in an INFEASIBLE band.")
+
+        if zones:
+            lines.append("")
+            lines.append("### Solid Zones")
+            for z in zones:
+                lines.append("  {}: centroid {} mm — {} mm wide × {} mm deep".format(
+                    z.get("label", "?"), z.get("centroid_mm", "?"),
+                    z.get("available_w_mm", 0), z.get("available_d_mm", 0)))
+
+            # Per-arm feasibility check: compute whether each arm is wide/deep enough
+            # to fit the fire-safety cluster in EW or NS orientation.
+            _bank_d  = fp.get("passenger_bank_total_depth_mm", 0) or 0
+            _clust_d = fc.get("cluster_assembly_depth_mm", 0) or 0
+            _corr    = 1200  # min corridor each side (mm)
+            _min_span = _bank_d + _clust_d + 2 * _corr  # total depth needed perpendicular to bank
+            if _bank_d and _clust_d:
+                lines.append("")
+                lines.append("### Arm Feasibility Check")
+                lines.append(
+                    "  Required perpendicular span = bank_depth({}) + cluster_depth({}) + 2×corridor({}) = {} mm".format(
+                        _bank_d, _clust_d, _corr, _min_span))
+                for z in zones:
+                    _aw = z.get("available_w_mm", 0) or 0
+                    _ad = z.get("available_d_mm", 0) or 0
+                    _lbl = z.get("label", "?")
+                    lines.append("  {} ({}mm wide × {}mm deep):".format(_lbl, _aw, _ad))
+                    # EW bank: bank runs east-west, cluster extends N or S → depth is the constraint
+                    _ew_ok = _ad >= _min_span
+                    _ew_short = _min_span - _ad if not _ew_ok else 0
+                    if _ew_ok:
+                        lines.append("    EW bank (N/S cluster): arm {}mm deep ≥ {}mm needed → FEASIBLE".format(
+                            _ad, _min_span))
+                    else:
+                        lines.append(
+                            "    EW bank (N/S cluster): arm {}mm deep < {}mm needed → INFEASIBLE "
+                            "(widen arm by min +{}mm, move concave corner outward by {}mm)".format(
+                                _ad, _min_span, _ew_short, _ew_short))
+                    # NS bank: bank runs north-south, cluster extends E or W → width is the constraint
+                    _ns_ok = _aw >= _min_span
+                    _ns_short = _min_span - _aw if not _ns_ok else 0
+                    if _ns_ok:
+                        lines.append("    NS bank (E/W cluster): arm {}mm wide ≥ {}mm needed → FEASIBLE".format(
+                            _aw, _min_span))
+                    else:
+                        lines.append(
+                            "    NS bank (E/W cluster): arm {}mm wide < {}mm needed → INFEASIBLE "
+                            "(widen arm by min +{}mm, move concave corner outward by {}mm)".format(
+                                _aw, _min_span, _ns_short, _ns_short))
+                    if _ew_ok or _ns_ok:
+                        _orient = []
+                        if _ew_ok: _orient.append("EW bank")
+                        if _ns_ok: _orient.append("NS bank")
+                        lines.append("    VERDICT: {} feasible in this arm.".format(" and ".join(_orient)))
+                    else:
+                        lines.append(
+                            "    VERDICT: NEITHER orientation fits — arm must be widened. "
+                            "Minimum: widen depth by {}mm (for EW bank) OR widen width by {}mm (for NS bank). "
+                            "Per Rule 3 conditional exception, you MAY widen this arm.".format(
+                                _ew_short, _ns_short))
+
+        # Courtyard multi-bank split guidance
+        _csplit = a.get("courtyard_split_guidance", {})
+        if _csplit.get("requires_separate_banks"):
+            _mb = _csplit.get("main_bank", {})
+            _sb = _csplit.get("secondary_bank", {})
+            _bb_cs = a.get("bounding_box_mm", [0, 0, 0, 0])
+            _cx = int((_bb_cs[0] + _bb_cs[2]) / 2)
+            lines.append("")
+            lines.append("### ⚠ COURTYARD MULTI-BANK CONSTRAINT (MANDATORY — Rule 9)")
+            lines.append("  " + _csplit.get("reason", ""))
+            lines.append("  You MUST use lifts.banks with exactly this structure:")
+            lines.append('  "lifts": {')
+            lines.append('    "banks": [')
+            lines.append('      {')
+            lines.append('        "count": {},'.format(_mb.get("count", "?")))
+            lines.append('        "position": [{}, {}],'.format(_cx, _mb.get("position_y_mm", "?")))
+            lines.append('        "orientation": "EW",')
+            lines.append('        "clusters": [{{"side": "{}"}}]'.format(_mb.get("cluster_side", "south")))
+            lines.append('      },')
+            lines.append('      {')
+            lines.append('        "count": {},'.format(_sb.get("count", 1)))
+            lines.append('        "position": [{}, {}],'.format(_cx, _sb.get("position_y_mm", "?")))
+            lines.append('        "orientation": "EW",')
+            lines.append('        "clusters": [{{"side": "{}"}}]'.format(_sb.get("cluster_side", "north")))
+            lines.append('      }')
+            lines.append('    ]')
+            lines.append('  }')
+            lines.append("  Main bank (count={}, y={}): {} cluster outer face at y={} — {}mm from outer wall".format(
+                _mb.get("count", "?"), _mb.get("position_y_mm", "?"),
+                _mb.get("cluster_side", "?"), _mb.get("cluster_outer_y_mm", "?"),
+                _mb.get("south_wall_clearance_mm", "?")))
+            lines.append("  Secondary bank (count={}, y={}): {} cluster outer face at y={} — {}mm from outer wall".format(
+                _sb.get("count", 1), _sb.get("position_y_mm", "?"),
+                _sb.get("cluster_side", "?"), _sb.get("cluster_outer_y_mm", "?"),
+                _sb.get("north_wall_clearance_mm", "?")))
+            lines.append("  Use these x={}, y coordinates EXACTLY.".format(_cx))
+            lines.append("  Both cluster lobby faces open AWAY from the void — no door faces the courtyard.")
+
+        # ── Engine-Computed Core Sizes (arithmetic — no pre-solve OR-Tools call) ──
+        # OR-Tools pre-computation removed: it ran against a dummy anchor and added
+        # 5–20s per build. Module sizes below are from BS-standards arithmetic and
+        # are what OR-Tools actually uses at build time.
+        lines.append("")
+        _fc_fl_d  = fc.get("fire_lift_shaft_d_mm", "?")
+        _fc_fl_w  = fc.get("fire_lift_shaft_w_mm", "?")
+        _fc_lb_d  = fc.get("fire_lobby_min_depth_mm", "?")
+        _fc_sw    = fc.get("staircase_shaft_w_mm", "?")
+        _fc_sd    = fc.get("staircase_shaft_d_mm", "?")
+        _fc_cd    = fc.get("cluster_assembly_depth_mm", "?")
+        _nc       = fc.get("num_clusters", "?")
+        lines.append("### Engine Core Sizes ({} cluster(s) required)".format(_nc))
+        lines.append("  Module sizes: fire lift {}×{}mm  |  fire lobby ≥{}mm deep  |  staircase {}×{}mm".format(
+            _fc_fl_w, _fc_fl_d, _fc_lb_d, _fc_sw, _fc_sd))
+        lines.append("  CLUSTER ASSEMBLY DEPTH (from bank face to cluster outer edge): {} mm".format(_fc_cd))
+        lines.append("  This is how far each cluster extends away from the bank face.")
+
+        # Valid bank position range from arithmetic (same formula as before, no OR-Tools needed)
+        _pos_bbox = _outer_bbox if (_outer_bbox and len(_outer_bbox) == 4) else None
+        _bank_half_d = int(fp.get("passenger_bank_total_depth_mm", 0)) // 2
+        if _pos_bbox and _bank_half_d and isinstance(_fc_cd, int):
+            _bx1, _by1, _bx2, _by2 = (int(_pos_bbox[0]), int(_pos_bbox[1]),
+                                       int(_pos_bbox[2]), int(_pos_bbox[3]))
+            lines.append("")
+            lines.append("  ### VALID LIFTS.POSITION RANGE (arithmetic — MUST satisfy ALL constraints)")
+            lines.append("  Building boundary: x=[{}, {}] mm  y=[{}, {}] mm".format(_bx1, _by1, _bx2, _by2))
+            lines.append("  Bank half-depth: {} mm  |  Cluster assembly depth: {} mm".format(_bank_half_d, _fc_cd))
+            lines.append("  NS bank (clusters E or W of bank):")
+            lines.append("    bank_centre_x ≥ {} mm  (= {}+{})  [west edge clear]".format(
+                _bx1 + _bank_half_d, _bx1, _bank_half_d))
+            lines.append("    bank_centre_x ≤ {} mm  (= {}-{})  [east edge clear]".format(
+                _bx2 - _bank_half_d, _bx2, _bank_half_d))
+            lines.append("    East cluster: bank_centre_x ≤ {} mm  (= {}-{}-{})".format(
+                _bx2 - _bank_half_d - _fc_cd, _bx2, _bank_half_d, _fc_cd))
+            lines.append("    West cluster: bank_centre_x ≥ {} mm  (= {}+{}+{})".format(
+                _bx1 + _bank_half_d + _fc_cd, _bx1, _bank_half_d, _fc_cd))
+            lines.append("  EW bank (clusters N or S of bank):")
+            lines.append("    bank_centre_y ≥ {} mm  (= {}+{})  [south edge clear]".format(
+                _by1 + _bank_half_d, _by1, _bank_half_d))
+            lines.append("    bank_centre_y ≤ {} mm  (= {}-{})  [north edge clear]".format(
+                _by2 - _bank_half_d, _by2, _bank_half_d))
+            lines.append("    North cluster: bank_centre_y ≤ {} mm  (= {}-{}-{})".format(
+                _by2 - _bank_half_d - _fc_cd, _by2, _bank_half_d, _fc_cd))
+            lines.append("    South cluster: bank_centre_y ≥ {} mm  (= {}+{}+{})".format(
+                _by1 + _bank_half_d + _fc_cd, _by1, _bank_half_d, _fc_cd))
+            lines.append("  CRITICAL: place bank so EVERY cluster fits within building boundary.")
+            lines.append("  The engine will snap the bank by up to 2000mm if slightly outside — but")
+            lines.append("  large violations will still cause a CONFLICT. Stay within the range above.")
+
+        lines.append("")
+        lines.append("END FLOOR PLATE ANALYSIS — verify every sub-element corner against boundary coords above before committing.")
+        return "\n".join(lines)
 
     def _answer_query(self, uiapp, user_prompt, tracker=None, classified=None):
         """Handle query intent: gather BIM state + options list, then answer directly.
@@ -1696,15 +2247,40 @@ class Orchestrator:
         if data.startswith("edit_entire_building_dimensions(") and data.endswith(")"):
             data = data[len("edit_entire_building_dimensions("):-1].strip()
 
-        # Final Fallback: Find the first { and last }
+        # Final Fallback: depth-counter brace search so trailing text after the JSON
+        # object does not cause json.loads "Extra data" errors (rfind grabbed too far).
         try:
             start = data.find("{")
-            end = data.rfind("}")
-            if start != -1 and end != -1:
-                candidate = data[start:end+1].strip()
-                self.log("_extract_json: extracted via brace search ({} chars)".format(len(candidate)))
-                return candidate
-        except:
+            if start != -1:
+                depth = 0
+                end = -1
+                in_string = False
+                escape_next = False
+                for i in range(start, len(data)):
+                    ch = data[i]
+                    if escape_next:
+                        escape_next = False
+                        continue
+                    if ch == "\\" and in_string:
+                        escape_next = True
+                        continue
+                    if ch == '"':
+                        in_string = not in_string
+                        continue
+                    if in_string:
+                        continue
+                    if ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            end = i
+                            break
+                if end != -1:
+                    candidate = data[start:end+1].strip()
+                    self.log("_extract_json: extracted via brace-depth search ({} chars)".format(len(candidate)))
+                    return candidate
+        except Exception:
             pass
 
         self.log("_extract_json: FAILED — no JSON found in response")
