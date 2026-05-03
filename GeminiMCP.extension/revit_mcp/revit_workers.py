@@ -4627,9 +4627,28 @@ class RevitWorkers:
                 if _bk_topo:
                     _bk_for_solver["topology_graph"] = _bk_topo
 
+                # For EW banks, the fire cluster must snap to the SMALLER row's east face,
+                # not the full anchor east face.  Row1 (smaller, floor(n/2) lifts) width:
+                #   bw1 = n1*(car_w + wall_t) + wall_t  with car_w=2500, wall_t=350
+                # Fire anchor east = bank_xmin + bw1 (rows are left-aligned).
+                _bk_lcb_fire = _bk_lcb  # default: full anchor
+                if _bk_n >= 4 and _bk_orientation == "EW":
+                    _car_w, _wall_t = 2500, 350
+                    _n1_fire = int(_bkm.floor(_bk_n / 2.0))
+                    _bw1_fire = _n1_fire * (_car_w + _wall_t) + _wall_t
+                    _bk_lcb_fire = (
+                        _bk_lcb[0],
+                        _bk_lcb[1],
+                        _bk_lcb[0] + _bw1_fire,  # trimmed east = smaller row east face
+                        _bk_lcb[3],
+                    )
+                    self.log("[MultiBank] Bank {}: fire anchor trimmed to smaller row east={:.0f} "
+                             "(full={:.0f} bw1={:.0f} n1={})".format(
+                        _bk_idx, _bk_lcb_fire[2], _bk_lcb[2], _bw1_fire, _n1_fire))
+
                 _bk_fs = fire_safety_logic.generate_fire_safety_manifest(
                     _bk_sets, levels_manifest, stair_spec, typical_h_mm, preset_fs,
-                    _bk_lcb, _bk_n, lobby_w,
+                    _bk_lcb_fire, _bk_n, lobby_w,
                     compliance_overrides=_cp_overrides,
                     footprint_pts=shell.get("footprint_points"),
                     footprint_holes=_normalise_footprint_holes(shell.get("footprint_holes", [])),
