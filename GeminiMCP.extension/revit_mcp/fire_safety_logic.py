@@ -3423,6 +3423,17 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
         else:
             _skip_lobby_face = None
 
+        # ── Determine which fire lift shaft face is shared with the passenger bank ──
+        # The shaft face that abuts the bank boundary is a duplicate of the bank's own
+        # wall; skip it to prevent co-planar double walls that cause a visible gap in Revit.
+        if is_fl and lift_core_bounds_mm:
+            if is_ew:
+                _skip_fl_bank_face = "W" if is_east_ew else "E"
+            else:
+                _skip_fl_bank_face = "N" if is_south else "S"
+        else:
+            _skip_fl_bank_face = None
+
         # ── Sub-boundary reservations ────────────────────────────────────────
         if _skip_set:
             continue
@@ -3441,7 +3452,7 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
             fl_cy = (fl_box[1] + fl_box[3]) / 2.0
             fl_fw = fl_box[2] - fl_box[0]   # X extent → fw_mm
             fl_fd = fl_box[3] - fl_box[1]   # Y extent → fd_mm
-            ls_walls, ls_floors = _fire_lift_shaft_walls(tag + "_FL", fl_cx, fl_cy, fl_fw, fl_fd, levels_data, overrun_height=overrun_height)
+            ls_walls, ls_floors = _fire_lift_shaft_walls(tag + "_FL", fl_cx, fl_cy, fl_fw, fl_fd, levels_data, overrun_height=overrun_height, skip_wall=_skip_fl_bank_face)
             walls.extend(ls_walls)
             floors.extend(ls_floors)
             # Floor-slab void for fire lift shaft — inner clear space (wall centerlines
@@ -3453,6 +3464,16 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
         lobby_tag   = tag + "_LB"
         lb_x1_w, lb_x2_w = lb_box[0], lb_box[2]
         lb_y1_w, lb_y2_w = lb_box[1], lb_box[3]
+        # Determine which lobby faces coincide with the passenger bank boundary so
+        # we don't generate a duplicate wall (bank already has walls on those edges).
+        _lb_tol = 25.0
+        _skip_lb_bank = set()
+        if lift_core_bounds_mm:
+            _lcb = lift_core_bounds_mm
+            if abs(lb_y2_w - _lcb[3]) < _lb_tol:  _skip_lb_bank.add("N")
+            if abs(lb_y1_w - _lcb[1]) < _lb_tol:  _skip_lb_bank.add("S")
+            if abs(lb_x2_w - _lcb[2]) < _lb_tol:  _skip_lb_bank.add("E")
+            if abs(lb_x1_w - _lcb[0]) < _lb_tol:  _skip_lb_bank.add("W")
         for l_idx, lvl in enumerate(levels_data):
             is_last_lvl = (l_idx == len(levels_data) - 1)
             if is_last_lvl:
@@ -3462,17 +3483,18 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
                 if lvl_h <= 0:
                     continue
             common = {"level_id": lvl['id'], "height": lvl_h, "type": "AI_Wall_Core"}
-            # Skip the face shared with the fire shaft — the shaft wall already covers it
-            if _skip_lobby_face != "W":
+            # Skip the face shared with the fire shaft — the shaft wall already covers it.
+            # Also skip any face coincident with the passenger bank boundary.
+            if _skip_lobby_face != "W" and "W" not in _skip_lb_bank:
                 walls.append({"id": "AI_{}_W_L{}".format(lobby_tag, l_idx + 1),
                               "start": [lb_x1_w, lb_y1_w, 0], "end": [lb_x1_w, lb_y2_w, 0], **common})
-            if _skip_lobby_face != "E":
+            if _skip_lobby_face != "E" and "E" not in _skip_lb_bank:
                 walls.append({"id": "AI_{}_E_L{}".format(lobby_tag, l_idx + 1),
                               "start": [lb_x2_w, lb_y1_w, 0], "end": [lb_x2_w, lb_y2_w, 0], **common})
-            if _skip_lobby_face != "N":
+            if _skip_lobby_face != "N" and "N" not in _skip_lb_bank:
                 walls.append({"id": "AI_{}_N_L{}".format(lobby_tag, l_idx + 1),
                               "start": [lb_x1_w, lb_y2_w, 0], "end": [lb_x2_w, lb_y2_w, 0], **common})
-            if _skip_lobby_face != "S":
+            if _skip_lobby_face != "S" and "S" not in _skip_lb_bank:
                 walls.append({"id": "AI_{}_S_L{}".format(lobby_tag, l_idx + 1),
                               "start": [lb_x1_w, lb_y1_w, 0], "end": [lb_x2_w, lb_y1_w, 0], **common})
 

@@ -105,14 +105,13 @@ def get_core_dimensions(num_lifts, internal_size=(2500, 2500), lobby_width=3000)
     w, l = internal_size
     t = _WALL_T  # wall thickness from compliance_lift_engineering.json
 
-    # Each core: max 12 lifts, max 6 per side
+    # Each core: max 12 lifts, max 6 per side.
+    # Odd counts are rounded up to even so both rows are equal — matches
+    # _generate_single_block_manifest which applies the same rounding.
     if num_lifts >= 4:
-        # Split into two rows. Row 1 (north, adjacent to fire cluster) gets the
-        # smaller group so the fire lift can use the gap space beside the shorter row.
-        n1 = int(math.floor(num_lifts / 2.0))
-        n2 = int(math.ceil(num_lifts / 2.0))
-        # Clamp to max 6 per side (though num_lifts should be capped at 12 anyway)
-        n1 = min(6, n1)
+        _n_even = num_lifts if num_lifts % 2 == 0 else num_lifts + 1
+        n1 = min(6, _n_even // 2)
+        n2 = min(6, _n_even // 2)
         bw1 = (n1 * w) + ((n1 + 1) * t)
         bw2 = (n2 * w) + ((n2 + 1) * t)
         block_width = max(bw1, bw2)
@@ -213,8 +212,9 @@ def _get_block_void_rectangles_mm(num_lifts, center_pos, internal_size=(2500, 25
 
     total_in_block = min(12, num_lifts)
     if total_in_block >= 4:
-        n1 = int(math.floor(total_in_block / 2.0))   # smaller row → north (fire cluster side)
-        n2 = int(math.ceil(total_in_block / 2.0))
+        _n_even = total_in_block if total_in_block % 2 == 0 else total_in_block + 1
+        n1 = min(6, _n_even // 2)
+        n2 = min(6, _n_even // 2)
     else:
         n1 = total_in_block
         n2 = 0
@@ -287,11 +287,14 @@ def _generate_single_block_manifest(num_lifts, levels_data, center_pos=(0, 0), i
     w, l = internal_size
     t = _WALL_T  # wall thickness from compliance_lift_engineering.json
 
-    # Symmetry: Split into two rows if >= 4 lifts
-    # Row 1 (north) = smaller group → adjacent to fire cluster with space for fire lift.
+    # Symmetry: Split into two equal rows if >= 4 lifts.
+    # Odd counts are rounded up to the next even number so both rows are equal —
+    # e.g. 5 → 6 (3+3), 7 → 8 (4+4). The extra lift is architecturally negligible
+    # and avoids the asymmetric-row appearance that confuses fire-module alignment.
     if num_lifts >= 4:
-        lifts_in_row1 = int(math.floor(num_lifts / 2.0))
-        lifts_in_row2 = int(math.ceil(num_lifts / 2.0))
+        _n_even = num_lifts if num_lifts % 2 == 0 else num_lifts + 1
+        lifts_in_row1 = _n_even // 2
+        lifts_in_row2 = _n_even // 2
     else:
         lifts_in_row1 = int(num_lifts)
         lifts_in_row2 = 0
@@ -448,8 +451,9 @@ def get_passenger_lift_door_positions(num_lifts, center_pos=(0, 0), internal_siz
         block_tag_str = "B{}".format(b_idx) if layout["num_blocks"] > 1 else ""
 
         if lifts_per_block >= 4:
-            n1 = int(math.floor(lifts_per_block / 2.0))   # smaller row → north
-            n2 = int(math.ceil(lifts_per_block / 2.0))
+            _n_even = lifts_per_block if lifts_per_block % 2 == 0 else lifts_per_block + 1
+            n1 = min(6, _n_even // 2)
+            n2 = min(6, _n_even // 2)
 
             row1_w = (n1 * w) + ((n1 + 1) * t)
             row2_w = (n2 * w) + ((n2 + 1) * t) if n2 > 0 else 0
