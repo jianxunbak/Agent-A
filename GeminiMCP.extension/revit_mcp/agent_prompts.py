@@ -126,6 +126,19 @@ Reference examples for common forms:
 "footprint_scale_overrides": {"1": 1.0, "30": 0.6}
 ```
 
+**⚠ TWIST — MANDATORY**: For ANY request using the words "twist", "twisting", "helix", "screw", "corkscrew", or "rotating floors", you MUST include `footprint_rotation_overrides` with at least TWO keys (e.g. `{"1": 0, "30": 90}`). A single key or omitting the field entirely produces NO twist — the building will look like a static box. Do NOT substitute `footprint_scale_overrides` for a twist request.
+
+**CIRCULAR TWISTING TOWER EXAMPLE** — "twisting tower with circular floor plate":
+```json
+"shell": {
+  "width": 50000, "length": 50000,
+  "shape": "circle",
+  "footprint_rotation_overrides": {"1": 0, "30": 180},
+  "columns_center_only": true
+}
+```
+For a circular floor plate, use `"shape": "circle"` — the engine computes a 24-sided polygon approximating the circle from `width` (= diameter). Combine with `footprint_rotation_overrides` for a twisting cylinder. `width` equals the diameter in mm (e.g. 50m diameter → `"width": 50000`). Do NOT use a plain rectangular `width`/`length` for a circular building — that produces a square, not a circle.
+
 **TAPER EXAMPLE** — "pencil tower" / "needle":
 ```json
 "shell": {
@@ -137,7 +150,7 @@ Reference examples for common forms:
 
 **TAPER + CORE SIZING RULE**: When `footprint_scale_overrides` taper the plate, the lift core walls are built at FULL height — they do NOT shrink with the plate. Ensure the ENTIRE core cluster (passenger lifts + both fire clusters including staircases) fits inside the plate at its SMALLEST scale. Compute: `smallest_plate_side = shell.width × min_scale_factor`. The total core width (NS orientation) = `lift_bank_width + 2 × (fire_lift_depth + lobby_depth + stair_depth)` ≈ `lift_bank_width + 2 × 9000mm`. If this exceeds `smallest_plate_side × 0.7`, either: (a) reduce lift count, (b) use `"arrangement": "parallel"` to reduce cluster depth, or (c) accept that the core protrudes on upper floors (inform the user but still build). NEVER place a tapered building's core off-centre — taper is symmetric about the origin, so a centred core at `position: [0,0]` is always correct.
 
-**STACKED VOLUMES EXAMPLE** — "Jenga tower" / "fragmented massing":
+**STACKED VOLUMES EXAMPLE** — "Jenga tower" / "fragmented massing" / "stacked boxes" / "Habitat 67" / "3 stacked volumes":
 ```json
 "volumes": [
   {"id": "vol_base",  "levels": [1, 8],  "width": 45000, "length": 40000, "offset_x": 0,    "offset_y": 0,    "rotation_deg": 0},
@@ -145,6 +158,18 @@ Reference examples for common forms:
   {"id": "vol_top",   "levels": [17,30], "width": 18000, "length": 18000, "offset_x": 3000, "offset_y": 7000, "rotation_deg": 25}
 ]
 ```
+Level numbers in `volumes[].levels` are **1-based** (ground floor = level 1, not 0). The last volume MUST end at `project_setup.levels` (e.g. 30-storey building → last volume ends at 30). Every floor must belong to exactly one volume — no gaps, no overlaps.
+
+**VOLUMES `lifts.position` RULE**: For a volumes build, set `lifts.position` to the centroid of the INTERSECTION of all volume bounding boxes — the point that is safely inside every volume. Compute it as:
+- `x = (max(all vol_bbox x1) + min(all vol_bbox x2)) / 2`
+- `y = (max(all vol_bbox y1) + min(all vol_bbox y2)) / 2`
+This ensures the fire cluster fits inside every volume at every floor. Do NOT use [0,0] for volumes builds — that places the core at the world origin which may be a corner of the building.
+
+**`volumes` vs `floor_overrides` — when to use which:**
+- Use `volumes` when the building reads as **distinct masses** — each zone has its own size, position, and/or rotation, and the composition is the architectural idea (fragmented, collaged, interlocked, cantilevered off-centre).
+- Use `floor_overrides` when the building is a **single continuous shell** that happens to step or taper at a few transition floors (wedding-cake setback, one notch at mid-height).
+- The tell: if you need to specify `offset_x`/`offset_y`/`rotation_deg` that differ between zones, use `volumes`. If all floors share the same centroid and orientation but differ only in width/length, use `floor_overrides`.
+- `floor_overrides` ONLY accepts single integer floor keys (`"4"`, `"10"`) mapping to `{"width":…, "length":…}`. It does NOT support: range keys (`"1-13"`), a nested `"levels"` sub-object (`floor_overrides.levels`), per-zone `footprint_points`, per-zone `footprint_offset`, per-zone `footprint_rotation`, or any other zone-level geometry. Any of these will trigger a CONFLICT error. Use `volumes` instead.
 
 **LEAN EXAMPLE** — "leaning tower" / "off-centre":
 ```json

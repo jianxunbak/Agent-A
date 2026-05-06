@@ -131,7 +131,7 @@ def _get_interpolated_rotation(rotation_overrides, level_1based):
     linearly interpolating between sparse control-point keys.
     Levels outside the key range clamp to the nearest endpoint.
     Example: {"1": 0, "10": 90, "20": 180} → 45° at level 5."""
-    if not rotation_overrides:
+    if not rotation_overrides or not isinstance(rotation_overrides, dict):
         return 0.0
     pts = {}
     for k, v in rotation_overrides.items():
@@ -156,7 +156,7 @@ def _get_interpolated_scale(scale_overrides, level_1based):
     """Return the scale for a given 1-based level index, linearly interpolating
     between sparse control-point keys (e.g. {"1":1.1,"10":0.7,"20":1.1}).
     Levels outside the key range clamp to the nearest endpoint."""
-    if not scale_overrides:
+    if not scale_overrides or not isinstance(scale_overrides, dict):
         return 1.0
     # Normalise all keys to int
     pts = {}
@@ -229,12 +229,24 @@ def _build_volume_map(manifest, num_levels):
     volumes = manifest.get("volumes")
     if not volumes:
         return {}
+    # Detect 0-based level indices: if any volume starts at level 0, the whole
+    # list is 0-based (Gemini sometimes counts floors from 0).  Shift by +1.
+    _all_los = []
+    for _v in volumes:
+        try:
+            _all_los.append(int(_v["levels"][0]))
+        except Exception:
+            pass
+    _zero_based = _all_los and min(_all_los) == 0
     vol_map = {}
     for vol in volumes:
         try:
             lo, hi = int(vol["levels"][0]), int(vol["levels"][1])
         except (KeyError, IndexError, TypeError, ValueError):
             continue
+        if _zero_based:
+            lo += 1
+            hi += 1
         for lvl in range(lo, hi + 1):
             if 1 <= lvl <= num_levels:
                 vol_map[lvl] = vol
@@ -268,6 +280,37 @@ def _poly_area_mm2(pts):
     n = len(pts)
     return abs(sum(pts[i][0] * pts[(i + 1) % n][1] - pts[(i + 1) % n][0] * pts[i][1]
                    for i in range(n))) / 2.0
+
+
+def _convex_hull_2d(pts):
+    """Andrew's monotone chain — returns CCW convex hull of points as [[x,y],...].
+
+    Used to merge two volume polygons at a shelter seam without producing the
+    huge axis-aligned bbox-union. The hull follows the outer envelope of both
+    polygons, so no slab/parapet edge floats far from any actual volume edge.
+    """
+    if not pts:
+        return []
+    # Strip arc-mid dicts; only x/y matter for the hull.
+    flat = sorted({(round(float(p[0]), 3), round(float(p[1]), 3)) for p in pts})
+    if len(flat) <= 1:
+        return [[p[0], p[1]] for p in flat]
+
+    def _cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower = []
+    for p in flat:
+        while len(lower) >= 2 and _cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper = []
+    for p in reversed(flat):
+        while len(upper) >= 2 and _cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    hull = lower[:-1] + upper[:-1]
+    return [[h[0], h[1]] for h in hull]
 
 
 def _normalise_footprint_holes(holes):
@@ -859,7 +902,7 @@ def _get_interpolated_offset(offset_overrides, level_1based):
     Values are [offset_x_mm, offset_y_mm]. Linearly interpolated between keys.
     Returns (offset_x_mm, offset_y_mm).
     """
-    if not offset_overrides:
+    if not offset_overrides or not isinstance(offset_overrides, dict):
         return 0.0, 0.0
     pts = {}
     for k, v in offset_overrides.items():
@@ -1097,6 +1140,17 @@ class RevitWorkers:
             # Expand shape shorthand FIRST so _process_shell_dimensions sees footprint_points
             shell = manifest.get("shell", {})
             shell = _expand_shape_shorthand(shell)
+            # Normalise: Gemini sometimes nests `volumes` inside `shell` (as shell.volumes or
+            # via shape="volumes") instead of at the top-level manifest key.
+            # Promote shell.volumes → manifest.volumes so all downstream code finds it.
+            _shell_vols = shell.get("volumes")
+            if _shell_vols and not manifest.get("volumes"):
+                manifest["volumes"] = _shell_vols
+                shell = dict(shell)
+                shell.pop("volumes", None)
+                manifest["shell"] = shell
+                self.log("[Manifest] Promoted shell.volumes → manifest.volumes ({} entries)".format(
+                    len(_shell_vols)))
             # Normalise floor_overrides: Gemini occasionally sends the inverted schema
             # {"width": {"10": 28333}, "length": {"10": 28333}} instead of the correct
             # {"10": {"width": 28333, "length": 28333}}.  Detect and transpose.
@@ -1127,6 +1181,28 @@ class RevitWorkers:
                             manifest["shell"] = shell
                             self.log("[Manifest] Normalised floor_overrides from inverted schema: {}".format(
                                 list(_transposed.keys())))
+            # Detect range keys in floor_overrides (e.g. "1-13") — the engine only parses
+            # single integer keys; range keys are silently ignored.  If present, they indicate
+            # Gemini should have used the `volumes` array instead.  Convert to a CONFLICT so
+            # Gemini gets explicit feedback on its next attempt.
+            _fo_check = shell.get("floor_overrides", {})
+            _range_keys = [k for k in (_fo_check or {}) if isinstance(k, str) and "-" in k]
+            if _range_keys:
+                return {
+                    "status": "CONFLICT",
+                    "description": (
+                        "floor_overrides contains range keys ({}) which are NOT supported — "
+                        "the engine only accepts single integer keys ('1', '10', etc.) for minor "
+                        "per-floor tweaks on a SINGLE continuous shell. "
+                        "For stacked volumes with different sizes/offsets per zone (Habitat 67, "
+                        "Jenga, stacked boxes), you MUST use the `volumes` array: "
+                        "[{{\"id\": \"vol_base\", \"levels\": [1, 13], \"width\": W1, \"length\": L1, "
+                        "\"offset_x\": 0, \"offset_y\": 0, \"rotation_deg\": 0}}, "
+                        "{{\"id\": \"vol_mid\", \"levels\": [14, 26], \"width\": W2, \"length\": L2, "
+                        "\"offset_x\": Ox, \"offset_y\": Oy, \"rotation_deg\": R}}, ...]"
+                    ).format(", ".join(repr(k) for k in _range_keys))
+                }
+
             manifest["shell"] = shell  # write back so _process_shell_dimensions sees footprint_points
             # Fix 6: organic builds always define the full geometry — never inherit stale wall lengths
             if shell.get("footprint_points") and not shell.get("force_global_dimensions"):
@@ -1616,6 +1692,9 @@ class RevitWorkers:
             else:
                 expanded_overrides[k_str] = v
         height_overrides = expanded_overrides
+        # Shift 0-based height_override keys to 1-based (Gemini sometimes counts from 0)
+        if height_overrides and "0" in height_overrides:
+            height_overrides = {str(int(k) + 1): v for k, v in height_overrides.items()}
         self.log("[Build] height_overrides after expansion: {}".format(
             {k: v for k, v in list(height_overrides.items())[:10]}))
 
@@ -1779,6 +1858,20 @@ class RevitWorkers:
             except Exception:
                 pass
 
+        # Pre-build a level → (w, l) map from volume footprints so floor_dims
+        # correctly reflects each volume's bounding box, not the shell default.
+        _vol_level_dims = {}
+        for _v in _manifest_v.get("volumes", []):
+            try:
+                _lo, _hi = int(_v["levels"][0]), int(_v["levels"][1])
+                _vpts = _volume_footprint_pts(_v)
+                _vxs = [p[0] for p in _vpts]; _vys = [p[1] for p in _vpts]
+                _vw = max(_vxs) - min(_vxs); _vl = max(_vys) - min(_vys)
+                for _vk in range(_lo, _hi + 1):
+                    _vol_level_dims[_vk] = (_vw, _vl)
+            except Exception:
+                pass
+
         dims = []
         for i in range(len(current_levels)):
             lvl_idx = i + 1
@@ -1787,6 +1880,12 @@ class RevitWorkers:
             # 1. Start with explicit per-level override (highest priority)
             w = ov.get("width")
             l = ov.get("length")
+
+            # 1b. Volume footprint dims take priority over shell defaults for
+            # levels covered by a volume entry — ensures fire-safety travel
+            # distance checks use the actual volume size, not shell.width/length.
+            if w is None and lvl_idx in _vol_level_dims:
+                w, l = _vol_level_dims[lvl_idx]
 
             # 2. PRESERVE EXISTING: Infer from existing model geometry.
             #    Only runs when:
@@ -1944,7 +2043,18 @@ class RevitWorkers:
                     current_levels, elevations, registry, results, created, reused, affected_elements
                 )
             if vol_levels_done:
-                remaining_k = [k for k in range(len(current_levels)) if k not in vol_levels_done]
+                # Drop levels strictly ABOVE the topmost volume. _process_levels
+                # appends one roof level above the building (count+1 total); for
+                # volumes builds that level has a roof slab from _process_floors
+                # but no walls rising above it. Falling through to the rectangular
+                # fallback would draw axis-aligned stub walls at world origin —
+                # they do not align with the rotated/offset volume polygon and
+                # appear as "flying" walls next to the actual building.
+                # Levels BETWEEN non-contiguous volume ranges (legitimate
+                # organic/rectangular sections) are kept and processed below.
+                _vol_top_k = max(vol_levels_done)
+                remaining_k = [k for k in range(len(current_levels))
+                               if k not in vol_levels_done and k <= _vol_top_k]
                 if not remaining_k:
                     return updated
                 # Splice down to non-volume levels; preserve original level indices for tags
@@ -2198,12 +2308,141 @@ class RevitWorkers:
         offset_overrides   = shell.get("footprint_offset_overrides", {})
         rotation_overrides = shell.get("footprint_rotation_overrides", {})
 
+        # Volumes-mode: parapets must align with the slab they sit on, not a
+        # centred rectangle at world origin.
+        #
+        # Mental model (k is 0-based loop index, level numbers are 1-based):
+        #   - Floor at iteration k is anchored at current_levels[k] = L(k+1).
+        #     Its polygon is vol_map[k+1] (or hull(vol_map[k], vol_map[k+1])
+        #     when those differ — the shelter rule).
+        #   - Walls drawn at iteration k go from current_levels[k] up to
+        #     current_levels[k+1]. They bound vol_map[k+1].
+        #   - A parapet at iteration k rises from current_levels[k], i.e. it
+        #     sits on the floor at L(k+1).
+        #
+        # A parapet is needed only where that floor has an EXPOSED edge — i.e.
+        # the slab polygon extends beyond the walls drawn above it. That happens
+        # in exactly two cases:
+        #   (a) Shelter slab: vol_map[k+1] differs from vol_map[k]
+        #       → slab = hull(vol_map[k], vol_map[k+1]); walls above bound only
+        #         vol_map[k+1]; the hull's extra coverage is exposed.
+        #   (b) Roof: orig_lvl_p == _vol_p_max_lvl + 1
+        #       → slab = top volume's polygon; no walls above at all.
+        # Internal levels of a single volume (vol_map[k] == vol_map[k+1]) have
+        # no exposed slab edge — the walls above fully bound the slab.
+        _manifest_p = getattr(self, '_current_manifest', None) or {}
+        vol_map_p = _build_volume_map(_manifest_p, len(current_levels))
+        _vol_p_max_lvl = max(vol_map_p.keys()) if vol_map_p else 0
+        _vol_p_top = vol_map_p.get(_vol_p_max_lvl) if vol_map_p else None
+
         for k in range(len(current_levels)):
             lvl = current_levels[k]
 
             lvl_ov = overrides.get(str(k+1), {})
             p_h_mm = safe_num(lvl_ov.get("parapet_height", g_parapet_h), 1000)
             if p_h_mm <= 0: continue
+
+            # --- VOLUMES-MODE PARAPET ---
+            #
+            # Indexing recap (k = 0-based loop index, level numbers 1-based):
+            #   - The floor at iteration k is anchored at current_levels[k] =
+            #     L(k+1). Its polygon comes from vol_map[k+1], optionally
+            #     shelter-extended via the convex hull with vol_map[k] (the
+            #     volume below). This mirrors _process_floors exactly.
+            #   - The walls drawn AT iteration k in _process_walls also use
+            #     vol_map[k+1] and rise from L(k+1) up to L(k+2). They bound
+            #     the floor's perimeter wherever the floor coincides with
+            #     vol_map[k+1]'s polygon.
+            #   - A parapet rises ABOVE the floor at L(k+1). It is needed only
+            #     for portions of that floor's edge that are NOT bounded by the
+            #     walls above — i.e. the parts of the (possibly hull-extended)
+            #     slab polygon that fall outside vol_map[k+1].
+            if vol_map_p:
+                orig_lvl_p = k + 1
+                vol_slab    = vol_map_p.get(orig_lvl_p)        # vol whose walls bound this floor
+                vol_below   = vol_map_p.get(orig_lvl_p - 1)    # vol whose roof reaches this floor
+                # Roof case: above the topmost volume the floor reuses the top
+                # volume polygon, and there are no walls bounding its edge.
+                is_roof = (vol_slab is None and _vol_p_top is not None
+                           and orig_lvl_p == _vol_p_max_lvl + 1)
+                if is_roof:
+                    slab_pts = _volume_footprint_pts(_vol_p_top)
+                    _walls_pts = None  # nothing bounds the roof slab edge
+                elif vol_slab is None:
+                    # Level not covered by any volume and not the roof level:
+                    # nothing meaningful for a volumes-mode parapet here.
+                    continue
+                else:
+                    # No exposed edge if the volume below this floor matches
+                    # the volume of this level (no shelter applied → slab and
+                    # walls share the same polygon).
+                    if vol_below is None or vol_below is vol_slab:
+                        continue
+                    # Otherwise the slab is hull(vol_below, vol_slab); the
+                    # walls above only bound vol_slab. Compute the hull so we
+                    # can iterate its segments.
+                    _pts_slab = _volume_footprint_pts(vol_slab)
+                    _pts_b = _volume_footprint_pts(vol_below)
+                    _hull_p = _convex_hull_2d(list(_pts_slab) + list(_pts_b))
+                    slab_pts = _hull_p if len(_hull_p) >= 3 else _pts_slab
+                    _walls_pts = _pts_slab
+                # Per-segment exposure test. The walls drawn at THIS floor's
+                # level bound vol_slab's polygon (or, at the roof, no walls at
+                # all). Any slab-polygon segment that is ALSO a segment of
+                # vol_slab is bounded by those walls — skip it. The segments
+                # that come from vol_below or are bridging chords of the
+                # convex hull are the exposed ones.
+                # Vertex-pair match (quantised to 1mm) is the precise test;
+                # midpoint-inside or outward-shift heuristics are unreliable
+                # on collinear/shared edges of two convex polygons.
+                _seg_set = set()
+                if _walls_pts is not None:
+                    _wn = len(_walls_pts)
+                    for _wi in range(_wn):
+                        _ws = _walls_pts[_wi]
+                        _we = _walls_pts[(_wi + 1) % _wn]
+                        _key_a = (round(_ws[0]), round(_ws[1]),
+                                  round(_we[0]), round(_we[1]))
+                        _key_b = (round(_we[0]), round(_we[1]),
+                                  round(_ws[0]), round(_ws[1]))
+                        _seg_set.add(_key_a)
+                        _seg_set.add(_key_b)
+                wall_type = DB.FilteredElementCollector(doc).OfClass(DB.WallType).FirstElement()
+                n_pp = len(slab_pts)
+                for j in range(n_pp):
+                    seg_s = slab_pts[j]
+                    seg_e = slab_pts[(j + 1) % n_pp]
+                    _ks = (round(seg_s[0]), round(seg_s[1]),
+                           round(seg_e[0]), round(seg_e[1]))
+                    if _ks in _seg_set:
+                        # This slab segment is also a wall-above segment —
+                        # parapet would sit on top of that wall. Skip.
+                        continue
+                    p1 = DB.XYZ(mm_to_ft(seg_s[0]), mm_to_ft(seg_s[1]), 0)
+                    p2 = DB.XYZ(mm_to_ft(seg_e[0]), mm_to_ft(seg_e[1]), 0)
+                    if p1.DistanceTo(p2) < mm_to_ft(2.0): continue
+                    tag = "AI_Parapet_L{}_Vol{}".format(orig_lvl_p, j)
+                    arc_data = seg_s[2] if len(seg_s) > 2 else None
+                    if arc_data and isinstance(arc_data, dict):
+                        pm = DB.XYZ(mm_to_ft(arc_data["mid_x"]), mm_to_ft(arc_data["mid_y"]), 0)
+                        try:
+                            curve = DB.Arc.Create(p1, p2, pm)
+                            wall_id = registry.get(tag)
+                            existing = doc.GetElement(wall_id) if wall_id else None
+                            if existing and isinstance(existing, DB.Wall):
+                                doc.Delete(existing.Id)
+                            wall = DB.Wall.Create(doc, curve, wall_type.Id, lvl.Id, mm_to_ft(p_h_mm), 0, False, False)
+                            disallow_joins(wall)
+                            safe_set_comment(wall, tag)
+                            registry[tag] = wall.Id
+                            created[0] += 1
+                            affected_elements.append(wall)
+                            results["elements"].append(str(wall.Id.Value))
+                        except Exception:
+                            pass
+                    else:
+                        self._draw_wall(doc, p1, p2, lvl, wall_type, mm_to_ft(p_h_mm), tag, registry, results, created, reused, affected_elements)
+                continue  # volumes-mode parapet handled inline above
 
             if footprint_pts:
                 # Organic mode: parapets sit on the slab edge.
@@ -2328,6 +2567,11 @@ class RevitWorkers:
         # Build volume map once for floor loop (same manifest as _process_walls)
         _manifest_f = getattr(self, '_current_manifest', None) or {}
         vol_map_f = _build_volume_map(_manifest_f, len(current_levels))
+        # Top mapped volume — used to extend the roof-level slab (level above the
+        # last volume range) so it follows the topmost volume's footprint instead
+        # of falling through to the centred rectangular slab path.
+        _vol_f_max_lvl = max(vol_map_f.keys()) if vol_map_f else 0
+        _vol_f_top = vol_map_f.get(_vol_f_max_lvl) if vol_map_f else None
 
         for k, lvl in enumerate(current_levels):
             from revit_mcp.cancel_manager import check_cancelled
@@ -2337,30 +2581,68 @@ class RevitWorkers:
 
             # --- VOLUME SLAB ---
             vol_f = vol_map_f.get(orig_lvl)
+            # Roof level (one above the topmost volume): re-use the top volume so
+            # the roof slab matches the building, not a centred rectangle.
+            if vol_f is None and _vol_f_top is not None and orig_lvl == _vol_f_max_lvl + 1:
+                vol_f = _vol_f_top
             if vol_f is not None:
                 vol_pts_f = _volume_footprint_pts(vol_f)
-                # Ensure slab encompasses the central core footprint.
-                # If the core extends beyond the volume polygon's bounding box,
-                # expand the slab to a rectangle that contains both.
-                if _core_mm:
-                    _vxs = [p[0] for p in vol_pts_f]
-                    _vys = [p[1] for p in vol_pts_f]
-                    _vxmin, _vxmax = min(_vxs), max(_vxs)
-                    _vymin, _vymax = min(_vys), max(_vys)
-                    _cxmin, _cymin, _cxmax, _cymax = _core_mm
-                    if (_cxmin < _vxmin - 1 or _cxmax > _vxmax + 1 or
-                            _cymin < _vymin - 1 or _cymax > _vymax + 1):
-                        _nxmin = min(_vxmin, _cxmin)
-                        _nxmax = max(_vxmax, _cxmax)
-                        _nymin = min(_vymin, _cymin)
-                        _nymax = max(_vymax, _cymax)
-                        vol_pts_f = [[_nxmin, _nymin], [_nxmax, _nymin],
-                                     [_nxmax, _nymax], [_nxmin, _nymax]]
-                        self.log("[FloorExpand] L{}: slab expanded to contain core "
-                                 "({:.0f}x{:.0f} → {:.0f}x{:.0f}mm)".format(
+                # Volume-transition shelter rule: when the volume below this slab
+                # differs from the one above (smaller / offset / rotated), the slab
+                # must cover BOTH so the lower volume's roof is closed instead of
+                # leaving a gap exposed to weather. We use the convex hull of the
+                # two polygons rather than a bbox-union — the hull follows the
+                # actual outer envelope, so the slab does not balloon into airspace
+                # at rotated/offset seams (which produced enormous floor plates).
+                vol_f_below = vol_map_f.get(orig_lvl - 1)
+                if vol_f_below is not None and vol_f_below is not vol_f:
+                    _pts_below = _volume_footprint_pts(vol_f_below)
+                    _hull = _convex_hull_2d(list(vol_pts_f) + list(_pts_below))
+                    if len(_hull) >= 3:
+                        vol_pts_f = _hull
+                        _hxs = [p[0] for p in _hull]; _hys = [p[1] for p in _hull]
+                        self.log("[Volumes] L{}: shelter slab is convex hull of "
+                                 "volumes below+above ({:.0f}x{:.0f}mm bbox, {} verts)".format(
                                      orig_lvl,
-                                     _vxmax - _vxmin, _vymax - _vymin,
-                                     _nxmax - _nxmin, _nymax - _nymin))
+                                     max(_hxs) - min(_hxs), max(_hys) - min(_hys),
+                                     len(_hull)))
+                # Ensure slab encompasses the central core footprint. Previously
+                # this replaced the volume polygon with an axis-aligned bbox-union
+                # of (volume bbox + core bbox), which destroyed the volume's
+                # rotation: rotated walls ended up sitting inside an axis-aligned
+                # slab edge that protruded past them on some sides while the
+                # rotated wall corners poked OUTSIDE the slab on others.
+                # Instead, fold the four core corners INTO the convex hull of the
+                # current slab polygon — the hull follows the volume's rotation
+                # except where it has to bulge to cover a core corner.
+                if _core_mm:
+                    _cxmin, _cymin, _cxmax, _cymax = _core_mm
+                    _core_corners = [[_cxmin, _cymin], [_cxmax, _cymin],
+                                     [_cxmax, _cymax], [_cxmin, _cymax]]
+                    # Test each core corner against the actual slab polygon, not
+                    # its axis-aligned bbox. A rotated volume can have a bbox
+                    # that contains the core while the rotated polygon itself
+                    # does not — exactly the "core partially exposed" failure.
+                    from revit_mcp.staircase_logic import _point_in_polygon as _pip_core
+                    _any_outside = not all(_pip_core(_cx, _cy, vol_pts_f)
+                                           for _cx, _cy in _core_corners)
+                    if _any_outside:
+                        _vxs = [p[0] for p in vol_pts_f]
+                        _vys = [p[1] for p in vol_pts_f]
+                        _vxmin, _vxmax = min(_vxs), max(_vxs)
+                        _vymin, _vymax = min(_vys), max(_vys)
+                        _hull_c = _convex_hull_2d(list(vol_pts_f) + _core_corners)
+                        if len(_hull_c) >= 3:
+                            vol_pts_f = _hull_c
+                            _hcxs = [p[0] for p in _hull_c]
+                            _hcys = [p[1] for p in _hull_c]
+                            self.log("[FloorExpand] L{}: slab expanded via convex "
+                                     "hull to contain core ({:.0f}x{:.0f} → "
+                                     "{:.0f}x{:.0f}mm bbox, {} verts)".format(
+                                         orig_lvl,
+                                         _vxmax - _vxmin, _vymax - _vymin,
+                                         max(_hcxs) - min(_hcxs),
+                                         max(_hcys) - min(_hcys), len(_hull_c)))
                 tag = "AI_Floor_L{}".format(orig_lvl)
                 loop = DB.CurveLoop()
                 n_vf = len(vol_pts_f)
@@ -2973,12 +3255,53 @@ class RevitWorkers:
         # to quickly reject positions that can never be inside any level's slab.
         _base_poly_mm = _tessellate_pts(_footprint_pts) if _footprint_pts else None
 
+        # Volumes mode: per-level polygon comes from the volume map (each volume
+        # has its own footprint_points / offset / rotation). Without this, the
+        # synthesised shell rectangle covers every level — making columns extend
+        # to the roof at positions that lie outside the actual stacked volumes.
+        _vol_manifest_col = getattr(self, '_current_manifest', None) or {}
+        _vol_map_col = _build_volume_map(_vol_manifest_col, len(current_levels))
+        _vol_col_max_lvl = max(_vol_map_col.keys()) if _vol_map_col else 0
+        _vol_col_top = _vol_map_col.get(_vol_col_max_lvl) if _vol_map_col else None
+
+        # Replace the base fast-reject envelope with the bbox-union of all volume
+        # polygons so positions inside an offset volume are not rejected before
+        # per-level containment is even tested.
+        if _vol_map_col:
+            _all_vx = []; _all_vy = []
+            for _v_seen in {id(v): v for v in _vol_map_col.values()}.values():
+                try:
+                    _vp = _volume_footprint_pts(_v_seen)
+                    _all_vx += [p[0] for p in _vp]
+                    _all_vy += [p[1] for p in _vp]
+                except Exception:
+                    pass
+            if _all_vx and _all_vy:
+                _bxmin, _bxmax = min(_all_vx), max(_all_vx)
+                _bymin, _bymax = min(_all_vy), max(_all_vy)
+                _base_poly_mm = [(_bxmin, _bymin), (_bxmax, _bymin),
+                                 (_bxmax, _bymax), (_bxmin, _bymax)]
+
         # Cache per-level tessellated polygons (keyed by 1-based level index)
         _level_poly_cache = {}
 
         def _get_level_poly(level_1based):
             if level_1based in _level_poly_cache:
                 return _level_poly_cache[level_1based]
+            # Volumes mode: tessellate the volume polygon for this level. Roof
+            # level (one above the topmost volume) reuses the top volume so the
+            # roof slab and its supporting columns share an envelope.
+            if _vol_map_col:
+                _vol = _vol_map_col.get(level_1based)
+                if _vol is None and _vol_col_top is not None and level_1based == _vol_col_max_lvl + 1:
+                    _vol = _vol_col_top
+                if _vol is not None:
+                    poly = _tessellate_pts(_volume_footprint_pts(_vol))
+                    _level_poly_cache[level_1based] = poly
+                    return poly
+                # Volume map exists but this level is not covered → no slab here.
+                _level_poly_cache[level_1based] = []
+                return []
             scale = _get_interpolated_scale(_scale_ovr, level_1based)
             ox_mm, oy_mm = _get_interpolated_offset(_offset_ovr, level_1based)
             rot = _get_interpolated_rotation(_rot_ovr, level_1based)
@@ -3077,6 +3400,12 @@ class RevitWorkers:
                     # _footprint_pts is always set (Option A synthesises a rectangle when absent).
                     if _point_in_poly(px_mm, py_mm, _get_level_poly(level_1based)):
                         k_highest = k
+                    elif _vol_map_col and k_highest >= 0:
+                        # Volumes mode: a column cannot pass through a level where
+                        # it lies outside the volume (no slab to support it). Stop
+                        # at the first gap so columns terminate at the base of the
+                        # volume that no longer covers their position.
+                        break
                 if k_highest >= 0:
                     max_level_for_grid[(ix, iy, ox, oy)] = k_highest
 
@@ -3755,9 +4084,14 @@ class RevitWorkers:
         def _is_protected_core_element(_el):
             return False  # touched-set check above already handles reused elements
         
-        # 1. Broad Scan for any element with "AI_" comment that wasn't touched
-        cats = [DB.BuiltInCategory.OST_Walls, DB.BuiltInCategory.OST_Floors, DB.BuiltInCategory.OST_Levels, 
-                DB.BuiltInCategory.OST_Grids, DB.BuiltInCategory.OST_Columns, DB.BuiltInCategory.OST_StructuralColumns]
+        # 1. Broad Scan for any element with "AI_" comment that wasn't touched.
+        # OST_Grids is INTENTIONALLY excluded — _generate_documentation owns the
+        # full grid lifecycle (delete-all-AI-grids, regenerate, create fresh).
+        # Touching grids here as well caused stale dimension dependencies to
+        # block one delete and a second pass to silently rename the survivors,
+        # which is the "grid lines getting messed up across builds" failure.
+        cats = [DB.BuiltInCategory.OST_Walls, DB.BuiltInCategory.OST_Floors, DB.BuiltInCategory.OST_Levels,
+                DB.BuiltInCategory.OST_Columns, DB.BuiltInCategory.OST_StructuralColumns]
         import System.Collections.Generic as Generic # type: ignore
         net_cats = Generic.List[DB.BuiltInCategory]()
         for c in cats: net_cats.Add(c)
@@ -3806,16 +4140,6 @@ class RevitWorkers:
                 
                 try:
                     if hasattr(el, "Pinned") and el.Pinned: el.Pinned = False
-                    # Grids with auto-dimensions cannot be deleted directly; cascade first
-                    if isinstance(el, DB.Grid):
-                        try:
-                            for dep_id in el.GetDependentElements(None):
-                                try:
-                                    dep = doc.GetElement(dep_id)
-                                    if dep and isinstance(dep, DB.Dimension):
-                                        doc.Delete(dep_id)
-                                except: pass
-                        except: pass
                     doc.Delete(el.Id)
                     deleted[0] += 1
                 except Exception as ex:
@@ -3856,16 +4180,64 @@ class RevitWorkers:
                 return True
             except: return False
 
-        # Delete existing AI grids to prevent duplicates.
-        # Use LookupParameter fallback because ALL_MODEL_INSTANCE_COMMENTS may be
-        # unavailable for Grid objects in some Revit versions.
+        # --- PRE-PASS: delete every AI grid (and any grid whose name collides
+        # with the labels we are about to create) BEFORE creating new ones.
+        # This is the single owner of grid deletion — _cleanup_registry no
+        # longer touches grids.  Three matching strategies, applied in order:
+        #   1. Comments parameter contains "AI_Grid"
+        #   2. Grid name matches an "AI_Grid" comment was lost (user edit)
+        #   3. Grid name == one of the labels we're about to create
+        # Then doc.Regenerate() so Revit fully releases any dependent
+        # dimension references before Pass 1 starts (otherwise create-after-
+        # incomplete-delete leaves phantom datums and Revit auto-renames
+        # the new grid to "A (1)" / "1 (1)" — that is the visible "messed
+        # up grids" failure across consecutive builds).
+
+        # Build the set of labels we plan to create.
+        _planned_labels = set()
+        sorted_x_pre = sorted(x_offsets)
+        for idx in range(len(sorted_x_pre)):
+            _label = ""
+            _n = idx
+            while True:
+                _label = chr(ord('A') + _n % 26) + _label
+                _n = _n // 26 - 1
+                if _n < 0:
+                    break
+            _planned_labels.add(_label)
+        for idx in range(len(y_offsets)):
+            _planned_labels.add(str(idx + 1))
+
+        _deleted_grid_count = 0
         for g in list(DB.FilteredElementCollector(doc).OfClass(DB.Grid).ToElements()):
             try:
+                _is_ai = False
                 p = g.get_Parameter(DB.BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
-                if not p: p = g.LookupParameter("Comments")
-                if p and p.HasValue and "AI_Grid" in p.AsString():
-                    _delete_grid_cascade(g)
-            except: pass
+                if not p:
+                    p = g.LookupParameter("Comments")
+                if p and p.HasValue and "AI_Grid" in (p.AsString() or ""):
+                    _is_ai = True
+                # Name-collision check: any existing grid whose name matches a
+                # planned label must be removed even if its AI_Grid tag is
+                # missing, otherwise Revit refuses to reuse the name and adds
+                # a "(1)" suffix to the new one.
+                _collides = False
+                try:
+                    if g.Name in _planned_labels:
+                        _collides = True
+                except Exception:
+                    pass
+                if _is_ai or _collides:
+                    if _delete_grid_cascade(g):
+                        _deleted_grid_count += 1
+            except Exception:
+                pass
+        self.log("[Grid] Pre-cleanup: deleted {} stale grids before regeneration".format(
+            _deleted_grid_count))
+        try:
+            doc.Regenerate()
+        except Exception:
+            pass
 
         # Collect all floor plan views once.
         all_plan_views = list(DB.FilteredElementCollector(doc).OfClass(DB.ViewPlan).ToElements())
@@ -3874,6 +4246,8 @@ class RevitWorkers:
         created_grids = []  # [(grid_element, creation_line), ...]
 
         def _create_grid(line, label, comment):
+            # Defensive: if a same-named grid slipped through pre-cleanup
+            # (e.g. dependency couldn't be detached), try once more here.
             for existing in list(DB.FilteredElementCollector(doc).OfClass(DB.Grid).ToElements()):
                 try:
                     if existing.Name == label:
@@ -3884,7 +4258,8 @@ class RevitWorkers:
                 grid.Name = label
                 safe_set_comment(grid, comment)
                 created_grids.append((grid, line))
-            except Exception: pass
+            except Exception as _gce:
+                self.log("[Grid] Create FAILED for label '{}': {}".format(label, _gce))
 
         # X-axis grids: vertical lines (constant X, varying Y) -- labelled A, B, C, ...
         # x_offsets is sorted ascending (left → right), so A is always on the left.
@@ -4353,6 +4728,13 @@ class RevitWorkers:
         # Normalise: Gemini may send [[outer_polygon], [hole]] instead of flat [[x,y],...].
         if _fp_pts and _fp_pts[0] and isinstance(_fp_pts[0][0], (list, tuple)):
             _fp_pts = _fp_pts[0]
+        # For volumes builds, derive footprint from the base (lowest-level) volume so the
+        # fire-safety engine uses the correct coordinate system for anchor validation and
+        # travel-distance checks instead of a centred synthetic rectangle from floor_dims.
+        if _fp_pts is None and manifest.get("volumes"):
+            _base_vol = min(manifest["volumes"],
+                            key=lambda _v: int(_v["levels"][0]) if _v.get("levels") else 0)
+            _fp_pts = _volume_footprint_pts(_base_vol)
         _offset_ovr = shell.get("footprint_offset_overrides", {})
         if _offset_ovr:
             try:
@@ -5508,9 +5890,12 @@ class RevitWorkers:
                         "floor plate on {} level(s) (first: level {}). "
                         "Smallest plate scale at failing levels: {:.2f}×. "
                         "Core walls are built at full height and cannot shrink with the taper. "
-                        "Fix: (a) reduce lift count, (b) use 'parallel' arrangement to reduce cluster depth, "
-                        "or (c) keep lifts.position at [0,0] and ensure the smallest scaled plate "
-                        "is at least (total_core_width + 2×min_office_bay) wide."
+                        "CRITICAL FIX REQUIRED — choose ONE: "
+                        "(a) Set lifts.position to [0,0] (MANDATORY for all tapered buildings — the taper "
+                        "is always symmetric about the origin, so an off-centre core protrudes on upper floors); "
+                        "(b) Reduce lift count so the core cluster fits within smallest_plate_side × 0.7; "
+                        "(c) Use 'arrangement': 'parallel' in the fire cluster to halve the cluster depth. "
+                        "Do NOT offset the core away from [0,0] in a tapered building."
                     ).format(
                         min(_all_x), max(_all_x), min(_all_y), max(_all_y),
                         len(_taper_fail_levels), _taper_fail_levels[0], _sf_min,

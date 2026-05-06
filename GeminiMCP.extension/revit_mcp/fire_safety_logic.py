@@ -2727,9 +2727,55 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
                 # _skip_st is intentionally NOT applied here — Revit Stairs elements
                 # have no explicit enclosure wall, so the lobby wall on the staircase
                 # face must be generated to close the enclosure.
+                #
+                # PARTIAL-SHARE PATCH:
+                # _skip_lf only drops the WHOLE lobby face. When the shaft's parallel-
+                # axis range is narrower than the lobby's (e.g. lobby S face spans
+                # 8000mm but the shaft only covers 3200mm of it), the un-shared
+                # portion is left open and the lobby is not enclosed.
+                # We compute a stub-segment list per shared face: the portions of the
+                # lobby face NOT covered by the shaft, and emit walls for them.
                 _ltag_e = tag + "_LB"
                 _lx1, _lx2 = _lb_box_e[0], _lb_box_e[2]
                 _ly1, _ly2 = _lb_box_e[1], _lb_box_e[3]
+                # Stub segments along the shared face: list of (a1, a2) sub-ranges
+                # of the lobby face that are NOT covered by the shaft. Each is
+                # emitted as a separate wall.
+                _stub_W = []  # list of (y1, y2) when _skip_lf == "W"
+                _stub_E = []
+                _stub_N = []  # list of (x1, x2) when _skip_lf == "N"
+                _stub_S = []
+                if _skip_lf in ("W", "E"):
+                    # Shared face is vertical (lobby W or E). Compare Y ranges.
+                    _shaft_y1, _shaft_y2 = _fl_box_e[1], _fl_box_e[3]
+                    _gap_lo = max(_ly1, min(_ly2, _shaft_y1))
+                    _gap_hi = min(_ly2, max(_ly1, _shaft_y2))
+                    _stub_list = _stub_W if _skip_lf == "W" else _stub_E
+                    if _gap_lo > _ly1 + 1.0:
+                        _stub_list.append((_ly1, _gap_lo))
+                    if _gap_hi < _ly2 - 1.0:
+                        _stub_list.append((_gap_hi, _ly2))
+                elif _skip_lf in ("N", "S"):
+                    # Shared face is horizontal (lobby N or S). Compare X ranges.
+                    _shaft_x1, _shaft_x2 = _fl_box_e[0], _fl_box_e[2]
+                    _gap_lo = max(_lx1, min(_lx2, _shaft_x1))
+                    _gap_hi = min(_lx2, max(_lx1, _shaft_x2))
+                    _stub_list = _stub_N if _skip_lf == "N" else _stub_S
+                    if _gap_lo > _lx1 + 1.0:
+                        _stub_list.append((_lx1, _gap_lo))
+                    if _gap_hi < _lx2 - 1.0:
+                        _stub_list.append((_gap_hi, _lx2))
+                if _stub_W or _stub_E or _stub_N or _stub_S:
+                    _fslog("[LayoutEngine] Set {}: lobby {} face partially shared "
+                           "with shaft → stub segments W={} E={} N={} S={}".format(
+                               i, _skip_lf, _stub_W, _stub_E, _stub_N, _stub_S))
+                # Stubs only apply when the face is dropped because of _skip_lf
+                # (partial shaft share). When the face is dropped via _skip_lb_ancs
+                # (pax-anchor coverage), the anchor wall covers it fully — no stub.
+                _emit_stubs_W = (_skip_lf == "W" and "W" not in _skip_lb_ancs)
+                _emit_stubs_E = (_skip_lf == "E" and "E" not in _skip_lb_ancs)
+                _emit_stubs_N = (_skip_lf == "N" and "N" not in _skip_lb_ancs)
+                _emit_stubs_S = (_skip_lf == "S" and "S" not in _skip_lb_ancs)
                 for _li, _lvl in enumerate(levels_data):
                     _is_last = (_li == len(levels_data) - 1)
                     _lh = overrun_height if _is_last else (
@@ -2740,15 +2786,31 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
                     if _skip_lf != "W" and "W" not in _skip_lb_ancs:
                         walls.append({"id": "AI_{}_W_L{}".format(_ltag_e, _li + 1),
                                       "start": [_lx1, _ly1, 0], "end": [_lx1, _ly2, 0], **_lcommon})
+                    elif _emit_stubs_W:
+                        for _si, (_sa, _sb) in enumerate(_stub_W):
+                            walls.append({"id": "AI_{}_W{}_L{}".format(_ltag_e, _si, _li + 1),
+                                          "start": [_lx1, _sa, 0], "end": [_lx1, _sb, 0], **_lcommon})
                     if _skip_lf != "E" and "E" not in _skip_lb_ancs:
                         walls.append({"id": "AI_{}_E_L{}".format(_ltag_e, _li + 1),
                                       "start": [_lx2, _ly1, 0], "end": [_lx2, _ly2, 0], **_lcommon})
+                    elif _emit_stubs_E:
+                        for _si, (_sa, _sb) in enumerate(_stub_E):
+                            walls.append({"id": "AI_{}_E{}_L{}".format(_ltag_e, _si, _li + 1),
+                                          "start": [_lx2, _sa, 0], "end": [_lx2, _sb, 0], **_lcommon})
                     if _skip_lf != "N" and "N" not in _skip_lb_ancs:
                         walls.append({"id": "AI_{}_N_L{}".format(_ltag_e, _li + 1),
                                       "start": [_lx1, _ly2, 0], "end": [_lx2, _ly2, 0], **_lcommon})
+                    elif _emit_stubs_N:
+                        for _si, (_sa, _sb) in enumerate(_stub_N):
+                            walls.append({"id": "AI_{}_N{}_L{}".format(_ltag_e, _si, _li + 1),
+                                          "start": [_sa, _ly2, 0], "end": [_sb, _ly2, 0], **_lcommon})
                     if _skip_lf != "S" and "S" not in _skip_lb_ancs:
                         walls.append({"id": "AI_{}_S_L{}".format(_ltag_e, _li + 1),
                                       "start": [_lx1, _ly1, 0], "end": [_lx2, _ly1, 0], **_lcommon})
+                    elif _emit_stubs_S:
+                        for _si, (_sa, _sb) in enumerate(_stub_S):
+                            walls.append({"id": "AI_{}_S{}_L{}".format(_ltag_e, _si, _li + 1),
+                                          "start": [_sa, _ly1, 0], "end": [_sb, _ly1, 0], **_lcommon})
 
                 # Lobby topcap
                 if levels_data:

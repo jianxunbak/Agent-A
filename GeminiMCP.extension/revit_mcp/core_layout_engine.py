@@ -1338,7 +1338,6 @@ def _legacy_find_layout(anchor_bounds, fire_lift_size, lobby_size, staircase_siz
     placed = already_placed or []
 
     best = None
-    best_score = float("inf")
 
     _sides = ["N", "S", "E", "W"]
     if preferred_side and preferred_side in _sides:
@@ -1352,49 +1351,56 @@ def _legacy_find_layout(anchor_bounds, fire_lift_size, lobby_size, staircase_siz
     # that order as the mandatory result — skip score comparison.
     _mandatory_order = preferred_order if preferred_order else None
 
-    for side in _sides:
-        for order in _orders:
-            for rot in [0, 1]:
-                # NE order only makes sense with staircase rotated (rot=1)
-                if order == "NE" and rot == 0:
-                    continue
-                # DW order only valid for rot=1 (EW/rotated staircase) — _generate_candidate
-                # also enforces this but skip early to avoid logging degenerate candidates
-                if order == "DW" and rot == 0:
-                    continue
-                cand = _generate_candidate(
-                    anchor_bounds, side, order, rot,
-                    fl_w, fl_d, lb_w, lb_d, st_w, st_d)
-                prefix = "[LayoutEngine] Candidate side={} order={} rot={}".format(side, order, rot)
-                if cand is None:
-                    _log("{}: degenerate".format(prefix))
-                    continue
-                ok, result = _validate_candidate(
-                    cand, anchor_bounds, side,
-                    holes, footprint_pts, placed,
-                    prefix, log_fn, chain_order=order)
-                if ok:
-                    cand_result = {
-                        "fire_lift":   cand["fire_lift"],
-                        "lobby":       cand["lobby"],
-                        "staircase":   cand["staircase"],
-                        "attach_side": side,
-                        "chain_order": order,
-                        "stair_rot":   rot,
-                        "score":       result,
-                    }
-                    if _mandatory_order and order == _mandatory_order:
-                        # First valid candidate matching the mandatory order wins immediately.
-                        best = cand_result
-                        _log("[LayoutEngine] Mandatory order={} matched — using first valid".format(order))
-                        break
-                    if result < best_score:
-                        best_score = result
-                        best = cand_result
-            if best and _mandatory_order and best["chain_order"] == _mandatory_order:
-                break
-        if best and _mandatory_order and best["chain_order"] == _mandatory_order:
-            break
+    def _run_search(sides_to_try):
+        _b = None
+        _bs = float("inf")
+        for side in sides_to_try:
+            for order in _orders:
+                for rot in [0, 1]:
+                    if order == "NE" and rot == 0:
+                        continue
+                    if order == "DW" and rot == 0:
+                        continue
+                    cand = _generate_candidate(
+                        anchor_bounds, side, order, rot,
+                        fl_w, fl_d, lb_w, lb_d, st_w, st_d)
+                    prefix = "[LayoutEngine] Candidate side={} order={} rot={}".format(side, order, rot)
+                    if cand is None:
+                        _log("{}: degenerate".format(prefix))
+                        continue
+                    ok, result = _validate_candidate(
+                        cand, anchor_bounds, side,
+                        holes, footprint_pts, placed,
+                        prefix, log_fn, chain_order=order)
+                    if ok:
+                        cand_result = {
+                            "fire_lift":   cand["fire_lift"],
+                            "lobby":       cand["lobby"],
+                            "staircase":   cand["staircase"],
+                            "attach_side": side,
+                            "chain_order": order,
+                            "stair_rot":   rot,
+                            "score":       result,
+                        }
+                        if _mandatory_order and order == _mandatory_order:
+                            _log("[LayoutEngine] Mandatory order={} matched — using first valid".format(order))
+                            return cand_result
+                        if result < _bs:
+                            _bs = result
+                            _b = cand_result
+        return _b
+
+    # When a preferred_side is specified (symmetry lock), first try that side alone.
+    # Only fall through to all sides if the preferred side yields zero valid candidates.
+    if preferred_side and preferred_side in ["N", "S", "E", "W"]:
+        best = _run_search([preferred_side])
+        if best:
+            _log("[LayoutEngine] (legacy) preferred_side={} satisfied".format(preferred_side))
+        else:
+            _log("[LayoutEngine] (legacy) preferred_side={} infeasible — trying all sides".format(preferred_side))
+            best = _run_search(_sides)
+    else:
+        best = _run_search(_sides)
 
     if best:
         _log("[LayoutEngine] (legacy) Selected: side={} order={} rot={} score={:.0f}".format(
