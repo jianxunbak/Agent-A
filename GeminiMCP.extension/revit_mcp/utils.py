@@ -27,19 +27,18 @@ def load_compliance(name):
 
 _cached_log_path = None
 
-def get_log_path():
-    global _cached_log_path
-    if _cached_log_path:
-        return _cached_log_path
-    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    _cached_log_path = os.path.join(root, "fastmcp_server.log")
-    return _cached_log_path
-
 def get_appdata_path(subfolder):
     """Return %APPDATA%\\RevitMCP\\<subfolder>, creating directories if needed."""
     base = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "RevitMCP", subfolder)
     os.makedirs(base, exist_ok=True)
     return base
+
+def get_log_path():
+    global _cached_log_path
+    if _cached_log_path:
+        return _cached_log_path
+    _cached_log_path = os.path.join(get_appdata_path("logs"), "fastmcp_server.log")
+    return _cached_log_path
 
 def safe_num(val, default=0):
     try:

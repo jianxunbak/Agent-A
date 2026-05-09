@@ -14,10 +14,72 @@ from revit_mcp.cancel_manager import check_cancelled
 
 
 class Orchestrator:
+    # Disk-backed RAG cache key path.  Same %APPDATA%\Roaming\RevitMCP\cache
+    # location used by sub_agent's chunk cache.  Persists synthesised rules
+    # across server restarts so a "30-storey office" rebuild after a Revit
+    # restart still hits cache and skips the ~50s RAG round-trip.
+    _RAG_DISK_CACHE_FILE = "rag_rules_cache.json"
+
     def __init__(self):
         self.workers = None
         self.generator = None
         self._rag_cache = {}   # keyed by (building_type, storeys) → rag_rules dict
+        self._load_rag_cache_from_disk()
+
+    def _rag_cache_path(self):
+        try:
+            from revit_mcp.utils import get_appdata_path
+            import os
+            return os.path.join(get_appdata_path("cache"), self._RAG_DISK_CACHE_FILE)
+        except Exception:
+            return None
+
+    def _load_rag_cache_from_disk(self):
+        """Populate self._rag_cache from disk on startup.  Uses string keys
+        on disk (json doesn't support tuple keys); convert back to tuples in
+        memory.
+        """
+        try:
+            import os, json as _j
+            path = self._rag_cache_path()
+            if not path or not os.path.isfile(path):
+                return
+            with open(path, "r", encoding="utf-8") as fh:
+                _disk = _j.load(fh) or {}
+            # Disk format: {"<type>::<storeys>": {rag_rules}}
+            _restored = 0
+            for k, v in _disk.items():
+                try:
+                    _btype, _storeys = k.split("::", 1)
+                    _storeys_v = int(_storeys) if _storeys.isdigit() else _storeys
+                    self._rag_cache[(_btype, _storeys_v)] = v
+                    _restored += 1
+                except Exception:
+                    continue
+            if _restored:
+                client.log(f"[RAG] Restored {_restored} cached rule sets from disk: {path}")
+        except Exception as _e:
+            try: client.log(f"[RAG] Disk cache load failed: {_e}")
+            except Exception: pass
+
+    def _save_rag_cache_to_disk(self):
+        """Write self._rag_cache to disk after a successful Vertex round-trip.
+        Best-effort — failures are logged but don't break the build.
+        """
+        try:
+            import os, json as _j
+            path = self._rag_cache_path()
+            if not path:
+                return
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            _disk = {}
+            for (btype, storeys), rules in (self._rag_cache or {}).items():
+                _disk[f"{btype}::{storeys}"] = rules
+            with open(path, "w", encoding="utf-8") as fh:
+                _j.dump(_disk, fh, indent=2, ensure_ascii=False)
+        except Exception as _e:
+            try: client.log(f"[RAG] Disk cache save failed: {_e}")
+            except Exception: pass
 
     def run_full_stack(self, uiapp, user_prompt, tracker=None, history=None):
         # Do NOT access uiapp.ActiveUIDocument here (thread violation).
@@ -161,188 +223,69 @@ class Orchestrator:
         # --- START RAG INTEGRATION ---
         # Only run RAG for build/new_build intents — queries, deletes, and option commands
         # don't need compliance rules.
+        # Concurrency: when the build will run two-pass (new_build), Pass 1's
+        # ~30s shell-only Gemini call doesn't actually need RAG content — the
+        # shell decisions are geometry/typology, not compliance dimensions.  So
+        # we kick RAG off in a daemon thread here and join it just before Pass 2
+        # assembles its prompt.  The save_snap fast path returns nearly instant,
+        # so the join is free in cached cases.  Single-pass / non-build intents
+        # run RAG synchronously to preserve original behaviour.
         import time as _time
+        import threading as _rag_threading
         rag_rules = None
         _stored_compliance_snapshot = None  # set when we reuse saved compliance
-        _build_intent_name = (build_classified or {}).get("intent")
-        _needs_rag = _build_intent_name in ("build", "new_build", None)  # None = classification failed, be safe
-        try:
-            from revit_mcp.config import RAG_ENABLED
-            self.log(f"[RAG] RAG_ENABLED={RAG_ENABLED}")
-            if RAG_ENABLED:
-                if not _needs_rag:
-                    self.log("[RAG] Skipping — intent is '{}', not a design operation".format(_build_intent_name))
-                else:
-                    # Check if the current option already has saved compliance — skip RAG if so
-                    _saved_rag, _saved_snap = None, None
-                    try:
-                        _mgr_early = get_options_manager()
-                        _mgr_early._ensure_loaded()
-                        _cur_opt = _mgr_early._data.get("current_option_id")
-                        _cur_rev = _mgr_early._data.get("current_revision_id")
-                        if _cur_opt:
-                            _saved_rag, _saved_snap = _mgr_early.get_cached_compliance(_cur_opt, _cur_rev)
-                    except Exception as _ce:
-                        self.log(f"[RAG] Compliance cache lookup failed: {_ce}")
+        _rag_future = None  # populated when we kick RAG off in a thread
 
-                    # Detect large storey change — compliance must be re-fetched
-                    _large_storey_change = False
-                    if _saved_snap:
-                        import re as _re2
-                        _storey_nums = _re2.findall(r'\b(\d+)\s*stor', user_prompt.lower())
-                        if _storey_nums:
-                            try:
-                                _cur_opt_obj = _mgr_early._find_option(_cur_opt) if _cur_opt else None
-                                _cur_levels = (_cur_opt_obj or {}).get("manifest", {}).get(
-                                    "project_setup", {}).get("levels", 0) if _cur_opt_obj else 0
-                                _req_levels = int(_storey_nums[-1])
-                                if abs(_req_levels - _cur_levels) >= 10:
-                                    _large_storey_change = True
-                                    self.log(f"[RAG] Large storey change detected ({_cur_levels} → {_req_levels}) — invalidating compliance cache")
-                            except Exception:
-                                pass
+        _build_intent_for_rag = (build_classified or {}).get("intent")
+        _will_run_two_pass = (_build_intent_for_rag == "new_build")
 
-                    if _saved_snap and not _large_storey_change:
-                        self.log(f"[RAG] Using saved compliance from option {_cur_opt} — skipping RAG")
-                        if tracker: tracker.set_status("Using saved authority codes from previous build...")
-                        rag_rules = _saved_rag
-                        _stored_compliance_snapshot = _saved_snap
-                    else:
-                        from revit_mcp.agents.main_agent import extract_intent
-                        from revit_mcp.agents.sub_agent import run_retrieve_rules
-                        self.log("[RAG] Extracting building intent (regex)...")
-                        intent = extract_intent(user_prompt)
-                        self.log(f"[RAG] Intent extracted: {intent}")
-                        cache_key = (intent.get("building_type"), intent.get("storeys"))
-                        if cache_key in self._rag_cache:
-                            rag_rules = self._rag_cache[cache_key]
-                            self.log(f"[RAG] Cache hit for {cache_key} — reusing rules")
-                            if tracker: tracker.set_status("Authority codes loaded from cache...")
-                        else:
-                            _btype = intent.get("building_type", "building")
-                            _nstoreys = intent.get("storeys", "?")
-                            _topics = intent.get("topics", [])
-                            if tracker: tracker.set_status(
-                                "Sub-agent: querying authority code library ({}, {} storeys)...".format(_btype, _nstoreys))
-                            self.log(f"[RAG] Building intent: {_btype}, {_nstoreys} storeys, topics: {_topics}")
-                            _t_rag = _time.time()
-                            self.log("[RAG] Calling run_retrieve_rules...")
-                            rag_rules = run_retrieve_rules(
-                                intent,
-                                report=None,
-                                set_status=tracker.set_status if tracker else None,
-                            )
-                            self.log(f"[RAG] run_retrieve_rules returned in {_time.time()-_t_rag:.2f}s — result={rag_rules}")
-
-                            # ── RAG VALIDATION + RETRY ──────────────────────────────────────────
-                            # Keys that MUST be present before passing compliance to Gemini.
-                            # Structured as {topic: [required_keys]} so we know which topics to retry.
-                            _REQUIRED_RAG_KEYS = {
-                                "staircase":        ["min_count", "min_flight_width_mm", "max_travel_distance_mm"],
-                                "occupant_load":    ["occupant_load_factor_m2"],
-                                "exit_width":       ["persons_per_unit_width", "exit_width_per_unit_mm"],
-                                "travel_distance":  ["max_travel_distance_mm"],
-                                "corridor":         ["min_corridor_width_mm"],
-                                "smoke_stop_lobby": ["min_area_mm2", "min_width_mm"],
-                            }
-                            if intent.get("storeys", 1) > 4:
-                                _REQUIRED_RAG_KEYS["fire_lift_lobby"] = ["min_area_mm2", "min_width_mm"]
-
-                            _retrieved_rules = (rag_rules or {}).get("rules", {})
-                            _missing_topics = []
-                            for _topic, _keys in _REQUIRED_RAG_KEYS.items():
-                                _topic_data = _retrieved_rules.get(_topic, {})
-                                for _key in _keys:
-                                    _val = _topic_data.get(_key)
-                                    _has_val = (
-                                        _val is not None
-                                        and (not isinstance(_val, dict) or _val.get("dimension") is not None)
-                                    )
-                                    if not _has_val:
-                                        if _topic not in _missing_topics:
-                                            _missing_topics.append(_topic)
-                                        self.log(f"[RAG] Missing required key: {_topic}.{_key}")
-
-                            if _missing_topics:
-                                self.log(f"[RAG] Retrying {len(_missing_topics)} topic(s) with missing keys: {_missing_topics}")
-                                _retry_intent = dict(intent, topics=_missing_topics)
-                                _t_retry = _time.time()
-                                _retry_rules = run_retrieve_rules(_retry_intent)
-                                self.log(f"[RAG] Retry done in {_time.time()-_t_retry:.2f}s — result={_retry_rules}")
-
-                                # Merge retry results into rag_rules (retry wins for retrieved keys)
-                                if _retry_rules and _retry_rules.get("rules"):
-                                    if rag_rules is None:
-                                        rag_rules = _retry_rules
-                                    else:
-                                        for _rt, _rv in _retry_rules.get("rules", {}).items():
-                                            if _rt not in rag_rules["rules"]:
-                                                rag_rules["rules"][_rt] = _rv
-                                            else:
-                                                # Merge individual keys — retry overwrites existing only where it has a value
-                                                for _rk, _rval in _rv.items():
-                                                    _is_present = (
-                                                        _rval is not None
-                                                        and (not isinstance(_rval, dict) or _rval.get("dimension") is not None)
-                                                    )
-                                                    if _is_present:
-                                                        rag_rules["rules"][_rt][_rk] = _rval
-
-                                # Log final state of required keys after retry
-                                _final_rules = (rag_rules or {}).get("rules", {})
-                                _still_missing = []
-                                for _topic, _keys in _REQUIRED_RAG_KEYS.items():
-                                    _topic_data = _final_rules.get(_topic, {})
-                                    for _key in _keys:
-                                        _val = _topic_data.get(_key)
-                                        _has_val = (
-                                            _val is not None
-                                            and (not isinstance(_val, dict) or _val.get("dimension") is not None)
-                                        )
-                                        if not _has_val:
-                                            _still_missing.append(f"{_topic}.{_key}")
-                                if _still_missing:
-                                    self.log(f"[RAG] After retry, still missing: {_still_missing} — Gemini will use static fallback for these")
-                                else:
-                                    self.log("[RAG] All required keys present after retry ✓")
-                            # ── END RAG VALIDATION + RETRY ─────────────────────────────────────
-
-                            if rag_rules:
-                                topics_found = list(rag_rules.get("rules", {}).keys())
-                                self.log(f"[RAG] Rules retrieved for topics: {topics_found}")
-                                self._rag_cache[cache_key] = rag_rules
-                                self.log(f"[RAG] Cached rules under key {cache_key}")
-                                if tracker:
-                                    from revit_mcp.agents.sub_agent import format_rules_for_display
-                                    _table = format_rules_for_display(rag_rules)
-                                    if _table:
-                                        tracker.report("✅ **Authority codes resolved:**\n\n" + _table, is_narrative=True)
-                                    else:
-                                        tracker.report("✅ Authority codes resolved.", is_narrative=True)
-        except Exception as _rag_err:
-            self.log(f"[RAG] FAILED — {type(_rag_err).__name__}: {_rag_err}")
-            rag_rules = None
+        if _will_run_two_pass:
+            # Concurrent path: launch the entire RAG pipeline in a background
+            # thread.  Outputs are captured into _rag_holder; we resolve them
+            # right before Pass 2 prompt assembly.
+            _rag_holder = {"rag_rules": None, "snapshot": None, "done": _rag_threading.Event()}
+            def _rag_worker():
+                try:
+                    _rr, _snap = self._run_rag_block(user_prompt, tracker, build_classified)
+                    _rag_holder["rag_rules"] = _rr
+                    _rag_holder["snapshot"] = _snap
+                except Exception as _e:
+                    self.log(f"[RAG] background worker crashed: {_e}")
+                finally:
+                    _rag_holder["done"].set()
+            _rag_future = _rag_threading.Thread(target=_rag_worker, daemon=True)
+            _rag_future.start()
+            self.log("[RAG] launched in background (concurrent with Pass 1)")
+        else:
+            # Synchronous path: original behaviour.
+            rag_rules, _stored_compliance_snapshot = self._run_rag_block(
+                user_prompt, tracker, build_classified)
         # --- END RAG INTEGRATION ---
+        # (legacy inline body extracted to Orchestrator._run_rag_block)
 
-        if _stored_compliance_snapshot:
-            # Reuse the exact compliance text that was used when this option was first built
-            compliance_text = _stored_compliance_snapshot
-        elif _c_lift or _c_fire or _c_struct or rag_rules:
-            compliance_text = "\nAUTHORITY COMPLIANCE RULES (MANDATORY — embed values used into manifest compliance_parameters):\n"
+        # ── compliance_text builder ─────────────────────────────────────────
+        # Re-callable so we can build a static-only version EARLY (before RAG
+        # finishes — used for Pass 1, which doesn't need RAG content for shell
+        # decisions) and a fully-merged version LATER once RAG is ready (used
+        # for Pass 2 + single-pass).
+        def _build_compliance_text(_rag_rules):
+            if _stored_compliance_snapshot:
+                return _stored_compliance_snapshot
+            if not (_c_lift or _c_fire or _c_struct or _rag_rules):
+                return ""
+            _txt = "\nAUTHORITY COMPLIANCE RULES (MANDATORY — embed values used into manifest compliance_parameters):\n"
             if _c_lift:
-                compliance_text += "## Lift Engineering — BS EN 81-20 / CIBSE Guide D:\n"
-                compliance_text += json.dumps(_c_lift, indent=2) + "\n"
+                _txt += "## Lift Engineering — BS EN 81-20 / CIBSE Guide D:\n"
+                _txt += json.dumps(_c_lift, indent=2) + "\n"
             # Merge dynamic RAG fire rules ON TOP of static file.
             # Static file supplies the known dimension values (riser, tread, flight width, etc.)
             # that the SCDF PDF table data may not be directly retrievable by Vertex.
             # RAG supplies specific clause numbers and any additional/more-specific rules.
-            if rag_rules or _c_fire:
-                compliance_text += f"## Fire Safety ({rag_rules.get('authority', 'SCDF') if rag_rules else 'BS EN 81-72 / BS 9999'}):\n"
-                # Start with static file as the base
+            if _rag_rules or _c_fire:
+                _txt += f"## Fire Safety ({_rag_rules.get('authority', 'SCDF') if _rag_rules else 'BS EN 81-72 / BS 9999'}):\n"
                 merged = json.loads(json.dumps(_c_fire)) if _c_fire else {}
-                if rag_rules:
+                if _rag_rules:
                     # Keys in these topics MUST come from RAG — always overwrite static values.
-                    # Static file is only a fallback when RAG returns nothing for a topic.
                     _RAG_AUTHORITATIVE_TOPICS = {
                         "staircase":        {"max_travel_distance_mm", "max_travel_distance_sprinklered_mm",
                                              "min_flight_width_mm", "min_landing_width_mm", "min_count"},
@@ -352,7 +295,7 @@ class Orchestrator:
                         "exit_width":       {"persons_per_unit_width", "exit_width_per_unit_mm"},
                         "corridor":         {"min_corridor_width_mm"},
                     }
-                    for topic, vals in rag_rules.get("rules", {}).items():
+                    for topic, vals in _rag_rules.get("rules", {}).items():
                         if topic not in merged:
                             merged[topic] = {}
                         authoritative_keys = _RAG_AUTHORITATIVE_TOPICS.get(topic, set())
@@ -362,17 +305,19 @@ class Orchestrator:
                             elif isinstance(v, dict) and "dimension" in v:
                                 dim = v["dimension"]
                                 clause = v.get("clause")
-                                # Always overwrite for authoritative keys; add-only for others
                                 if k in authoritative_keys or merged[topic].get(k) is None:
                                     merged[topic][k] = dim
                                 if clause:
                                     merged[topic][k + "__clause"] = clause
                             else:
                                 merged[topic][k] = v
-                compliance_text += json.dumps(merged, indent=2) + "\n"
+                _txt += json.dumps(merged, indent=2) + "\n"
             if _c_struct:
-                compliance_text += "## Structural — Wall Thicknesses:\n"
-                compliance_text += json.dumps(_c_struct, indent=2) + "\n"
+                _txt += "## Structural — Wall Thicknesses:\n"
+                _txt += json.dumps(_c_struct, indent=2) + "\n"
+            return _txt
+
+        compliance_text = _build_compliance_text(rag_rules)
 
         def gather_state():
             import Autodesk.Revit.DB as DB # type: ignore
@@ -545,24 +490,38 @@ class Orchestrator:
         # Temperature + thinking_budget come from classify_intent — set per prompt, not hardcoded.
         temperature = float((classified or {}).get("temperature", 0.4))
         thinking_budget = int((classified or {}).get("thinking_budget", 16384))
-        self.log("Step 2: Requesting building plan from Gemini AI (model: {}, thinking_budget: {}, temperature: {})".format(client.model, thinking_budget, temperature))
+        # Pass 2 (core placement) doesn't need the same reasoning budget as Pass 1
+        # (shell architecture). Pass 2 is constraint-satisfaction — bank position
+        # within an engine-computed valid range, cluster sides per directive.
+        # Most of the architectural exploration already happened in Pass 1.
+        # Cap Pass 2 at 4096 thinking tokens (was inheriting 16384 from new_build
+        # classification). Saves ~20-30s per Pass 2 call. Conflict-retry attempts
+        # also benefit since they go through the same Pass 2 path.
+        pass2_thinking_budget = min(thinking_budget, 4096)
+        self.log("Step 2: Requesting building plan from Gemini AI (model: {}, thinking_budget: {} pass1 / {} pass2, temperature: {})".format(
+            client.model, thinking_budget, pass2_thinking_budget, temperature))
         creativity_label = "creative" if temperature >= 0.8 else ("balanced" if temperature >= 0.4 else "precise")
         self.log(f"Sending to Gemini AI ({client.model}) — {creativity_label} mode (temp={temperature})...")
         if tracker: tracker.set_status("Main agent: generating building manifest ({} mode)...".format(creativity_label))
 
-        def _generate_with_heartbeat(prompt, phase_label, attempt_label=""):
+        def _generate_with_heartbeat(prompt, phase_label, attempt_label="", thinking_budget_override=None):
             """Call client.generate_content() with a background thread that updates the
-            tracker status every 10s so the user sees live elapsed time instead of silence."""
+            tracker status every 10s so the user sees live elapsed time instead of silence.
+
+            thinking_budget_override: when set, uses this budget instead of the
+            classify_intent value. Pass 2 calls pass `pass2_thinking_budget` here.
+            """
             import threading as _threading
             import time as _hb_time
             _result_holder = [None]
             _error_holder  = [None]
             _start = _hb_time.time()
+            _budget = thinking_budget_override if thinking_budget_override is not None else thinking_budget
 
             def _worker():
                 try:
                     _result_holder[0] = client.generate_content(
-                        prompt, thinking_budget=thinking_budget, temperature=temperature)
+                        prompt, thinking_budget=_budget, temperature=temperature)
                 except Exception as _e:
                     _error_holder[0] = _e
 
@@ -695,6 +654,24 @@ class Orchestrator:
                     if _guide_diag:
                         self.log("[TwoPass][DIAG] placement_guide_bands={}".format(_guide_diag))
                     # ────────────────────────────────────────────────────────────
+                    # Concurrent RAG: if we kicked it off in a thread above,
+                    # await it now (just before Pass 2 needs the merged compliance
+                    # text) and rebuild compliance_text with the freshly-merged
+                    # rules.  Pass 1 used the static-only compliance, which was
+                    # fine because Pass 1 doesn't make decisions on RAG values.
+                    if _rag_future is not None:
+                        _t_join = _time.time()
+                        if tracker: tracker.set_status("Awaiting authority code retrieval...")
+                        # Generous deadline matching run_retrieve_rules' own 150s ceiling.
+                        _rag_holder["done"].wait(timeout=160)
+                        rag_rules = _rag_holder.get("rag_rules")
+                        _stored_compliance_snapshot = _rag_holder.get("snapshot")
+                        compliance_text = _build_compliance_text(rag_rules)
+                        self.log("[RAG] joined background worker in {:.2f}s "
+                                 "(rag_rules={}, snapshot={})".format(
+                            _time.time() - _t_join,
+                            "present" if rag_rules else "None",
+                            "present" if _stored_compliance_snapshot else "None"))
                     _analysis_block = self._format_floor_plate_analysis(_analysis)
                     _shell_block = "\n\n## PASS 1 SHELL MANIFEST (do not change shell — add core placement only)\n```json\n{}\n```\n".format(
                         __import__("json").dumps(_pass1_manifest, indent=2))
@@ -711,6 +688,24 @@ class Orchestrator:
                     self.log("[TwoPass] Pass 1 produced no manifest — falling back to single-pass.")
             except Exception as _tp_err:
                 self.log("[TwoPass] Two-pass setup error: {} — falling back to single-pass.".format(_tp_err))
+
+        # If RAG was launched concurrently and we never joined (either Pass 1
+        # produced no manifest, OR an exception aborted the two-pass block), do
+        # the join now so single-pass / retry-loop sees the merged compliance
+        # instead of the static-only Pass-1 placeholder.
+        if _rag_future is not None and not _rag_holder["done"].is_set():
+            _t_join_fb = _time.time()
+            if tracker: tracker.set_status("Awaiting authority code retrieval (fallback)...")
+            _rag_holder["done"].wait(timeout=160)
+            rag_rules = _rag_holder.get("rag_rules")
+            _stored_compliance_snapshot = _rag_holder.get("snapshot")
+            compliance_text = _build_compliance_text(rag_rules)
+            current_prompt = (DISPATCHER_PROMPT + presets_text + compliance_text
+                              + "\n" + state_text + history_block + _goal_block
+                              + "\nUser Request: " + user_prompt)
+            self.log("[RAG] joined background worker on two-pass fallback in "
+                     "{:.2f}s; rebuilt single-pass current_prompt".format(
+                         _time.time() - _t_join_fb))
 
         max_attempts = 3
         intent_text = None  # Captured from Gemini's <architectural_intent> for build_memory naming
@@ -744,7 +739,13 @@ class Orchestrator:
             _pass_label = "Pass 2: placing core" if _run_two_pass else "Generating manifest"
             _attempt_label = " (attempt {}/{})".format(attempt + 1, max_attempts) if max_attempts > 1 else ""
             if tracker: tracker.set_status("{}{} — sending to Gemini...".format(_pass_label, _attempt_label))
-            manifest_json = _generate_with_heartbeat(current_prompt, _pass_label, _attempt_label)
+            # Pass 2 is constraint-satisfaction over engine-computed ranges, so it
+            # uses a tighter thinking budget than Pass 1's architectural reasoning.
+            # Single-pass builds (no Pass 1) keep the full classify_intent budget.
+            _attempt_budget = pass2_thinking_budget if _run_two_pass else None
+            manifest_json = _generate_with_heartbeat(
+                current_prompt, _pass_label, _attempt_label,
+                thinking_budget_override=_attempt_budget)
             ai_duration = time.time() - ai_start
 
             self.log("Manifest received from AI. (Time: {:.2f}s). Parsing...".format(ai_duration))
@@ -1156,6 +1157,15 @@ class Orchestrator:
             # Valid ranges are [lo, hi]; if lo > hi the band is INFEASIBLE.
             _clust_d = fc.get("cluster_assembly_depth_mm", 0)
             _bank_d_half = int(fp.get("passenger_bank_total_depth_mm", 0)) // 2
+            # When the manifest will produce TWO mirrored clusters on a single bank
+            # (one outer, one inner), the inner cluster needs `cluster_d` clearance
+            # too — otherwise the mirrored stair lands inside the void.  Default to
+            # 2 (the most common case for courtyard typology) so the prompt range
+            # is correct even before Gemini commits to a cluster count.  The post-
+            # placement validator in fire_safety_logic catches drift if Gemini
+            # actually emits a single-cluster directive.
+            _num_clusters_reserve = max(int(fc.get("num_clusters", 2) or 2), 1)
+            _inner_reserve = _clust_d if _num_clusters_reserve >= 2 else 0
             if _clust_d and _bank_d_half:
                 # Footprint outer bounds (use outer_bbox when available, else void ± generous margin)
                 if _outer_bbox and len(_outer_bbox) == 4:
@@ -1165,66 +1175,75 @@ class Orchestrator:
                     # Fallback: pad void by a generous margin
                     _fp_xmin_pg = _void_xmin - 20000; _fp_xmax_pg = _void_xmax + 20000
                     _fp_ymin_pg = _void_ymin - 20000; _fp_ymax_pg = _void_ymax + 20000
-                # South band: bank sits between fp_ymin and void_ymin, cluster goes south (outer)
-                #   bank_y1 ≥ fp_ymin + cluster_depth  →  bank_cy ≥ fp_ymin + cluster_depth + bank_hd
-                #   bank_y2 ≤ void_ymin                →  bank_cy ≤ void_ymin - bank_hd
+                # South band: bank sits between fp_ymin and void_ymin
+                #   Outer (south of bank): cluster_d reservation toward fp_ymin
+                #   Inner (north of bank): cluster_d reservation toward void_ymin
+                #     when 2 clusters — mirrored cluster lands here, must clear void
                 _s_lo = _fp_ymin_pg + _clust_d + _bank_d_half
-                _s_hi = _void_ymin - _bank_d_half
-                # North band: bank sits between void_ymax and fp_ymax, cluster goes north (outer)
-                #   bank_y1 ≥ void_ymax                →  bank_cy ≥ void_ymax + bank_hd
-                #   bank_y2 ≤ fp_ymax - cluster_depth  →  bank_cy ≤ fp_ymax - cluster_depth - bank_hd
-                _n_lo = _void_ymax + _bank_d_half
+                _s_hi = _void_ymin - _bank_d_half - _inner_reserve
+                # North band: bank sits between void_ymax and fp_ymax
+                #   Outer (north of bank): cluster_d reservation toward fp_ymax
+                #   Inner (south of bank): cluster_d reservation toward void_ymax
+                _n_lo = _void_ymax + _bank_d_half + _inner_reserve
                 _n_hi = _fp_ymax_pg - _clust_d - _bank_d_half
-                # East band: bank between void_xmax and fp_xmax, cluster goes east
-                _e_lo = _void_xmax + _bank_d_half
+                # East band: bank between void_xmax and fp_xmax
+                _e_lo = _void_xmax + _bank_d_half + _inner_reserve
                 _e_hi = _fp_xmax_pg - _clust_d - _bank_d_half
-                # West band: bank between fp_xmin and void_xmin, cluster goes west
+                # West band: bank between fp_xmin and void_xmin
                 _w_lo = _fp_xmin_pg + _clust_d + _bank_d_half
-                _w_hi = _void_xmin - _bank_d_half
+                _w_hi = _void_xmin - _bank_d_half - _inner_reserve
 
                 lines.append("  PLACEMENT GUIDE — valid bank_centre ranges for EW bank (cluster goes N or S):")
                 lines.append("    Cluster chain depth = {} mm (fire_lift + lobby + stair stacked)".format(_clust_d))
                 lines.append("    Bank half-depth = {} mm".format(_bank_d_half))
+                if _inner_reserve:
+                    lines.append("    NOTE: assuming {} clusters per bank — both outer AND inner sides reserve "
+                                 "{} mm clearance (the inner-side cluster is mirrored from the outer side and "
+                                 "must not overlap the courtyard void)".format(
+                                     _num_clusters_reserve, _clust_d))
+                # Total clearance the band must hold:
+                # outer cluster (cluster_d) + bank depth (2·bank_hd) + inner cluster
+                # (inner_reserve, 0 for 1-cluster banks).
+                _band_need = _clust_d + _bank_d_half * 2 + _inner_reserve
+                _budget_label = "{}mm chain (outer) + {}mm bank{}".format(
+                    _clust_d, _bank_d_half * 2,
+                    " + {}mm chain (inner mirror)".format(_inner_reserve) if _inner_reserve else "")
                 if _s_lo <= _s_hi:
                     lines.append("    South band — FEASIBLE: bank_centre_y in [{}, {}] mm  (bank south of void, cluster toward south wall)".format(
                         _s_lo, _s_hi))
                 else:
                     lines.append("    South band — INFEASIBLE: need bank_cy in [{}, {}] mm but lo>hi "
-                                 "(south band {}mm deep, need chain {}mm + bank_depth {}mm = {}mm total)".format(
+                                 "(south band {}mm deep, need {} = {}mm total)".format(
                         _s_lo, _s_hi,
-                        _void_ymin - _fp_ymin_pg,
-                        _clust_d, _bank_d_half * 2, _clust_d + _bank_d_half * 2))
+                        _void_ymin - _fp_ymin_pg, _budget_label, _band_need))
                 if _n_lo <= _n_hi:
                     lines.append("    North band — FEASIBLE: bank_centre_y in [{}, {}] mm  (bank north of void, cluster toward north wall)".format(
                         _n_lo, _n_hi))
                 else:
                     lines.append("    North band — INFEASIBLE: need bank_cy in [{}, {}] mm but lo>hi "
-                                 "(north band {}mm deep, need chain {}mm + bank_depth {}mm = {}mm total)".format(
+                                 "(north band {}mm deep, need {} = {}mm total)".format(
                         _n_lo, _n_hi,
-                        _fp_ymax_pg - _void_ymax,
-                        _clust_d, _bank_d_half * 2, _clust_d + _bank_d_half * 2))
+                        _fp_ymax_pg - _void_ymax, _budget_label, _band_need))
                 lines.append("  PLACEMENT GUIDE — valid bank_centre ranges for NS bank (cluster goes E or W):")
                 if _e_lo <= _e_hi:
                     lines.append("    East band — FEASIBLE: bank_centre_x in [{}, {}] mm  (bank east of void, cluster toward east wall)".format(
                         _e_lo, _e_hi))
                 else:
                     lines.append("    East band — INFEASIBLE: need bank_cx in [{}, {}] mm but lo>hi "
-                                 "(east band {}mm wide, need chain {}mm + bank_depth {}mm = {}mm total)".format(
+                                 "(east band {}mm wide, need {} = {}mm total)".format(
                         _e_lo, _e_hi,
-                        _fp_xmax_pg - _void_xmax,
-                        _clust_d, _bank_d_half * 2, _clust_d + _bank_d_half * 2))
+                        _fp_xmax_pg - _void_xmax, _budget_label, _band_need))
                 if _w_lo <= _w_hi:
                     lines.append("    West band — FEASIBLE: bank_centre_x in [{}, {}] mm  (bank west of void, cluster toward west wall)".format(
                         _w_lo, _w_hi))
                 else:
                     lines.append("    West band — INFEASIBLE: need bank_cx in [{}, {}] mm but lo>hi "
-                                 "(west band {}mm wide, need chain {}mm + bank_depth {}mm = {}mm total)".format(
+                                 "(west band {}mm wide, need {} = {}mm total)".format(
                         _w_lo, _w_hi,
-                        _void_xmin - _fp_xmin_pg,
-                        _clust_d, _bank_d_half * 2, _clust_d + _bank_d_half * 2))
+                        _void_xmin - _fp_xmin_pg, _budget_label, _band_need))
                 _any_feasible = any([_s_lo <= _s_hi, _n_lo <= _n_hi, _e_lo <= _e_hi, _w_lo <= _w_hi])
                 if not _any_feasible:
-                    _min_band_sz = _clust_d + _bank_d_half * 2 + 1000
+                    _min_band_sz = _band_need + 1000
                     _void_y_depth = _void_ymax - _void_ymin
                     _void_x_depth = _void_xmax - _void_xmin
                     _min_bldg_ew = int(_void_y_depth + 2 * _min_band_sz)
@@ -1512,7 +1531,7 @@ class Orchestrator:
                     _prev_question = text  # last real user question
                 if _prev_question and _prev_answer:
                     break
-            if _prev_question:
+            if _prev_question and _prev_answer:
                 user_prompt = _prev_question
                 _retry_note = (
                     "\n\nNOTE — THIS IS A RETRY: The user found the previous answer unsatisfactory.\n"
@@ -1542,7 +1561,7 @@ class Orchestrator:
         # Tables like 2.2A, 2.2B are SCDF fire code tables — default to SCDF
         if not detected_authority and _re.search(r'table\s+\d+\.\d+', _prompt_lower):
             detected_authority = "SCDF"
-        source_filter = f"knowledge_base/{detected_authority}" if detected_authority else None
+        source_filter = detected_authority if detected_authority else None
         self.log(f"[AuthorityQuery] detected_authority={detected_authority} source_filter={source_filter}")
 
         # Ask Gemini to expand the user's query into 3 precise RAG search strings,
@@ -1636,13 +1655,96 @@ class Orchestrator:
             if tracker: tracker.report(msg)
             return msg
 
+        # ── Pre-process chunks before assembling the Gemini context ───────────
+        # 1. Detect table-rich chunks (count pipe-density per line, not just |-|).
+        # 2. Stitch fragmented "(part N)" chunks of the same clause into one.
+        # 3. Rank chunks by relevance to the user's prompt so most-useful go first.
+
+        def _pipe_density(text: str) -> int:
+            """Count consecutive lines with 3+ pipe separators — strong signal of a table."""
+            lines = text.splitlines()
+            run = best = 0
+            for ln in lines:
+                if ln.count("|") >= 3:
+                    run += 1
+                    if run > best: best = run
+                else:
+                    run = 0
+            return best
+
+        def _has_table(text: str) -> bool:
+            return (
+                "|-" in text or "| --- |" in text
+                or _pipe_density(text) >= 3
+                or "TABLE " in text.upper() and "|" in text
+            )
+
+        # Stitch (part N) fragments. Title pattern: "Clause X.Y.Z — Topic (part N)".
+        # Group chunks whose title (sans "(part N)") matches; concatenate their content
+        # in part-number order. Single-part clauses pass through unchanged.
+        import re as _re_stitch
+        _PART_RE = _re_stitch.compile(r"\s*\(part\s+(\d+)\)\s*$", _re_stitch.IGNORECASE)
+        _groups: dict = {}
+        _order: list = []
+        for chunk in results:
+            title = (chunk.get("metadata", {}).get("title") or "").strip()
+            m = _PART_RE.search(title)
+            if m:
+                base_title = _PART_RE.sub("", title).strip()
+                part_num = int(m.group(1))
+            else:
+                base_title = title
+                part_num = 1
+            key = base_title or chunk.get("content", "")[:60]
+            if key not in _groups:
+                _groups[key] = []
+                _order.append(key)
+            _groups[key].append((part_num, chunk))
+
+        stitched_chunks = []
+        for key in _order:
+            parts = sorted(_groups[key], key=lambda pc: pc[0])
+            if len(parts) == 1:
+                stitched_chunks.append(parts[0][1])
+                continue
+            base = dict(parts[0][1])  # shallow copy of first chunk
+            base = {**base, "metadata": dict(base.get("metadata", {}))}
+            base["metadata"]["title"] = key  # drop "(part N)" suffix
+            base["content"] = "\n".join(p[1].get("content", "") for p in parts)
+            # Merge clause_refs across parts
+            refs = []
+            for _, p in parts:
+                for r in p.get("metadata", {}).get("clause_refs", []) or []:
+                    if r not in refs: refs.append(r)
+            base["metadata"]["clause_refs"] = refs
+            stitched_chunks.append(base)
+            self.log(f"[AuthorityQuery] stitched {len(parts)} parts of '{key[:60]}' -> {len(base['content'])} chars")
+
+        # Relevance rank: extract table refs and key terms from the user prompt,
+        # boost chunks whose content/title hits them. Stable sort preserves order
+        # within same score so original retrieval relevance is the tiebreaker.
+        _table_refs = _re_stitch.findall(r'table\s+(\d+\.\d+[a-z]?)', user_prompt.lower())
+        _query_terms = [w for w in _re_stitch.findall(r'\w{4,}', user_prompt.lower())
+                        if w not in {"what", "show", "tell", "give", "from", "this", "that",
+                                     "with", "have", "does", "should", "would", "could",
+                                     "code", "rule", "table"}]
+
+        def _score(chunk):
+            text = (chunk.get("content", "") + " " + (chunk.get("metadata", {}).get("title", ""))).lower()
+            score = 0
+            for ref in _table_refs:
+                if f"table {ref}" in text: score += 10
+                elif ref in text:          score += 4
+            for term in _query_terms:
+                if term in text: score += 1
+            return -score  # negative for ascending sort = highest score first
+
+        ranked_chunks = sorted(stitched_chunks, key=_score)
+
         # Build chunks text for Gemini.
-        # - Chunks containing tables get a higher char cap (8000) so rows aren't cut mid-table.
-        # - Plain prose chunks are capped at 2000 to keep total context lean.
-        # - The TABLE_IN_MARKDOWN marker is stripped since Gemini reads raw markdown natively.
         chunks_text = ""
         sources_seen = []
-        for chunk in results:
+        for chunk in ranked_chunks:
             meta        = chunk.get("metadata", {})
             title       = meta.get("title", "")
             page        = meta.get("page", "")
@@ -1650,18 +1752,22 @@ class Orchestrator:
             source_uri  = chunk.get("source_uri", "")
             raw_content = chunk.get("content", "")
 
-            # Clean up extraction artefacts — Gemini reads plain markdown directly
             clean = raw_content.replace("_START_OF_TABLE_", "").replace("_END_OF_TABLE_", "").replace("TABLE_IN_MARKDOWN:", "").strip()
 
-            # Give table chunks more room so rows aren't truncated
-            has_table = "|-" in clean or "| --- |" in clean or "| Type of Occupancy" in clean
-            cap = 8000 if has_table else 2000
+            # Stitched chunks are usually tables; give them a generous cap.
+            has_table = _has_table(clean)
+            cap = 12000 if has_table else 2000
             content = clean[:cap]
 
             refs_str = f" [refs: {', '.join(clause_refs)}]" if clause_refs else ""
             label    = f"{title} p.{page}" if page else title
             chunks_text += f"\n[{label}{refs_str}]\n{content}\n"
             self.log(f"[AuthorityQuery] chunk: label={label!r} has_table={has_table} len={len(content)} | {content.strip().splitlines()[0][:80]!r}")
+            # Verbose dump: full content of any chunk that scored relevance points,
+            # so we can see exactly what's reaching Gemini for table queries.
+            if _table_refs and any(f"table {ref}" in clean.lower() or ref in clean.lower() for ref in _table_refs):
+                _preview = clean[:1500].replace("\n", "\\n")
+                self.log(f"[AuthorityQuery] >>> RELEVANT CHUNK FULL CONTENT ({label[:50]!r}, {len(clean)} chars):\n{_preview}")
 
             authority = source_uri.split("/")[-2] if "/" in source_uri else title
             if authority and authority not in sources_seen:
@@ -1672,9 +1778,9 @@ class Orchestrator:
         self.log(f"[AuthorityQuery] chunks assembled ({len(chunks_text)} chars), calling Gemini...")
 
         _fmt_map = {
-            "brief":    "Answer in 2-3 sentences maximum. State only the key value or requirement — no tables, no bullet lists, no Key Takeaways section.",
-            "detailed": "Reproduce every relevant table in full — all columns, rows, and conditions. Cite every clause. Use ## headings, full tables, and end with the Key Takeaways section.",
-            "standard": "Give a clear, complete answer. Use tables when the excerpts contain them. Cite clause numbers for key requirements. End with Key Takeaways.",
+            "brief":    "Answer in 2-3 sentences maximum. Lead with the direct answer; cite the supporting clause inline. No headings, no Key Takeaways section.",
+            "detailed": "Give a thorough answer with full reasoning. Walk through the method step by step, show any formula or worked example, then attach a 'Supporting Clauses' section that quotes the relevant clauses/tables verbatim.",
+            "standard": "Give a focused, direct answer to what the user actually asked. Use steps, a formula, or a calculation if that's what fits — not a wall of clauses. Cite supporting clauses inline.",
         }
         _tone_note = "Write in a precise, technical style." if _tone == "technical" else "Write in a clear, accessible style that a non-specialist can follow."
         _answer_preamble = ""
@@ -1684,21 +1790,34 @@ class Orchestrator:
 
         answer_prompt = (
             "You are a Singapore building authority code consultant with expertise across SCDF, URA, LTA, NEA, NPARKS, PUB, and other authorities.\n"
-            "Using ONLY the retrieved excerpts below, answer the user's question.{retry}\n\n"
+            "Your job is to ANSWER the user's question — not to dump excerpts. Read the retrieved clauses, understand what the user is actually trying to do, then give a direct, useful answer.{retry}\n\n"
             "{preamble}"
+            "STEP 1 — UNDERSTAND THE INTENT\n"
+            "Before writing anything, classify what the user is asking for:\n"
+            "  • LOOKUP — \"what is the minimum X?\" → give the number/requirement, then cite the clause.\n"
+            "  • HOW-TO — \"how do I count/calculate/measure X?\" → give the method as steps or a formula derived from the clauses. Do NOT just paste the clause and stop.\n"
+            "  • CHECK — \"is N enough for situation Y?\" → apply the rule to their numbers and state pass/fail with reasoning.\n"
+            "  • EXPLAIN — \"why does the code require X?\" → give the rationale and conditions in plain language.\n"
+            "  • VERBATIM — \"show me Table X\" / \"quote clause Y\" → reproduce the table or clause faithfully.\n"
+            "Match your response shape to the intent. A how-to answered as a list of clauses is a failed answer.\n\n"
+            "STEP 2 — SYNTHESIZE, DON'T LIST\n"
+            "- Lead with the direct answer (the steps, the formula, the number, the verdict).\n"
+            "- If the user asked HOW to do something, derive a procedure from the rules: \"Step 1: measure X between Y and Z. Step 2: subtract any handrail projection. Step 3: compare against the table for your occupant load.\"\n"
+            "- If a calculation is involved, show the formula and a worked example using the user's numbers when given.\n"
+            "- Cite supporting clauses INLINE as evidence (e.g. \"...measured clear of handrails (**Clause 2.2.6**)\"), not as the main content.\n"
+            "- Only reproduce a full table when the user asked for the table itself, or when the answer genuinely depends on multiple rows the user needs to see.\n\n"
             "READING THE EXCERPTS:\n"
-            "- Excerpts may contain partial Markdown tables split across multiple chunks — piece them together.\n"
-            "- A table header row like '| Col A | Col B |' followed by '|-|-|' and then data rows is a complete Markdown table — reproduce it fully.\n"
-            "- If the same table appears across multiple excerpts (e.g. header in one, rows in another), merge them into one coherent table in your answer.\n"
-            "- Ignore section headings like '# Two-way escape arrangement' that are PDF artefacts around the table.\n\n"
-            "FORMATTING RULES (response rendered as Markdown in a chat UI):\n"
-            "1. Use ## headings to group by authority or topic.\n"
-            "2. Use **bold** for key dimensions, measurements, and clause numbers.\n"
-            "3. If excerpts contain table rows (pipe-separated), ALWAYS output a complete Markdown table — never flatten to prose.\n"
-            "4. Use bullet lists for requirements and conditions.\n"
-            "5. Cite clause references for every requirement (e.g. **Clause 2.2.6**).\n"
-            "6. If the excerpts do not contain the answer, say so explicitly — do NOT use outside knowledge.\n"
-            "7. End with a **--- Key Takeaways ---** section with the 2-3 most critical points in bold — UNLESS the response format says 'brief'.\n\n"
+            "- Tables in the excerpts may use pipe separators WITHOUT a `|---|` divider row. Treat any line with 3+ pipes as a table row.\n"
+            "- A single excerpt may contain a table header followed by data rows further down — reconstruct the full Markdown table by adding a `|---|---|...` divider row between the header and the first data row.\n"
+            "- The same table may also span multiple consecutive excerpts (e.g. header in one, rows in another). Merge them into one coherent Markdown table in your answer.\n"
+            "- Cells that look mangled (extra blank cells, wrapped text, missing columns) are PDF→text artefacts. Reconstruct the most plausible row alignment based on column headers.\n"
+            "- Ignore section headings like '# Two-way escape arrangement' that are PDF artefacts around the table.\n"
+            "- If the excerpts genuinely do not contain enough to answer, say so explicitly — do NOT invent rules from outside knowledge.\n\n"
+            "FORMATTING (response rendered as Markdown in a chat UI):\n"
+            "1. Open with the direct answer — no preamble, no \"Based on the excerpts...\".\n"
+            "2. Use numbered steps for procedures, **bold** for key values and clause numbers.\n"
+            "3. Reproduce tables only when the intent is LOOKUP/VERBATIM and the table data is the answer.\n"
+            "4. Footnote markers like `\\(^{{a}}\\)` are PDF artefacts — render as `(a)` or Unicode superscripts. Never emit literal `\\(`, `\\)`, `^`, or curly braces.\n\n"
             "Retrieved Excerpts:\n{}\n\n"
             "User question: {}\n\n"
             "Answer:"
@@ -1890,7 +2009,6 @@ class Orchestrator:
         if intent == "export_option":
             opt_num = str(classified.get("option", ""))
             rev_num = str(classified.get("revision", "")) if classified.get("revision") else None
-            # If no option number given (e.g. "export this to notion"), resolve from current active option
             if not opt_num:
                 mgr._ensure_loaded()
                 current_opt_id = mgr._data.get("current_option_id") if mgr._data else None
@@ -1899,14 +2017,13 @@ class Orchestrator:
                     opt_num = m.group(1) if m else current_opt_id
                     self.log("Dispatcher: Export-option — no option number given, resolved to current option {}".format(opt_num))
                 else:
-                    return "No active option found. Please build something first or specify an option number (e.g. 'export option 1 to Notion').", classified
+                    return "No active option found. Please build something first or specify an option number (e.g. 'export option 1').", classified
             if opt_num:
                 self.log("Dispatcher: Export-option intent — option={}, rev={}".format(opt_num, rev_num))
                 json_result = mgr.export_option_json(opt_num, rev_num)
                 if json_result is None:
                     return "Option '{}' not found. Use 'list options' to see available options.".format(opt_num), classified
-                notion_result = mgr.export_to_notion(opt_num, rev_num)
-                return "Manifest JSON for option {}:\n```json\n{}\n```\n\n{}".format(opt_num, json_result, notion_result), classified
+                return "Manifest JSON for option {}:\n```json\n{}\n```".format(opt_num, json_result), classified
 
         if intent == "move_to_revision":
             src_opt_num = str(classified.get("src_option", "")) or None
@@ -2285,5 +2402,260 @@ class Orchestrator:
 
         self.log("_extract_json: FAILED — no JSON found in response")
         return data.strip()
+
+    def _run_rag_block(self, user_prompt, tracker, build_classified):
+        """Run the entire RAG retrieval pipeline (saved-snap fast path,
+        in-session cache hit, Vertex retrieval + retry validation, persist
+        to disk).  Returns ``(rag_rules, _stored_compliance_snapshot)``.
+
+        Extracted from inline ``_orchestrate`` so it can be invoked either
+        synchronously (single-pass builds) or in a daemon thread concurrent
+        with Pass 1 (two-pass new_build).  Body is the original inline code
+        with ``rag_rules`` / ``_stored_compliance_snapshot`` returned at the
+        end instead of left as outer locals.
+        """
+        import time as _time
+        rag_rules = None
+        _stored_compliance_snapshot = None  # set when we reuse saved compliance
+        _build_intent_name = (build_classified or {}).get("intent")
+        _needs_rag = _build_intent_name in ("build", "new_build", None)  # None = classification failed, be safe
+        try:
+            from revit_mcp.config import RAG_ENABLED
+            self.log(f"[RAG] RAG_ENABLED={RAG_ENABLED}")
+            if RAG_ENABLED:
+                if not _needs_rag:
+                    self.log("[RAG] Skipping — intent is '{}', not a design operation".format(_build_intent_name))
+                else:
+                    # Check if the current option already has saved compliance — skip RAG if so
+                    _saved_rag, _saved_snap = None, None
+                    try:
+                        _mgr_early = get_options_manager()
+                        _mgr_early._ensure_loaded()
+                        _cur_opt = _mgr_early._data.get("current_option_id")
+                        _cur_rev = _mgr_early._data.get("current_revision_id")
+                        if _cur_opt:
+                            _saved_rag, _saved_snap = _mgr_early.get_cached_compliance(_cur_opt, _cur_rev)
+                    except Exception as _ce:
+                        self.log(f"[RAG] Compliance cache lookup failed: {_ce}")
+
+                    # Detect large storey change — compliance must be re-fetched
+                    _large_storey_change = False
+                    if _saved_snap:
+                        import re as _re2
+                        _storey_nums = _re2.findall(r'\b(\d+)\s*stor', user_prompt.lower())
+                        if _storey_nums:
+                            try:
+                                _cur_opt_obj = _mgr_early._find_option(_cur_opt) if _cur_opt else None
+                                _cur_levels = (_cur_opt_obj or {}).get("manifest", {}).get(
+                                    "project_setup", {}).get("levels", 0) if _cur_opt_obj else 0
+                                _req_levels = int(_storey_nums[-1])
+                                if abs(_req_levels - _cur_levels) >= 10:
+                                    _large_storey_change = True
+                                    self.log(f"[RAG] Large storey change detected ({_cur_levels} → {_req_levels}) — invalidating compliance cache")
+                            except Exception:
+                                pass
+
+                    if _saved_snap and not _large_storey_change:
+                        self.log(f"[RAG] Using saved compliance from option {_cur_opt} — skipping RAG")
+                        if tracker: tracker.set_status("Using saved authority codes from previous build...")
+                        rag_rules = _saved_rag
+                        _stored_compliance_snapshot = _saved_snap
+                        if tracker and rag_rules:
+                            from revit_mcp.agents.sub_agent import format_rules_for_display
+                            _table = format_rules_for_display(rag_rules)
+                            if _table:
+                                tracker.report(
+                                    "📋 **Authority codes (reused from previous build option):**\n\n" + _table,
+                                    is_narrative=True,
+                                )
+                            else:
+                                tracker.report("📋 Authority codes reused from previous build option.", is_narrative=True)
+                    else:
+                        from revit_mcp.agents.main_agent import extract_intent, enrich_intent
+                        from revit_mcp.agents.sub_agent import run_retrieve_rules
+                        self.log("[RAG] Extracting building intent (regex)...")
+                        intent = extract_intent(user_prompt)
+                        self.log(f"[RAG] Intent extracted: {intent}")
+                        if tracker: tracker.set_status("Sub-agent: classifying building occupancy and scope...")
+                        intent = enrich_intent(intent, user_prompt, log_fn=lambda m: self.log(f"[RAG] {m}"))
+                        self.log(f"[RAG] Intent enriched: pg={intent.get('purpose_group')} occupancy={intent.get('occupancy_class')} band={intent.get('height_band')} sprinklered={intent.get('sprinklered')} exclude={intent.get('exclude_pg')}")
+                        cache_key = (intent.get("building_type"), intent.get("storeys"))
+                        if cache_key in self._rag_cache:
+                            rag_rules = self._rag_cache[cache_key]
+                            self.log(f"[RAG] Cache hit for {cache_key} — reusing rules")
+                            if tracker: tracker.set_status("Authority codes loaded from cache...")
+                            if tracker and rag_rules:
+                                from revit_mcp.agents.sub_agent import format_rules_for_display
+                                _table = format_rules_for_display(rag_rules)
+                                if _table:
+                                    tracker.report(
+                                        "📋 **Authority codes (cached from earlier this session):**\n\n" + _table,
+                                        is_narrative=True,
+                                    )
+                                else:
+                                    tracker.report("📋 Authority codes loaded from in-session cache.", is_narrative=True)
+                        else:
+                            _btype = intent.get("building_type", "building")
+                            _nstoreys = intent.get("storeys", "?")
+                            _topics = intent.get("topics", [])
+                            if tracker: tracker.set_status(
+                                "Sub-agent: querying authority code library ({}, {} storeys)...".format(_btype, _nstoreys))
+                            self.log(f"[RAG] Building intent: {_btype}, {_nstoreys} storeys, topics: {_topics}")
+                            _t_rag = _time.time()
+                            self.log("[RAG] Calling run_retrieve_rules...")
+                            rag_rules = run_retrieve_rules(
+                                intent,
+                                report=None,
+                                set_status=tracker.set_status if tracker else None,
+                            )
+                            self.log(f"[RAG] run_retrieve_rules returned in {_time.time()-_t_rag:.2f}s — result={rag_rules}")
+
+                            # ── RAG VALIDATION + RETRY ──────────────────────────────────────────
+                            # Keys that MUST be present before passing compliance to Gemini.
+                            # Structured as {topic: [required_keys]} so we know which topics to retry.
+                            _REQUIRED_RAG_KEYS = {
+                                "staircase":        ["min_count", "min_flight_width_mm", "max_travel_distance_mm"],
+                                "occupant_load":    ["occupant_load_factor_m2"],
+                                "exit_width":       ["persons_per_unit_width", "exit_width_per_unit_mm"],
+                                "travel_distance":  ["max_travel_distance_mm"],
+                                "corridor":         ["min_corridor_width_mm"],
+                                "smoke_stop_lobby": ["min_area_mm2", "min_width_mm"],
+                            }
+                            if intent.get("storeys", 1) > 4:
+                                _REQUIRED_RAG_KEYS["fire_lift_lobby"] = ["min_area_mm2", "min_width_mm"]
+
+                            _retrieved_rules = (rag_rules or {}).get("rules", {})
+                            _missing_topics = []
+                            for _topic, _keys in _REQUIRED_RAG_KEYS.items():
+                                _topic_data = _retrieved_rules.get(_topic, {})
+                                for _key in _keys:
+                                    _val = _topic_data.get(_key)
+                                    _has_val = (
+                                        _val is not None
+                                        and (not isinstance(_val, dict) or _val.get("dimension") is not None)
+                                    )
+                                    if not _has_val:
+                                        if _topic not in _missing_topics:
+                                            _missing_topics.append(_topic)
+                                        self.log(f"[RAG] Missing required key: {_topic}.{_key}")
+
+                            if _missing_topics:
+                                self.log(f"[RAG] Retrying {len(_missing_topics)} topic(s) with missing keys: {_missing_topics}")
+                                _retry_intent = dict(intent, topics=_missing_topics)
+                                _t_retry = _time.time()
+                                _retry_rules = run_retrieve_rules(_retry_intent)
+                                self.log(f"[RAG] Retry done in {_time.time()-_t_retry:.2f}s — result={_retry_rules}")
+
+                                # Merge retry results — STRICTLY scoped:
+                                # 1. Only consider topics in _missing_topics (don't introduce new top-level topics).
+                                # 2. Only fill keys that are in _REQUIRED_RAG_KEYS for that topic AND were missing.
+                                # 3. Never overwrite a key that already has a valid value — that protects against
+                                #    the retry returning a less-strict variant (e.g. staircase.min_count flipping 2→1).
+                                if rag_rules is None:
+                                    rag_rules = {"authority": (_retry_rules or {}).get("authority", "SCDF"), "rules": {}}
+                                if _retry_rules and _retry_rules.get("rules"):
+                                    _retry_topics = _retry_rules.get("rules", {})
+                                    _retry_added = []
+                                    _retry_skipped_topics = [t for t in _retry_topics if t not in _missing_topics]
+                                    if _retry_skipped_topics:
+                                        self.log(f"[RAG] Retry returned out-of-scope topics, ignoring: {_retry_skipped_topics}")
+                                    for _rt in _missing_topics:
+                                        _rv = _retry_topics.get(_rt)
+                                        if not _rv:
+                                            continue
+                                        _existing_topic = rag_rules["rules"].setdefault(_rt, {})
+                                        # Only the required keys for this topic — synthesis may surface other
+                                        # keys but they aren't authoritative enough to merge in via retry.
+                                        _required_for_topic = set(_REQUIRED_RAG_KEYS.get(_rt, []))
+                                        for _rk in _required_for_topic:
+                                            _rval = _rv.get(_rk)
+                                            _is_present = (
+                                                _rval is not None
+                                                and (not isinstance(_rval, dict) or _rval.get("dimension") is not None)
+                                            )
+                                            if not _is_present:
+                                                continue
+                                            _existing_val = _existing_topic.get(_rk)
+                                            _existing_present = (
+                                                _existing_val is not None
+                                                and (not isinstance(_existing_val, dict) or _existing_val.get("dimension") is not None)
+                                            )
+                                            if _existing_present:
+                                                # Don't clobber an already-valid value — first synthesis wins.
+                                                continue
+                                            _existing_topic[_rk] = _rval
+                                            _retry_added.append(f"{_rt}.{_rk}")
+                                        # Also merge "source" if missing
+                                        if _rv.get("source") and not _existing_topic.get("source"):
+                                            _existing_topic["source"] = _rv["source"]
+                                    self.log(f"[RAG] Retry merge filled {len(_retry_added)} missing keys: {_retry_added}")
+
+                                # Cross-topic mirroring: Table 2.2A's max travel distance is a building-wide
+                                # value retrieved under the travel_distance topic but the build pipeline also
+                                # expects it under staircase.max_travel_distance_mm. Mirror it across when the
+                                # source-of-truth topic has a value and the destination doesn't.
+                                _post_rules = (rag_rules or {}).get("rules", {})
+                                _MIRROR_RULES = [
+                                    ("travel_distance", "max_travel_distance_mm",            "staircase", "max_travel_distance_mm"),
+                                    ("travel_distance", "max_travel_distance_sprinklered_mm", "staircase", "max_travel_distance_sprinklered_mm"),
+                                ]
+                                for _src_t, _src_k, _dst_t, _dst_k in _MIRROR_RULES:
+                                    _src_val = _post_rules.get(_src_t, {}).get(_src_k)
+                                    _src_present = (
+                                        _src_val is not None
+                                        and (not isinstance(_src_val, dict) or _src_val.get("dimension") is not None)
+                                    )
+                                    if not _src_present:
+                                        continue
+                                    _dst_topic = _post_rules.setdefault(_dst_t, {})
+                                    _dst_val = _dst_topic.get(_dst_k)
+                                    _dst_present = (
+                                        _dst_val is not None
+                                        and (not isinstance(_dst_val, dict) or _dst_val.get("dimension") is not None)
+                                    )
+                                    if not _dst_present:
+                                        _dst_topic[_dst_k] = _src_val
+                                        self.log(f"[RAG] Mirrored {_src_t}.{_src_k} -> {_dst_t}.{_dst_k}")
+
+                                # Log final state of required keys after retry
+                                _final_rules = (rag_rules or {}).get("rules", {})
+                                _still_missing = []
+                                for _topic, _keys in _REQUIRED_RAG_KEYS.items():
+                                    _topic_data = _final_rules.get(_topic, {})
+                                    for _key in _keys:
+                                        _val = _topic_data.get(_key)
+                                        _has_val = (
+                                            _val is not None
+                                            and (not isinstance(_val, dict) or _val.get("dimension") is not None)
+                                        )
+                                        if not _has_val:
+                                            _still_missing.append(f"{_topic}.{_key}")
+                                if _still_missing:
+                                    self.log(f"[RAG] After retry, still missing: {_still_missing} — Gemini will use static fallback for these")
+                                else:
+                                    self.log("[RAG] All required keys present after retry ✓")
+                            # ── END RAG VALIDATION + RETRY ─────────────────────────────────────
+
+                            if rag_rules:
+                                topics_found = list(rag_rules.get("rules", {}).keys())
+                                self.log(f"[RAG] Rules retrieved for topics: {topics_found}")
+                                self._rag_cache[cache_key] = rag_rules
+                                self.log(f"[RAG] Cached rules under key {cache_key}")
+                                # Persist to disk so the cache survives Revit
+                                # restarts.  Best-effort — failure here doesn't
+                                # break the build (in-memory cache still works).
+                                self._save_rag_cache_to_disk()
+                                if tracker:
+                                    from revit_mcp.agents.sub_agent import format_rules_for_display
+                                    _table = format_rules_for_display(rag_rules)
+                                    if _table:
+                                        tracker.report("✅ **Authority codes resolved:**\n\n" + _table, is_narrative=True)
+                                    else:
+                                        tracker.report("✅ Authority codes resolved.", is_narrative=True)
+        except Exception as _rag_err:
+            self.log(f"[RAG] FAILED — {type(_rag_err).__name__}: {_rag_err}")
+            rag_rules = None
+        return rag_rules, _stored_compliance_snapshot
+
 
 orchestrator = Orchestrator()

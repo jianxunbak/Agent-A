@@ -157,7 +157,7 @@ class GeminiClient:
             "- delete_revision: user wants to delete a specific revision of an option\n"
             "- delete_all_options: user wants to delete all saved design options/memory (NOT model elements)\n"
             "- recreate_option: user wants to rebuild/regenerate a saved option\n"
-            "- export_option: user wants to export an option to JSON or Notion\n"
+            "- export_option: user wants to export an option's manifest as JSON\n"
             "- move_to_revision: user wants to move an option under another option as a revision\n"
             "- new_build: user wants to create/generate a new building\n"
             "- delete_elements: user wants to delete Revit model elements (walls, floors, columns, etc.) OR clear the entire model/building\n"

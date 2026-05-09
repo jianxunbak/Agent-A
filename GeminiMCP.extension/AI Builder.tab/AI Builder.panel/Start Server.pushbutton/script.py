@@ -147,75 +147,146 @@ def _make_tb(text, fg=None, size=None, bold=False, italic=False, wrap=True, font
     return tb
 
 
+def _table_log(stage, info=""):
+    """Bulletproof file-based logger for table-render debugging."""
+    try:
+        import os as _os
+        from revit_mcp.utils import get_appdata_path
+        _path = _os.path.join(get_appdata_path("logs"), "table_render_debug.log")
+        with open(_path, "a") as _f:
+            _f.write("[{0}] {1}\n".format(stage, info))
+    except Exception:
+        pass
+
+
 def _is_table_line(line):
     return '|' in line
 
 
 def _parse_table(lines):
+    _table_log("PARSE_ENTER", "lines_in={0}".format(len(lines)))
     rows = []
-    for ln in lines:
+    for idx, ln in enumerate(lines):
         ln = ln.strip()
         if not ln or _re.match(r'^\|[-| :]+\|$', ln):
+            _table_log("PARSE_SKIP", "idx={0} reason={1!r}".format(idx, "separator-or-empty"))
             continue
         cells = [c.strip() for c in ln.strip('|').split('|')]
+        _table_log("PARSE_ROW", "idx={0} cells={1} preview={2!r}".format(idx, len(cells), ln[:120]))
         rows.append(cells)
+    _table_log("PARSE_EXIT", "rows={0}".format(len(rows)))
     return rows
 
 
 def _build_table_grid(rows):
+    _table_log("BUILD_ENTER", "rows={0}".format(len(rows) if rows else 0))
     if not rows:
+        _table_log("BUILD_EXIT", "no rows -> None")
         return None
 
-    col_count = max(len(r) for r in rows)
-    grid = Grid()
-    grid.Margin = Thickness(0, 4, 0, 4)
+    try:
+        col_count = max(len(r) for r in rows)
+        _table_log("BUILD_COLS", "col_count={0} row_widths={1}".format(col_count, [len(r) for r in rows[:5]]))
 
-    for _ in range(col_count):
-        cd = ColumnDefinition()
-        cd.Width = GridLength(1, GridUnitType.Star)
-        grid.ColumnDefinitions.Add(cd)
-
-    for ri, row in enumerate(rows):
-        rd = RowDefinition()
-        rd.Height = GridLength.Auto
-        grid.RowDefinitions.Add(rd)
-
-        is_header = (ri == 0)
-        is_active = not is_header and any(_MARKER_START in cell for cell in row)
-        if is_header:
-            bg = _COL_TH_BG
-        elif is_active:
-            bg = _COL_TR_ACTIVE
-        else:
-            bg = _COL_TR_ALT if ri % 2 == 0 else _COL_TR_NORM
-
+        # Pick a per-column natural width based on the longest cell content,
+        # clamped to a readable range. Columns size to their own content
+        # instead of being squashed by the parent width.
+        col_widths = []
         for ci in range(col_count):
-            cell_text = row[ci] if ci < len(row) else ""
-            cell_text = cell_text.replace(_MARKER_START, "").replace(_MARKER_END, "")
-            cell_border = Border()
-            cell_border.Background = bg
-            cell_border.BorderBrush = _COL_BORDER
-            cell_border.BorderThickness = Thickness(0.5)
-            cell_border.Padding = Thickness(6, 4, 6, 4)
+            longest = 0
+            for row in rows:
+                if ci < len(row):
+                    cell = row[ci].replace(_MARKER_START, "").replace(_MARKER_END, "")
+                    if len(cell) > longest:
+                        longest = len(cell)
+            # ~7px per char + padding, clamped to [70, 220]
+            px = max(70, min(220, 14 + longest * 7))
+            col_widths.append(px)
 
-            tb = _make_tb(cell_text, bold=is_header, wrap=True)
+        grid = Grid()
+        grid.Margin = Thickness(0, 4, 0, 4)
+        grid.HorizontalAlignment = HorizontalAlignment.Left
+
+        for w in col_widths:
+            cd = ColumnDefinition()
+            cd.Width = GridLength(w)
+            grid.ColumnDefinitions.Add(cd)
+        _table_log("BUILD_COLDEFS_OK", "widths={0}".format(col_widths))
+
+        for ri, row in enumerate(rows):
+            rd = RowDefinition()
+            rd.Height = GridLength.Auto
+            grid.RowDefinitions.Add(rd)
+
+            is_header = (ri == 0)
+            is_active = not is_header and any(_MARKER_START in cell for cell in row)
             if is_header:
-                tb.Foreground = _color(220, 240, 255)
+                bg = _COL_TH_BG
             elif is_active:
-                tb.Foreground = _GREEN_BRUSH
-            cell_border.Child = tb
+                bg = _COL_TR_ACTIVE
+            else:
+                bg = _COL_TR_ALT if ri % 2 == 0 else _COL_TR_NORM
 
-            Grid.SetRow(cell_border, ri)
-            Grid.SetColumn(cell_border, ci)
-            grid.Children.Add(cell_border)
+            for ci in range(col_count):
+                cell_text = row[ci] if ci < len(row) else ""
+                cell_text = cell_text.replace(_MARKER_START, "").replace(_MARKER_END, "")
+                cell_border = Border()
+                cell_border.Background = bg
+                cell_border.BorderBrush = _COL_BORDER
+                cell_border.BorderThickness = Thickness(0.5)
+                cell_border.Padding = Thickness(6, 4, 6, 4)
 
-    return grid
+                # wrap=True keeps long cells from forcing the column wider —
+                # the cell wraps within its fixed column width instead.
+                tb = _make_tb(cell_text, bold=is_header, wrap=True)
+                if is_header:
+                    tb.Foreground = _color(220, 240, 255)
+                elif is_active:
+                    tb.Foreground = _GREEN_BRUSH
+                cell_border.Child = tb
+
+                Grid.SetRow(cell_border, ri)
+                Grid.SetColumn(cell_border, ci)
+                grid.Children.Add(cell_border)
+            _table_log("BUILD_ROW_OK", "ri={0}".format(ri))
+
+        # Horizontal scroller so wide tables don't get clipped — user can
+        # drag the scrollbar to read the right-hand columns.
+        scroller = ScrollViewer()
+        scroller.HorizontalScrollBarVisibility = ScrollBarVisibility.Auto
+        scroller.VerticalScrollBarVisibility = ScrollBarVisibility.Disabled
+        scroller.Margin = Thickness(0, 4, 0, 4)
+        scroller.Content = grid
+
+        _table_log("BUILD_EXIT", "grid built OK, children={0}".format(grid.Children.Count))
+        return scroller
+    except Exception as _be:
+        import traceback as _tb
+        _table_log("BUILD_EXCEPTION", "{0}\n{1}".format(_be, _tb.format_exc()))
+        raise
 
 
 def _build_wpf_markdown(text):
     """Convert markdown text to a WPF StackPanel with styled elements."""
     panel = StackPanel()
     panel.Orientation = System.Windows.Controls.Orientation.Vertical
+
+    # Gemini sometimes wraps the entire response in a ```markdown ... ``` fence.
+    # That makes the code-block branch eat the whole document and the actual
+    # markdown (including tables) renders as monospace text. Strip the outer
+    # fence so the document below can be parsed normally.
+    _stripped = text.strip()
+    if _stripped.startswith('```'):
+        _first_nl = _stripped.find('\n')
+        if _first_nl != -1:
+            _opener = _stripped[3:_first_nl].strip().lower()
+            # Only strip if it's an explicit markdown fence (or bare ``` with
+            # markdown-looking content). Don't touch code blocks like ```python.
+            _body = _stripped[_first_nl + 1:]
+            if _body.endswith('```'):
+                _body = _body[:-3].rstrip()
+            if _opener in ('', 'markdown', 'md'):
+                text = _body
 
     lines = text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
 
@@ -258,10 +329,22 @@ def _build_wpf_markdown(text):
             while i < len(lines) and _is_table_line(lines[i]):
                 table_lines.append(lines[i])
                 i += 1
-            rows = _parse_table(table_lines)
-            grid = _build_table_grid(rows)
-            if grid:
-                panel.Children.Add(grid)
+            _table_log("BRANCH_TABLE", "collected={0}".format(len(table_lines)))
+            try:
+                rows = _parse_table(table_lines)
+                grid = _build_table_grid(rows)
+                if grid:
+                    panel.Children.Add(grid)
+                    _table_log("BRANCH_ADDED", "ok")
+                else:
+                    for tl in table_lines:
+                        panel.Children.Add(_make_tb(tl))
+                    _table_log("BRANCH_FALLBACK_NONE", "grid was None")
+            except Exception as _e:
+                import traceback as _tb
+                _table_log("BRANCH_EXCEPTION", "{0}\n{1}".format(_e, _tb.format_exc()))
+                for tl in table_lines:
+                    panel.Children.Add(_make_tb(tl))
             continue
 
         # ── Code block (``` fenced) ──
@@ -296,19 +379,38 @@ def _build_wpf_markdown(text):
             indent = len(bullet_m.group(1))
             marker = bullet_m.group(2)
             content = bullet_m.group(3)
-            item_panel = StackPanel()
-            item_panel.Orientation = System.Windows.Controls.Orientation.Horizontal
-            item_panel.Margin = Thickness(indent * 8, 1, 0, 1)
+
+            # Use a Grid with Auto+* columns instead of a horizontal
+            # StackPanel — StackPanels give children infinite width, so the
+            # text TextBlock never wraps and runs off the right edge of the
+            # chat window. The * column constrains the text to the available
+            # width and TextWrapping.Wrap kicks in.
+            item_grid = Grid()
+            item_grid.Margin = Thickness(indent * 8, 1, 0, 1)
+            item_grid.HorizontalAlignment = HorizontalAlignment.Stretch
+
+            cd_marker = ColumnDefinition()
+            cd_marker.Width = GridLength.Auto
+            item_grid.ColumnDefinitions.Add(cd_marker)
+            cd_text = ColumnDefinition()
+            cd_text.Width = GridLength(1, GridUnitType.Star)
+            item_grid.ColumnDefinitions.Add(cd_text)
+
             dot = TextBlock()
             dot.Text = u'▸ ' if not _re.match(r'\d', marker) else marker + ' '
             dot.Foreground = _color(100, 180, 255)
             dot.FontWeight = FontWeights.Bold
             dot.Margin = Thickness(0, 0, 4, 0)
             dot.VerticalAlignment = VerticalAlignment.Top
-            item_panel.Children.Add(dot)
+            Grid.SetColumn(dot, 0)
+            item_grid.Children.Add(dot)
+
             tb = _make_tb(content)
-            item_panel.Children.Add(tb)
-            panel.Children.Add(item_panel)
+            tb.TextWrapping = TextWrapping.Wrap
+            Grid.SetColumn(tb, 1)
+            item_grid.Children.Add(tb)
+
+            panel.Children.Add(item_grid)
             i += 1; continue
 
         # ── Blockquote ──
@@ -395,6 +497,7 @@ class AIChatWindow(object):
             self.MenuButton.Click += self.on_menu_click
             # ContextMenu is not in the visual tree; wire by index
             self.MenuButton.ContextMenu.Items[0].Click += self.on_clear_chat
+            self.MenuButton.ContextMenu.Items[1].Click += self.on_clear_rag_cache
 
     # ── Spinner bubble helpers ────────────────────────────────────────────────
 
@@ -485,8 +588,11 @@ class AIChatWindow(object):
             new_border.Margin = Thickness(40, 5, 0, 5)
             new_border.MaxWidth = 420
         else:
+            # Stretch to the chat column width so paragraph wrapping kicks in
+            # at the actual window size — otherwise long lines push the bubble
+            # past the right edge of the ChatScroller and get cropped.
             new_border.Background = SolidColorBrush(Color.FromRgb(38, 38, 52))
-            new_border.HorizontalAlignment = HorizontalAlignment.Left
+            new_border.HorizontalAlignment = HorizontalAlignment.Stretch
             new_border.Margin = Thickness(0, 5, 10, 5)
 
         if is_user:
@@ -534,6 +640,82 @@ class AIChatWindow(object):
             self.ChatHistory.Children.Clear()
         self.history = []
         self.add_message("Hello! I am your Gemini-powered Revit assistant. The MCP server is running and I'm ready to help.", is_user=False)
+
+    def on_clear_rag_cache(self, sender, e):
+        """Clear all caches that influence RAG / authority-code retrieval so the
+        next build re-queries Vertex AI from scratch. Useful for demoing live RAG."""
+        import os
+        report_lines = []
+
+        # 1. Disk chunk cache: %AppData%\Roaming\RevitMCP\cache\chunk_cache.json
+        try:
+            from revit_mcp.utils import get_appdata_path
+            chunk_path = os.path.join(get_appdata_path("cache"), "chunk_cache.json")
+            if os.path.isfile(chunk_path):
+                os.remove(chunk_path)
+                report_lines.append("- Deleted disk chunk cache (`chunk_cache.json`)")
+            else:
+                report_lines.append("- Disk chunk cache was already empty")
+        except Exception as ex:
+            report_lines.append("- Disk chunk cache: failed to delete ({})".format(ex))
+
+        # 2. In-memory chunk cache held inside sub_agent module
+        try:
+            from revit_mcp.agents import sub_agent
+            sub_agent._chunk_cache = {}
+            report_lines.append("- Cleared in-memory chunk cache")
+        except Exception as ex:
+            report_lines.append("- In-memory chunk cache: failed to clear ({})".format(ex))
+
+        # 3. In-memory rag_rules cache on the orchestrator singleton
+        try:
+            from revit_mcp.dispatcher import orchestrator
+            orchestrator._rag_cache = {}
+            report_lines.append("- Cleared orchestrator RAG cache")
+        except Exception as ex:
+            report_lines.append("- Orchestrator RAG cache: failed to clear ({})".format(ex))
+
+        # 3b. Disk RAG rules cache: %AppData%\Roaming\RevitMCP\cache\rag_rules_cache.json
+        # (synthesised rules that survive Revit restarts so a "30-storey office"
+        # rebuild after a restart doesn't re-pay the ~50s RAG cost)
+        try:
+            from revit_mcp.utils import get_appdata_path
+            rules_path = os.path.join(get_appdata_path("cache"), "rag_rules_cache.json")
+            if os.path.isfile(rules_path):
+                os.remove(rules_path)
+                report_lines.append("- Deleted disk RAG rules cache (`rag_rules_cache.json`)")
+            else:
+                report_lines.append("- Disk RAG rules cache was already empty")
+        except Exception as ex:
+            report_lines.append("- Disk RAG rules cache: failed to delete ({})".format(ex))
+
+        # 4. Per-option compliance snapshots in build_options.json — these take
+        # priority over the caches above (dispatcher.py:205) and would otherwise
+        # cause the next build to replay the previous run's RAG verbatim.
+        try:
+            from revit_mcp.build_memory import get_options_manager
+            mgr = get_options_manager()
+            mgr._ensure_loaded()
+            stripped = 0
+            for opt in mgr._data.get("options", []):
+                if opt.get("rag_rules") or opt.get("compliance_snapshot"):
+                    stripped += 1
+                opt["rag_rules"] = None
+                opt["compliance_snapshot"] = ""
+                for rev in opt.get("revisions", []) or []:
+                    if rev.get("rag_rules") or rev.get("compliance_snapshot"):
+                        stripped += 1
+                    rev["rag_rules"] = None
+                    rev["compliance_snapshot"] = ""
+            mgr._save()
+            report_lines.append(
+                "- Stripped saved compliance from `build_options.json` ({} entries cleared)".format(stripped))
+        except Exception as ex:
+            report_lines.append("- Saved compliance in build_options.json: failed to clear ({})".format(ex))
+
+        msg = "RAG cache cleared. The next build will fetch fresh data from Vertex AI.\n\n" + "\n".join(report_lines)
+        self.add_message(msg, is_user=False)
+        client.log("UI: RAG cache cleared via menu — " + " | ".join(report_lines))
 
     def on_send_click(self, sender, e):
         """Handle the send button click."""
@@ -668,7 +850,7 @@ class AIChatWindow(object):
         new_border.Background = SolidColorBrush(Color.FromRgb(38, 38, 52))
         new_border.CornerRadius = CornerRadius(8)
         new_border.Padding = Thickness(12)
-        new_border.HorizontalAlignment = HorizontalAlignment.Left
+        new_border.HorizontalAlignment = HorizontalAlignment.Stretch
         new_border.Margin = Thickness(0, 5, 10, 5)
         new_border.Child = _build_wpf_markdown(text)
 

@@ -3,10 +3,8 @@ import unittest
 import sys
 import os
 
-# Ensure package is discoverable
-sys.path.append(os.path.dirname(__file__))
-from .fire_safety_logic import generate_fire_safety_manifest, calculate_fire_safety_requirements
-from .staircase_logic import get_stair_run_data
+from revit_mcp.fire_safety_logic import generate_fire_safety_manifest, calculate_fire_safety_requirements
+from revit_mcp.staircase_logic import get_stair_run_data
 
 class TestCoreIntegration(unittest.TestCase):
     def test_full_core_generation_pipeline(self):

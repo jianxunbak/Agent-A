@@ -8,18 +8,18 @@ from revit_mcp.gemini_client import client
 from revit_mcp.rag.vertex_rag import query_vertex_rag
 from revit_mcp.rag.query_builder import build_queries
 
-# Maps each RAG topic to the GCS folder path of the authoritative source document.
-# Use the folder name (e.g. "knowledge_base/SCDF") so any new PDF added under
-# that folder is automatically included — no document-ID maintenance needed.
+# Maps each RAG topic to the authority tag stored in structData.source of the
+# structured datastore (e.g. "SCDF"). Matches the same convention used by the
+# authority-query path in dispatcher._answer_authority_query.
 _TOPIC_SOURCE: dict[str, str] = {
-    "staircase":        "knowledge_base/SCDF",
-    "fire_lift":        "knowledge_base/SCDF",
-    "fire_lift_lobby":  "knowledge_base/SCDF",
-    "smoke_stop_lobby": "knowledge_base/SCDF",
-    "occupant_load":    "knowledge_base/SCDF",
-    "exit_width":       "knowledge_base/SCDF",
-    "travel_distance":  "knowledge_base/SCDF",
-    "corridor":         "knowledge_base/SCDF",
+    "staircase":        "SCDF",
+    "fire_lift":        "SCDF",
+    "fire_lift_lobby":  "SCDF",
+    "smoke_stop_lobby": "SCDF",
+    "occupant_load":    "SCDF",
+    "exit_width":       "SCDF",
+    "travel_distance":  "SCDF",
+    "corridor":         "SCDF",
 }
 
 # ── Chunk cache ────────────────────────────────────────────────────────────────
@@ -89,7 +89,19 @@ def _merge_and_cache_chunks(authority: str, topic: str, new_chunks: list) -> lis
 
 
 SUB_AGENT_PROMPT = """
-You are an SCDF fire code specialist. Extract ALL spatial requirements from the RETRIEVED EXCERPTS ONLY.
+You are an SCDF fire code specialist. Extract spatial requirements from the RETRIEVED EXCERPTS ONLY, scoped to the building described in OCCUPANCY SCOPE.
+
+OCCUPANCY SCOPE (THIS IS THE ONLY BUILDING YOU ARE EXTRACTING RULES FOR):
+- Purpose Group: {purpose_group}
+- Occupancy class: {occupancy_class}
+- Height band: {height_band} ({storeys} storeys)
+- Sprinklered: {sprinklered}
+- Mixed-use: {mixed_use}
+- Scope summary: {scope_summary}
+- EXCLUDE rules that apply ONLY to these Purpose Groups: {exclude_pg}
+
+OUTPUT TOPICS (you MUST output exactly these topic keys, no more, no fewer):
+{topics_csv}
 
 STRICT RULES:
 1. Use ONLY the text in the excerpts below. Do NOT use outside knowledge.
@@ -99,8 +111,19 @@ STRICT RULES:
 5. Each dimension value MUST be an object: {{"dimension": <number>, "clause": "<ref or null>"}}.
 6. Booleans also use the same format: {{"dimension": true, "clause": "<ref>"}}.
 7. Each topic must have a "source" key naming the document and version (e.g. "SCDF Fire Code 2023").
-8. Include ALL requirements found — do not limit to a fixed list of keys.
-9. Return ONLY a raw JSON object. No markdown, no explanation.
+8. SCOPE FILTER: OMIT a rule ONLY when the excerpt CLEARLY restricts it to a Purpose Group listed in EXCLUDE, AND no other clause restates the rule in a generally-applicable way. Examples for an office (PG V) build:
+   - Clause 9.2.1a explicitly says "for residential apartments or maisonettes" — OMIT.
+   - Clause 9.4.1a "office floor in a PG II residential building" — OMIT (it's about ancillary office in a residential block, not a standalone PG V office).
+   - "PG II super-high-rise residential >40 storeys" — OMIT for PG V.
+   - Hotel-only (PG VII) clauses — OMIT for PG V.
+   IMPORTANT — do NOT over-omit. Many SCDF rules are general (apply to all PGs) and will appear in chunks without naming a specific PG; you MUST extract those even if surrounding chunks talk about other PGs. When a rule is general (e.g. "all exit staircases shall be at least 1000mm wide", "minimum corridor width per Table 2.2A occupancy row"), extract it. The default is INCLUDE; only OMIT when you can point to explicit PG-restriction language in the excerpt.
+9. PICK THE RIGHT VALUE FOR THIS BUILDING. Many tables have multiple columns/rows for the same parameter (sprinklered vs non-sprinklered, exit-to-outdoors vs staircase, different occupancy classes). You MUST pick the value that matches THIS building's OCCUPANCY SCOPE:
+   - Sprinklered = {sprinklered}. When a table has sprinklered/non-sprinklered columns, pick the column matching this flag. If you output BOTH (because the build pipeline expects both — e.g. travel_distance), label them clearly.
+   - Occupancy row = "{occupancy_class}". Use the row that matches this occupancy. Do NOT pick "building-to-building", "without commercial activities", or any unrelated row.
+   - For staircase/exit-passageway capacity (persons_per_unit_width): use the STAIRCASES column, NOT the door-to-outdoors-at-ground-level column. The capacity calculation governs upper-storey egress through staircases, not ground-floor doors.
+10. CONSOLIDATE context-variants into a SINGLE key. After applying the SCOPE FILTER, if the same dimension still appears under multiple conditions (e.g. different height thresholds), output ONE key using the value applicable to THIS building, and note the qualifying condition inside the clause field, e.g. {{"dimension": 2, "clause": "6.6.4b.(1) (habitable height > 24m, applies)"}}. Do NOT create suffix-variant keys like "min_count_super_high_rise_residential_gt_40_storeys".
+11. STAY IN TOPIC SCOPE. Do NOT introduce new top-level topics that are not in OUTPUT TOPICS above. If you find a relevant rule that doesn't fit any listed topic, omit it.
+12. Return ONLY a raw JSON object. No markdown, no explanation.
 
 UNIT RULES (strictly enforced):
 - Lengths, widths, heights, depths: always mm. Convert m → mm by multiplying by 1000.
@@ -110,11 +133,11 @@ UNIT RULES (strictly enforced):
 SCDF TABLE 2.2A COLUMN ORDER (left to right, 12 data columns after the occupancy name):
 Col 1: One-way travel non-spr (m)
 Col 2: One-way travel spr (m)
-Col 3: Two-way travel non-spr (m)   ← "max_travel_distance_mm" = this value × 1000
-Col 4: Two-way travel spr (m)        ← "max_travel_distance_sprinklered_mm" = this value × 1000
+Col 3: Two-way travel non-spr (m)
+Col 4: Two-way travel spr (m)
 Col 5: Persons/unit — door opening exiting to OUTDOORS at ground level, non-spr
 Col 6: Persons/unit — door opening exiting to OUTDOORS at ground level, spr
-Col 7: Persons/unit — STAIRCASES and exit passageways, non-spr  ← "persons_per_unit_width" = this value
+Col 7: Persons/unit — STAIRCASES and exit passageways, non-spr
 Col 8: Persons/unit — STAIRCASES and exit passageways, spr
 Col 9: Persons/unit — Ramps, corridors, other exits
 Col 10: Min width (m)
@@ -122,17 +145,22 @@ Col 11: Max dead end non-spr (m)
 Col 12: Max dead end spr (m)
 
 Example row from the table: "| Offices | 15 | 30 | 45 | 75 | 100 | 80 | 60 | 100 | 1 | 1.2 | 15 | 20 |"
-→ max_travel_distance_mm = 45 × 1000 = 45000
-→ max_travel_distance_sprinklered_mm = 75 × 1000 = 75000
-→ persons_per_unit_width (staircase, non-spr) = Col 7 = 60  (NOT Col 5=100 which is door-to-outdoors)
 
-- "exit_width_per_unit_mm": per Cl.2.2.5a one unit of width = 500mm. Always output 500.
-- Match the occupancy row using the building type in Building Intent (e.g. "commercial office" → "Offices" row).
+DECISION TREE — for THIS building (sprinklered={sprinklered}, occupancy="{occupancy_class}"), use this row to pick column values:
+- max_travel_distance_mm           → if sprinklered=True use Col 4 × 1000, else use Col 3 × 1000.
+                                     Also output the OTHER variant under max_travel_distance_sprinklered_mm so both keys are populated.
+                                     For the Offices row: Col 3=45, Col 4=75 → if sprinklered: max_travel_distance_mm=75000 AND max_travel_distance_sprinklered_mm=75000 with clause noting "Two-way travel sprinklered (applies to this building)".
+                                     If not sprinklered: max_travel_distance_mm=45000, max_travel_distance_sprinklered_mm=75000 (both reported).
+- persons_per_unit_width           → use STAIRCASES column matching sprinkler flag. If sprinklered=True use Col 8, else Col 7. NEVER use Col 5/6 (those are door-to-outdoors at ground level — wrong for upper-storey staircase egress).
+                                     For the Offices row sprinklered: Col 8=100. Non-sprinklered: Col 7=60.
+- exit_width_per_unit_mm           → per Cl.2.2.5a one unit of width = 500mm. Always output 500.
+- min_corridor_width_mm (corridor topic) → use Col 10 (Min width) × 1000. For Offices row: 1.2m × 1000 = 1200mm.
+- min_flight_width_mm (staircase)  → also Col 10 (Min width) × 1000 — the table's minimum exit width applies to staircases too unless a stricter clause overrides.
 
-For occupant_load: occupant_load_factor_m2 is m2 per person from the occupancy load table (NOT from Table 2.2A).
-
-Building Intent:
-{intent_json}
+For occupant_load:
+- occupant_load_factor_m2 is m2 per person from the SCDF Occupancy Load table (typically Table 2.2C or in Clause 1.4 definitions, NOT Table 2.2A).
+- Match the row labelled for THIS occupancy: "{occupancy_class}". For an office, look for "Offices", "Office area", or "Business centre/office (general)" rows — these typically give 9–10 m2/person.
+- IGNORE rows labelled "building-to-building", "without commercial activities", or any clearly different occupancy. If the only office-row value you can find is in the chunks, use it. If no office-applicable value is in the chunks at all, omit the key.
 
 Retrieved Excerpts (with pre-extracted clause refs):
 {chunks_text}
@@ -211,13 +239,18 @@ async def _fetch_topic(topic: str, intent: dict) -> dict:
     # ── Cache miss: query Vertex and update cache ──────────────────────────────
     _log(f"_fetch_topic CACHE MISS: {authority}/{topic} — querying Vertex AI")
     queries = build_queries(topic, intent)
-    _log(f"_fetch_topic {len(queries)} sub-queries for {topic} | source_filter={source}")
+    # Topic-specific top_k overrides — bumped for topics where the right table
+    # row can be split across multiple chunks (Table 1.4B Office row was missed
+    # at top_k=2 because the chunk containing "Pedestrian linkways/MRT" came
+    # back instead).
+    _topic_top_k = {"occupant_load": 5, "exit_width": 4}.get(topic, 2)
+    _log(f"_fetch_topic {len(queries)} sub-queries for {topic} | source_filter={source} | top_k={_topic_top_k}")
     loop = asyncio.get_running_loop()
 
     async def _run_one(q):
         try:
             return await loop.run_in_executor(
-                None, lambda: query_vertex_rag(query=q, top_k=2, source_filter=source)
+                None, lambda: query_vertex_rag(query=q, top_k=_topic_top_k, source_filter=source)
             )
         except Exception as e:
             _log(f"_fetch_topic sub-query ERROR ({q[:60]}): {e}")
@@ -291,8 +324,20 @@ async def retrieve_rules(intent: dict, report=None, set_status=None) -> dict:
     _log(f"=== RAW CHUNKS SENT TO SYNTHESIS ({len(chunks_text)} chars) ===\n{chunks_text}\n=== END CHUNKS ===")
     _log(f"retrieve_rules: chunks assembled ({len(chunks_text)} chars), calling Gemini for synthesis...")
 
+    # Pull scope fields from intent — fall back to permissive defaults if enrichment was skipped
+    _topics = intent.get("topics", []) or list(raw_results and [r["topic"] for r in raw_results])
+    _exclude_pg = intent.get("exclude_pg") or []
+    _exclude_str = ", ".join(_exclude_pg) if _exclude_pg else "(none specified — apply your judgement based on Purpose Group)"
     prompt = SUB_AGENT_PROMPT.format(
-        intent_json=json.dumps(intent, indent=2),
+        purpose_group=intent.get("purpose_group", "unspecified"),
+        occupancy_class=intent.get("occupancy_class", intent.get("building_type", "building")),
+        height_band=intent.get("height_band", "unspecified"),
+        storeys=intent.get("storeys", "?"),
+        sprinklered=intent.get("sprinklered", True),
+        mixed_use=intent.get("mixed_use", False),
+        scope_summary=intent.get("scope_summary", "{} building".format(intent.get("building_type", ""))),
+        exclude_pg=_exclude_str,
+        topics_csv=", ".join(_topics) if _topics else "(none — output the topics implied by the chunks)",
         chunks_text=chunks_text,
     )
 
@@ -329,6 +374,20 @@ async def retrieve_rules(intent: dict, report=None, set_status=None) -> dict:
                         corrected = int(dim * 1_000_000)
                         _log(f"[AreaFix] {k}={dim} looks like m2 — converting to {corrected} mm2")
                         v["dimension"] = corrected
+
+        # Soft sanity check: occupant_load_factor for office buildings should be ~10 m²/p.
+        # Anything below 3 strongly suggests Vertex returned the wrong table row
+        # (e.g. "building without commercial activities" = 5 m²/p, or "assembly" rows
+        # that are 1-2 m²/p). Log a warning so it's visible in fastmcp_server.log.
+        _occ_topic = rules.get("rules", {}).get("occupant_load", {})
+        _occ_factor = _occ_topic.get("occupant_load_factor_m2")
+        if isinstance(_occ_factor, dict):
+            _occ_factor = _occ_factor.get("dimension")
+        _occ_class = (intent.get("occupancy_class") or "").lower()
+        if isinstance(_occ_factor, (int, float)) and _occ_factor < 3 and "office" in _occ_class:
+            _log(f"[RAG] WARNING: occupant_load_factor_m2={_occ_factor} for {_occ_class} "
+                 f"looks suspicious (offices typically ~10 m²/p) — Vertex may have "
+                 f"returned the wrong table row. Continuing with this value.")
 
         _log(f"retrieve_rules: JSON parsed OK — topics={list(rules.get('rules', {}).keys())} total={time.time()-t0:.2f}s")
         _log(f"=== SUB-AGENT OUTPUT (passed to main AI) ===\n{json.dumps(rules, indent=2)}\n=== END SUB-AGENT OUTPUT ===")

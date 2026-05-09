@@ -265,19 +265,53 @@ def _extract_clause_refs(text: str) -> list:
 def _parse_results(data: dict) -> list:
     """Extract result chunks from a Discovery Engine response dict.
 
-    Uses extractive segments (longer passages) in preference to extractive answers.
-    Surrounding previous/next segments are concatenated into the chunk content so
-    tables and figures that span multiple pages are retrieved intact.
-    Snippets are appended as supplementary context when present.
+    Supports two data store shapes:
+      1. Structured (JSONL with structData fields: content, source, clause_number, ...)
+         — preferred when document.structData has a 'content' field.
+      2. Unstructured PDFs (derivedStructData with extractive segments) — fallback.
 
     Each chunk includes:
-      - 'source_uri' from derivedStructData.link (for post-filtering)
-      - 'metadata.clause_refs' list pre-extracted from content text via regex
+      - 'source_uri' (structData.source for structured, derivedStructData.link for PDFs)
+      - 'metadata.clause_refs' list pre-extracted from content text via regex,
+         with structData.clause_number prepended when present.
     """
     results = []
     for item in data.get("results", []):
         doc        = item.get("document", {})
-        derived    = doc.get("derivedStructData", {})
+        struct     = doc.get("structData", {}) or {}
+        derived    = doc.get("derivedStructData", {}) or {}
+
+        # ── Structured data store path (JSONL with structData.content) ────────
+        if struct.get("content"):
+            content       = struct.get("content", "")
+            title         = struct.get("title", "")
+            source        = struct.get("source", "")
+            chapter       = struct.get("chapter", "")
+            clause_number = struct.get("clause_number") or ""
+            sub_clause    = struct.get("sub_clause") or ""
+
+            clause_refs = _extract_clause_refs(content)
+            if clause_number and clause_number not in clause_refs:
+                clause_refs.insert(0, clause_number)
+
+            clause_label = f"Clause {clause_number}" if clause_number else title
+            if sub_clause:
+                clause_label = f"{clause_label} ({sub_clause})"
+
+            results.append({
+                "content":    content,
+                "source_uri": source,
+                "metadata": {
+                    "title":       title,
+                    "page":        "",
+                    "clause":      clause_label,
+                    "clause_refs": clause_refs,
+                    "chapter":     chapter,
+                },
+            })
+            continue
+
+        # ── Unstructured PDF path (extractive segments) ───────────────────────
         title      = derived.get("title", "")
         source_uri = derived.get("link", "")
 

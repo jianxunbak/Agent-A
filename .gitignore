@@ -1,8 +1,13 @@
+# Secrets
 .env
+GeminiMCP.extension/.env
 service-account.json
+GeminiMCP.extension/service-account.json
+
+# Logs
 *.log
-latest_log_dump.txt
-latest_log_dump_utf8.txt
+
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
@@ -10,16 +15,14 @@ __pycache__/
 .venv/
 env/
 venv/
+
+# IDE / OS
 .vs/
 .vscode/
-bin/
-obj/
+.DS_Store
+Thumbs.db
 
-# Revit backups and recovery
+# Revit recovery / backups
 *.recovery.rvt
 *.backup.*
 *.000*.rvt
-
-# OS specific
-.DS_Store
-Thumbs.db

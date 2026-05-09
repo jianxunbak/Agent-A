@@ -1,17 +1,12 @@
 # -*- coding: utf-8 -*-
 """Tests for the build cancellation system.
-Run with: python -m pytest revit_mcp/test_cancellation.py -v
-or:        python revit_mcp/test_cancellation.py
+Run with: python -m pytest tests/test_cancellation.py -v
 """
 import asyncio
 import queue
-import sys
-import os
 import threading
 import time
 import unittest
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 # ---------------------------------------------------------------------------
 # cancel_manager tests — pure Python, no Revit required

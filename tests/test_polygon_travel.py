@@ -31,9 +31,9 @@ import sys
 import os
 import unittest
 
-from . import staircase_logic
-from .staircase_logic import _point_in_polygon, _check_travel_distance
-from .fire_safety_logic import calculate_fire_safety_requirements
+from revit_mcp import staircase_logic
+from revit_mcp.staircase_logic import _point_in_polygon, _check_travel_distance
+from revit_mcp.fire_safety_logic import calculate_fire_safety_requirements
 
 # ---------------------------------------------------------------------------
 # Shared geometry helpers

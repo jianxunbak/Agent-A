@@ -459,9 +459,183 @@ def _point_in_polygon(px, py, polygon_pts):
     return inside
 
 
+def _segments_proper_intersect(p1, p2, p3, p4):
+    """True if segment p1-p2 properly intersects segment p3-p4.
+    Endpoint-only contact returns False (so paths can graze polygon vertices).
+    """
+    def _orient(a, b, c):
+        v = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+        if abs(v) < 1e-9:
+            return 0
+        return 1 if v > 0 else -1
+
+    o1 = _orient(p1, p2, p3)
+    o2 = _orient(p1, p2, p4)
+    o3 = _orient(p3, p4, p1)
+    o4 = _orient(p3, p4, p2)
+    # Strict: both endpoints of each segment on OPPOSITE sides of the other.
+    # Endpoint touch (o == 0) is treated as non-intersecting.
+    return o1 != 0 and o2 != 0 and o3 != 0 and o4 != 0 and o1 != o2 and o3 != o4
+
+
+def _segment_crosses_polygon_interior(p1, p2, polygon_pts):
+    """True if the segment p1→p2 passes through the polygon interior.
+    Uses two checks: (a) segment crosses any polygon edge in proper-intersect
+    sense, OR (b) segment midpoint is inside the polygon.
+    """
+    n = len(polygon_pts)
+    for i in range(n):
+        a = polygon_pts[i]
+        b = polygon_pts[(i + 1) % n]
+        if _segments_proper_intersect(p1, p2, a, b):
+            return True
+    mx, my = (p1[0] + p2[0]) / 2.0, (p1[1] + p2[1]) / 2.0
+    return _point_in_polygon(mx, my, polygon_pts)
+
+
+def _wall_routed_distance(stair, test_pt, obstacle_polygons):
+    """Travel distance from `stair` to `test_pt` routing around obstacles.
+
+    Fast path: if straight line is unobstructed → return Euclidean distance.
+    Slow path: build a visibility graph over obstacle polygon vertices
+    (inflated outward by 500mm so paths route around, not through corners)
+    and run Dijkstra to find the shortest path.
+
+    obstacle_polygons: list of polygon vertex lists. Each is treated as an
+        impassable region (interior cannot be traversed). Stair shaft and
+        lobby walls are NOT in this list — only building outer walls,
+        courtyards, and lift cores per user direction.
+    """
+    sx, sy = stair[0], stair[1]
+    tx, ty = test_pt[0], test_pt[1]
+
+    # Fast path: direct line not blocked → Euclidean
+    if not obstacle_polygons or not any(
+        _segment_crosses_polygon_interior(stair, test_pt, poly)
+        for poly in obstacle_polygons if poly and len(poly) >= 3
+    ):
+        return math.sqrt((tx - sx) ** 2 + (ty - sy) ** 2)
+
+    # Slow path: build inflated obstacle vertices and run Dijkstra over a
+    # visibility graph. Inflate each obstacle vertex outward (away from its
+    # polygon centroid) by 500mm so a path doesn't graze the obstacle corner.
+    _INFLATE_MM = 500.0
+    nodes = [(sx, sy), (tx, ty)]
+    for poly in obstacle_polygons:
+        if not poly or len(poly) < 3:
+            continue
+        cx = sum(p[0] for p in poly) / float(len(poly))
+        cy = sum(p[1] for p in poly) / float(len(poly))
+        for vx, vy in poly:
+            dx = vx - cx
+            dy = vy - cy
+            dlen = math.sqrt(dx * dx + dy * dy) or 1.0
+            ux = vx + (dx / dlen) * _INFLATE_MM
+            uy = vy + (dy / dlen) * _INFLATE_MM
+            nodes.append((ux, uy))
+
+    n_nodes = len(nodes)
+    INF = float("inf")
+    dist = [INF] * n_nodes
+    dist[0] = 0.0
+    visited = [False] * n_nodes
+
+    # Edge existence: pre-compute which node pairs have a clear segment.
+    # O(n²) edge check is fine — we only have ~10-20 nodes per call.
+    def _edge_clear(i, j):
+        if i == j:
+            return False
+        a = nodes[i]
+        b = nodes[j]
+        for poly in obstacle_polygons:
+            if poly and len(poly) >= 3 and _segment_crosses_polygon_interior(a, b, poly):
+                return False
+        return True
+
+    # Dijkstra
+    for _ in range(n_nodes):
+        u = -1
+        best = INF
+        for k in range(n_nodes):
+            if not visited[k] and dist[k] < best:
+                best = dist[k]
+                u = k
+        if u == -1 or u == 1:
+            break
+        visited[u] = True
+        ux, uy = nodes[u]
+        for v in range(n_nodes):
+            if visited[v] or not _edge_clear(u, v):
+                continue
+            vx, vy = nodes[v]
+            w = math.sqrt((vx - ux) ** 2 + (vy - uy) ** 2)
+            if dist[u] + w < dist[v]:
+                dist[v] = dist[u] + w
+
+    return dist[1] if dist[1] < INF else math.sqrt((tx - sx) ** 2 + (ty - sy) ** 2)
+
+
+def _generate_test_points(footprint_pts, footprint_holes=None):
+    """Generate the same augmented test-point grid used by _check_travel_distance.
+    Returns list of (x, y) tuples. Empty list if no footprint provided.
+
+    Exposed so callers (e.g. fire_safety_logic.add_perimeter_for_coverage) can
+    identify which cells are CURRENTLY failing the travel-distance test, then
+    score new stair candidates by how many failed cells they would fix.
+    """
+    if not footprint_pts or len(footprint_pts) < 3:
+        return []
+    _fp_xs = [p[0] for p in footprint_pts]
+    _fp_ys = [p[1] for p in footprint_pts]
+    _fp_xmin, _fp_xmax = min(_fp_xs), max(_fp_xs)
+    _fp_ymin, _fp_ymax = min(_fp_ys), max(_fp_ys)
+    _N = 16
+    _dx = (_fp_xmax - _fp_xmin) / float(_N)
+    _dy = (_fp_ymax - _fp_ymin) / float(_N)
+    _td_holes = footprint_holes or []
+    pts = []
+    for _ix in range(_N):
+        for _iy in range(_N):
+            _gx = _fp_xmin + (_ix + 0.5) * _dx
+            _gy = _fp_ymin + (_iy + 0.5) * _dy
+            if not _point_in_polygon(_gx, _gy, footprint_pts):
+                continue
+            if any(_point_in_polygon(_gx, _gy, h) for h in _td_holes):
+                continue
+            pts.append((_gx, _gy))
+    # Augment with inset polygon vertices
+    _INSET_MM = 400.0
+    _fp_cx = sum(p[0] for p in footprint_pts) / float(len(footprint_pts))
+    _fp_cy = sum(p[1] for p in footprint_pts) / float(len(footprint_pts))
+    for _vx, _vy in footprint_pts:
+        _dxv = _fp_cx - _vx
+        _dyv = _fp_cy - _vy
+        _dlen = math.sqrt(_dxv * _dxv + _dyv * _dyv) or 1.0
+        _ux = _vx + (_dxv / _dlen) * _INSET_MM
+        _uy = _vy + (_dyv / _dlen) * _INSET_MM
+        if _point_in_polygon(_ux, _uy, footprint_pts) and \
+           not any(_point_in_polygon(_ux, _uy, h) for h in _td_holes):
+            pts.append((_ux, _uy))
+    for _h in _td_holes:
+        if not _h or len(_h) < 3:
+            continue
+        _hcx = sum(p[0] for p in _h) / float(len(_h))
+        _hcy = sum(p[1] for p in _h) / float(len(_h))
+        for _vx, _vy in _h:
+            _dxv = _vx - _hcx
+            _dyv = _vy - _hcy
+            _dlen = math.sqrt(_dxv * _dxv + _dyv * _dyv) or 1.0
+            _ux = _vx + (_dxv / _dlen) * _INSET_MM
+            _uy = _vy + (_dyv / _dlen) * _INSET_MM
+            if _point_in_polygon(_ux, _uy, footprint_pts) and \
+               not any(_point_in_polygon(_ux, _uy, h) for h in _td_holes):
+                pts.append((_ux, _uy))
+    return pts
+
+
 def _check_travel_distance(stair_positions, floor_dims_mm,
                            max_dist_mm, num_required=2, footprint_pts=None,
-                           footprint_holes=None):
+                           footprint_holes=None, obstacle_polygons=None):
     """Return True if every sampled floor-plate point can reach at least
     *num_required* staircases within *max_dist_mm* (Euclidean).
 
@@ -501,7 +675,11 @@ def _check_travel_distance(stair_positions, floor_dims_mm,
         _fp_ys = [p[1] for p in footprint_pts]
         _fp_xmin, _fp_xmax = min(_fp_xs), max(_fp_xs)
         _fp_ymin, _fp_ymax = min(_fp_ys), max(_fp_ys)
-        _N = 8  # 8×8 grid → ~64 candidates, cell centres avoid polygon edges
+        # 16×16 grid → ~256 candidates, cell centres land 3.75km off corners
+        # (was 8×8 → 5.3km off). Combined with explicit polygon-vertex test
+        # points below, building corners are explicitly checked so the test
+        # never silently passes a stair that's 5km past the limit at a corner.
+        _N = 16
         _dx = (_fp_xmax - _fp_xmin) / float(_N)
         _dy = (_fp_ymax - _fp_ymin) / float(_N)
         _td_holes = footprint_holes or []
@@ -515,15 +693,72 @@ def _check_travel_distance(stair_positions, floor_dims_mm,
                 if any(_point_in_polygon(_gx, _gy, h) for h in _td_holes):
                     continue
                 poly_test_pts.append((_gx, _gy))
+
+        # Augment grid with explicit vertex test points — the actual building
+        # corners (and courtyard inner corners) are by definition the worst-case
+        # travel points. Inset slightly toward the floor area so they don't sit
+        # exactly on a wall (matches SCDF cl. 2.2.6c "min measurement point from
+        # enclosure walls" intent).
+        _INSET_MM = 400.0
+        # Building corners: inset toward polygon centroid
+        _fp_cx = sum(p[0] for p in footprint_pts) / float(len(footprint_pts))
+        _fp_cy = sum(p[1] for p in footprint_pts) / float(len(footprint_pts))
+        for _vx, _vy in footprint_pts:
+            _dxv = _fp_cx - _vx
+            _dyv = _fp_cy - _vy
+            _dlen = math.sqrt(_dxv * _dxv + _dyv * _dyv) or 1.0
+            _ux = _vx + (_dxv / _dlen) * _INSET_MM
+            _uy = _vy + (_dyv / _dlen) * _INSET_MM
+            if _point_in_polygon(_ux, _uy, footprint_pts) and \
+               not any(_point_in_polygon(_ux, _uy, h) for h in _td_holes):
+                poly_test_pts.append((_ux, _uy))
+        # Hole vertices: inset OUTWARD (away from hole centroid, into the floor)
+        for _h in _td_holes:
+            if not _h or len(_h) < 3:
+                continue
+            _hcx = sum(p[0] for p in _h) / float(len(_h))
+            _hcy = sum(p[1] for p in _h) / float(len(_h))
+            for _vx, _vy in _h:
+                _dxv = _vx - _hcx
+                _dyv = _vy - _hcy
+                _dlen = math.sqrt(_dxv * _dxv + _dyv * _dyv) or 1.0
+                _ux = _vx + (_dxv / _dlen) * _INSET_MM
+                _uy = _vy + (_dyv / _dlen) * _INSET_MM
+                if _point_in_polygon(_ux, _uy, footprint_pts) and \
+                   not any(_point_in_polygon(_ux, _uy, h) for h in _td_holes):
+                    poly_test_pts.append((_ux, _uy))
+
         if not poly_test_pts:
             poly_test_pts = [(0.0, 0.0)]
+        # Build the obstacle list for wall-routed distance: courtyard holes are
+        # always obstacles (occupants can't walk through voids); additional
+        # obstacles like lift cores are passed in via obstacle_polygons by the
+        # caller. Stair shaft and lobby walls are NOT obstacles per design — door
+        # placement is handled elsewhere and is currently not reliable enough to
+        # treat their walls as travel-blocking.
+        _obstacles = list(_td_holes)
+        if obstacle_polygons:
+            _obstacles.extend(p for p in obstacle_polygons if p and len(p) >= 3)
+        # Track first-failing point for diagnostics. Pass/fail summary logged
+        # at end. Detailed wall-routing tracking would double the cost; if a
+        # particular failure looks suspicious, re-run with verbose flag.
         for px, py in poly_test_pts:
             dists = sorted(
-                math.sqrt((px - sx) ** 2 + (py - sy) ** 2)
+                _wall_routed_distance((sx, sy), (px, py), _obstacles)
                 for sx, sy in stair_positions
             )
             if dists[num_required - 1] > max_dist_mm:
+                _sl_log("[TravelTest] FAIL: pt=({:.0f},{:.0f}) dists_to_stairs={} "
+                        "(need {}-th <= {}; got {:.0f}) | n_stairs={} n_test_cells={} "
+                        "n_obstacles={}".format(
+                            px, py, [int(d) for d in dists],
+                            num_required, int(max_dist_mm), dists[num_required - 1],
+                            len(stair_positions), len(poly_test_pts), len(_obstacles)))
                 return False
+        _sl_log("[TravelTest] PASS: {} cells × {} stairs (need {}-reach <= {}mm); "
+                "n_obstacles={}".format(
+                    len(poly_test_pts), len(stair_positions), num_required,
+                    int(max_dist_mm), len(_obstacles)))
         return True
 
     for floor_w_mm, floor_l_mm in to_test:
@@ -536,13 +771,26 @@ def _check_travel_distance(stair_positions, floor_dims_mm,
             (-hw / 2, -hl / 2), (hw / 2, -hl / 2),
             (hw / 2, hl / 2), (-hw / 2, hl / 2),
         ]
+        # Rectangle-fallback path uses wall-routed distance only if obstacles
+        # were supplied. With no polygon footprint there's no concept of
+        # courtyard holes, so this only activates when caller passes
+        # obstacle_polygons explicitly (e.g. a lift core rectangle).
+        _obstacles_rect = list(obstacle_polygons or [])
         for px, py in test_points:
             dists = sorted(
-                math.sqrt((px - sx) ** 2 + (py - sy) ** 2)
+                _wall_routed_distance((sx, sy), (px, py), _obstacles_rect)
                 for sx, sy in stair_positions
             )
             if dists[num_required - 1] > max_dist_mm:
+                _sl_log("[TravelTest] FAIL (rect path): pt=({:.0f},{:.0f}) "
+                        "dists_to_stairs={} (need {}-th <= {}; got {:.0f}) | "
+                        "n_stairs={} floor=({:.0f},{:.0f})".format(
+                            px, py, [int(d) for d in dists],
+                            num_required, int(max_dist_mm), dists[num_required - 1],
+                            len(stair_positions), floor_w_mm, floor_l_mm))
                 return False
+    _sl_log("[TravelTest] PASS (rect path): {} test pts × {} stairs (need {}-reach <= {}mm)".format(
+        len(test_points), len(stair_positions), num_required, int(max_dist_mm)))
     return True
 
 

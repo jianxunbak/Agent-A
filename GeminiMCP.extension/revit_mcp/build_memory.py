@@ -937,45 +937,6 @@ class OptionsManager:
             option_id, revision_id, "yes" if rag else "no", len(snap) if snap else 0))
         return rag, snap
 
-    def export_to_notion(self, option_id, revision_id=None):
-        """
-        Upload a saved option or revision to Notion.
-        Returns a success or error message string.
-        """
-        self._ensure_loaded()
-        _log("export_to_notion: option='{}', revision='{}'".format(option_id, revision_id))
-
-        option = self._find_option(option_id)
-        if option is None:
-            msg = "Option '{}' not found.".format(option_id)
-            _log("export_to_notion: FAILED — {}".format(msg))
-            return msg
-
-        if revision_id is not None:
-            rev = self._find_revision(option, revision_id)
-            if rev is None:
-                msg = "Revision '{}' not found in option '{}'.".format(revision_id, option["id"])
-                _log("export_to_notion: FAILED — {}".format(msg))
-                return msg
-            target = rev
-        else:
-            target = option
-
-        _log("export_to_notion: uploading '{}' to Notion...".format(target["name"]))
-        try:
-            from revit_mcp.notion_client import get_notion_client
-            result = get_notion_client().upload_option(target)
-            page_url = result.get("url", "")
-            _log("export_to_notion: SUCCESS — Notion page created. URL: {}".format(page_url or "(none)"))
-            return "Uploaded '{}' to Notion successfully.{}".format(
-                target["name"], " View: " + page_url if page_url else ""
-            )
-        except Exception as e:
-            import traceback
-            _log("export_to_notion: ERROR — {}\n{}".format(e, traceback.format_exc()))
-            return "Notion upload failed: {}".format(e)
-
-
 # ── Module-level singleton ────────────────────────────────────────────────────
 
 _options_manager = None

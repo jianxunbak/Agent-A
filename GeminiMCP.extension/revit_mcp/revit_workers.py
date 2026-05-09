@@ -14,6 +14,73 @@ from . import fire_safety_logic
 import math
 
 
+# ── UI-responsive blocking call wrapper ──────────────────────────────────────
+# Long pure-Python compute (R3.Solve coverage scoring, shift-range probes, etc.)
+# can run for 20-60+ seconds.  When that runs synchronously on Revit's main
+# thread it freezes the UI: chat window, ribbon, viewports — all unresponsive.
+# This wrapper runs the work on a daemon thread while the main thread pumps
+# WPF/WinForms message queues so the UI stays alive and the cancel button works.
+# It does NOT speed up the compute — Python's GIL means the worker can only
+# make progress while the main thread sleeps — but the perceived freeze is gone.
+def _run_with_ui_pump(fn, *args, **kwargs):
+    """Run ``fn(*args, **kwargs)`` on a daemon thread, pumping the WPF dispatcher
+    + WinForms message queue from the calling thread until the worker finishes.
+    Returns whatever fn returned; re-raises any exception fn raised.
+
+    Safe for pure-Python work (no Revit API calls).  R3.Solve qualifies — it
+    only does coverage scoring + Dijkstra over polygon geometry.
+    """
+    import threading as _t, time as _time
+    _result = [None]
+    _error  = [None]
+    _done   = _t.Event()
+
+    def _worker():
+        try:
+            _result[0] = fn(*args, **kwargs)
+        except BaseException as _e:
+            _error[0] = _e
+        finally:
+            _done.set()
+
+    _t.Thread(target=_worker, daemon=True).start()
+
+    # WinForms.DoEvents() pumps the same Win32 message queue WPF uses on this
+    # thread.  It's the primitive the existing chat-UI script already relies on
+    # ([Start Server.pushbutton/script.py:62]) and it's enough to keep Revit's
+    # ribbon, mouse, and chat window alive while R3 grinds in the background.
+    _wpf_pump = None
+    try:
+        import clr  # type: ignore
+        clr.AddReference("System.Windows.Forms")
+        from System.Windows.Forms import Application as _WF  # type: ignore
+        def _pump_simple():
+            try: _WF.DoEvents()
+            except Exception: pass
+        _wpf_pump = _pump_simple
+    except Exception:
+        _wpf_pump = None  # No pump available — main thread sleeps without pumping
+
+    # Cancellation poll — same primitive the rest of the build uses.
+    try:
+        from revit_mcp.cancel_manager import is_cancelled as _is_cancelled
+    except Exception:
+        _is_cancelled = lambda: False
+
+    while not _done.wait(timeout=0.05):
+        if _wpf_pump is not None:
+            _wpf_pump()
+        if _is_cancelled():
+            # Worker keeps running (we can't safely abort a Python thread mid-
+            # compute), but we exit the pump loop and raise so the build aborts.
+            # The daemon thread will be GC'd at process exit.
+            raise RuntimeError("Build cancelled by user.")
+
+    if _error[0] is not None:
+        raise _error[0]
+    return _result[0]
+
+
 def _merge_void_rects(rects):
     """Merge OVERLAPPING axis-aligned rectangles into non-overlapping ones.
     Each rect is (x1, y1, x2, y2).
@@ -282,6 +349,58 @@ def _poly_area_mm2(pts):
                    for i in range(n))) / 2.0
 
 
+def _net_floor_area_mm2(outer_pts, holes=None):
+    """Outer polygon area minus all hole areas (e.g. courtyards)."""
+    a = _poly_area_mm2(outer_pts)
+    for h in (holes or []):
+        if h and len(h) >= 3:
+            a -= _poly_area_mm2(h)
+    return max(a, 0)
+
+
+# Per-typology fallback values used when RAG fails to retrieve them. NOT clause
+# numbers — these are office/residential/etc architectural defaults consistent
+# with SCDF Code & CIBSE Guide D. Gemini-supplied or RAG-retrieved values
+# always take precedence; this dict only fills gaps.
+_TYPOLOGY_DEFAULTS = {
+    "commercial_office": {
+        "occupant_load_factor_m2": 10.0,
+        "occupancy_density_p_per_m2": 0.10,
+        "max_travel_distance_mm": 45000,
+        "max_travel_distance_sprinklered_mm": 75000,
+        "persons_per_unit_width": 60,
+    },
+    "residential": {
+        "occupant_load_factor_m2": 18.0,
+        "occupancy_density_p_per_m2": 0.056,
+        "max_travel_distance_mm": 30000,
+        "max_travel_distance_sprinklered_mm": 60000,
+        "persons_per_unit_width": 50,
+    },
+    "retail": {
+        "occupant_load_factor_m2": 4.0,
+        "occupancy_density_p_per_m2": 0.25,
+        "max_travel_distance_mm": 30000,
+        "max_travel_distance_sprinklered_mm": 60000,
+        "persons_per_unit_width": 60,
+    },
+}
+
+
+def _typology_default(typology, key, fallback):
+    """Look up a per-typology default value, with a generic fallback. Matches
+    typology strings loosely (case-insensitive, space->underscore, substring)."""
+    if not typology:
+        return fallback
+    t = str(typology).lower().replace(" ", "_").replace("-", "_")
+    if t in _TYPOLOGY_DEFAULTS:
+        return _TYPOLOGY_DEFAULTS[t].get(key, fallback)
+    for k, defaults in _TYPOLOGY_DEFAULTS.items():
+        if k in t or t in k:
+            return defaults.get(key, fallback)
+    return fallback
+
+
 def _convex_hull_2d(pts):
     """Andrew's monotone chain — returns CCW convex hull of points as [[x,y],...].
 
@@ -387,11 +506,13 @@ def pre_analyse_floor_plate(manifest, compliance_overrides=None, user_goal=None)
         fp_pts = fp_pts[0]
     fp_holes = _normalise_footprint_holes(shell.get("footprint_holes", []))
     if fp_pts and len(fp_pts) >= 3:
-        _floor_area_mm2 = _poly_area_mm2(fp_pts)
+        _floor_area_mm2 = _net_floor_area_mm2(fp_pts, fp_holes)
     else:
         _floor_area_mm2 = _fw * _fl
     _NFA_RATIO   = 0.60
-    _occ_density = safe_num(lifts_cfg.get("occupancy_density", 0.067), 0.067)
+    _typology_pa = manifest.get("typology", "")
+    _default_density_pa = _typology_default(_typology_pa, "occupancy_density_p_per_m2", 0.067)
+    _occ_density = safe_num(lifts_cfg.get("occupancy_density"), _default_density_pa)
     _total_occ   = max(100, (_floor_area_mm2 / 1e6) * _NFA_RATIO * _occ_density * num_storeys)
     _auto_lifts  = lift_logic.calculate_lift_requirements(num_storeys, typical_h_mm, _total_occ)
     if num_lifts is None or num_lifts == "random":
@@ -3872,9 +3993,35 @@ class RevitWorkers:
         wall_type = self._find_core_wall_type(doc)
 
         granular_walls = []
+        # Diagnostic: confirm what walls we're about to create.  The bank-build
+        # path appends ~248 walls per bank to manifest["walls"]; missing walls
+        # in Revit means either (a) the merge didn't happen or (b) the loop
+        # below filters them out silently.  Log the shape so the next build
+        # clearly attributes the symptom to one path or the other.
+        _all_walls = manifest.get("walls", []) or []
+        _bank_walls_in_manifest = [w for w in _all_walls
+                                    if (w.get("id", "").startswith("AI_B")
+                                        and "_AI_" not in w.get("id", "")[3:5])]
+        _stair_walls_in_manifest = [w for w in _all_walls
+                                     if "Stair" in w.get("id", "")
+                                     or "FL_" in w.get("id", "")
+                                     or "_LB_" in w.get("id", "")]
+        self.log("  GranWalls input: {} total walls in manifest; {} bank-prefixed (AI_Bn_*); "
+                 "{} look like stair/lobby/firelift walls".format(
+                     len(_all_walls), len(_bank_walls_in_manifest), len(_stair_walls_in_manifest)))
+        if _bank_walls_in_manifest:
+            _bw0 = _bank_walls_in_manifest[0]
+            self.log("  GranWalls sample bank wall: id={} level_id={} start={} end={}".format(
+                _bw0.get("id"), _bw0.get("level_id"),
+                _bw0.get("start"), _bw0.get("end")))
+        _filter_no_id = 0
+        _filter_no_level = 0
+        _level_misses = []
         for w_data in manifest.get("walls", []):
             ai_id = w_data.get("id")
-            if not ai_id: continue
+            if not ai_id:
+                _filter_no_id += 1
+                continue
 
             p1_raw = w_data.get("start", [0, 0, 0])
             p2_raw = w_data.get("end", [1000, 0, 0])
@@ -3901,6 +4048,10 @@ class RevitWorkers:
 
             lvl = level_map.get(w_data.get("level_id"))
             if not lvl:
+                _filter_no_level += 1
+                if len(_level_misses) < 5:
+                    _level_misses.append("{} (level_id={!r})".format(
+                        ai_id, w_data.get("level_id")))
                 if "_LB_" in ai_id:
                     self.log("  GranWalls WARN: LB wall {} has unknown level_id '{}', falling back to L1".format(
                         ai_id, w_data.get("level_id")))
@@ -3973,6 +4124,12 @@ class RevitWorkers:
             
             results["elements"].append(str(wall.Id.Value))
             granular_walls.append(wall)
+        # Diagnostic: report how many walls were actually created vs filtered.
+        self.log("  GranWalls done: created/reused {} walls; "
+                 "filter no-id={}, filter no-level={}, "
+                 "first 3 missing-level ids={}".format(
+                     len(granular_walls), _filter_no_id, _filter_no_level,
+                     _level_misses[:3]))
         return granular_walls
 
     def _process_granular_floors(self, manifest, current_levels, registry, results, created, reused, affected_elements=[]):
@@ -4160,10 +4317,66 @@ class RevitWorkers:
         if not x_offsets and not y_offsets:
             return
 
-        half_w_ft = mm_to_ft(max_w) / 2.0
-        half_l_ft = mm_to_ft(max_l) / 2.0
         # Grid lines extend slightly beyond the building for clarity
         overshoot_ft = mm_to_ft(3000)
+
+        # --- COMPUTE TRUE BUILDING EXTENT FROM ACTUAL FLOORS ---
+        # max_w/max_l are PER-FLOOR bbox sizes, centred at world origin in the
+        # rectangular case. For volumes / organic / SVG-footprint builds, each
+        # floor can be offset/rotated, so the world-space extent is much larger
+        # than max_w x max_l.  Using the per-floor size to set grid line endpoints
+        # makes the grid stop inside (or outside) the building plate depending on
+        # the offset direction — which is the "starts halfway / past the plate /
+        # generally messy" failure.
+        # The robust fix: union the bounding boxes of every AI_Floor element and
+        # use that as the grid's perpendicular extent.
+        x_min_ft = None; x_max_ft = None
+        y_min_ft = None; y_max_ft = None
+        try:
+            _floor_collector = DB.FilteredElementCollector(doc).OfCategory(
+                DB.BuiltInCategory.OST_Floors).WhereElementIsNotElementType()
+            for _fl in _floor_collector:
+                try:
+                    p_cm = _fl.get_Parameter(DB.BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
+                    if not p_cm:
+                        continue
+                    _cm_str = p_cm.AsString() or ""
+                    if not _cm_str.startswith("AI_Floor"):
+                        continue
+                    _bb = _fl.get_BoundingBox(None)
+                    if not _bb:
+                        continue
+                    if x_min_ft is None or _bb.Min.X < x_min_ft: x_min_ft = _bb.Min.X
+                    if y_min_ft is None or _bb.Min.Y < y_min_ft: y_min_ft = _bb.Min.Y
+                    if x_max_ft is None or _bb.Max.X > x_max_ft: x_max_ft = _bb.Max.X
+                    if y_max_ft is None or _bb.Max.Y > y_max_ft: y_max_ft = _bb.Max.Y
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        # Fallback to centred bbox derived from max_w/max_l if no floors
+        # (degenerate manifests, or a very early build phase failed silently).
+        if x_min_ft is None or x_max_ft is None:
+            half_w_ft = mm_to_ft(max_w) / 2.0
+            x_min_ft = -half_w_ft
+            x_max_ft =  half_w_ft
+        if y_min_ft is None or y_max_ft is None:
+            half_l_ft = mm_to_ft(max_l) / 2.0
+            y_min_ft = -half_l_ft
+            y_max_ft =  half_l_ft
+        # Also include grid-offset positions themselves so a column placed
+        # outside the floor envelope (cantilever, perimeter stair) doesn't have
+        # its grid line truncated short of the column.
+        if x_offsets:
+            _xo_lo, _xo_hi = min(x_offsets), max(x_offsets)
+            if _xo_lo < x_min_ft: x_min_ft = _xo_lo
+            if _xo_hi > x_max_ft: x_max_ft = _xo_hi
+        if y_offsets:
+            _yo_lo, _yo_hi = min(y_offsets), max(y_offsets)
+            if _yo_lo < y_min_ft: y_min_ft = _yo_lo
+            if _yo_hi > y_max_ft: y_max_ft = _yo_hi
+        self.log("[Grid] Building extent (ft): X=[{:.2f}, {:.2f}] Y=[{:.2f}, {:.2f}]".format(
+            x_min_ft, x_max_ft, y_min_ft, y_max_ft))
 
         def _delete_grid_cascade(g):
             """Delete a grid and its dependent dimensions so the delete cannot be blocked."""
@@ -4272,8 +4485,10 @@ class RevitWorkers:
                 n = n // 26 - 1
                 if n < 0:
                     break
-            p1 = DB.XYZ(ox, -half_l_ft - overshoot_ft, 0)
-            p2 = DB.XYZ(ox,  half_l_ft + overshoot_ft, 0)
+            # Extend X-grid (vertical line) from south of building to north,
+            # using the actual floor-plate Y range plus 3m overshoot on each end.
+            p1 = DB.XYZ(ox, y_min_ft - overshoot_ft, 0)
+            p2 = DB.XYZ(ox, y_max_ft + overshoot_ft, 0)
             _create_grid(DB.Line.CreateBound(p1, p2), label, "AI_Grid_X_{}".format(idx))
 
         # Y-axis grids: horizontal lines (constant Y, varying X) -- labelled 1, 2, 3, ...
@@ -4282,8 +4497,10 @@ class RevitWorkers:
         sorted_y_top_first = sorted(y_offsets, reverse=True)
         for idx, oy in enumerate(sorted_y_top_first):
             label = str(idx + 1)
-            p1 = DB.XYZ(-half_w_ft - overshoot_ft, oy, 0)
-            p2 = DB.XYZ( half_w_ft + overshoot_ft, oy, 0)
+            # Extend Y-grid (horizontal line) from west of building to east,
+            # using the actual floor-plate X range plus 3m overshoot on each end.
+            p1 = DB.XYZ(x_min_ft - overshoot_ft, oy, 0)
+            p2 = DB.XYZ(x_max_ft + overshoot_ft, oy, 0)
             _create_grid(DB.Line.CreateBound(p1, p2), label, "AI_Grid_Y_{}".format(idx))
 
         # --- PASS 2: extend grid 3D height and propagate to all floor plan views ---
@@ -4421,21 +4638,69 @@ class RevitWorkers:
         _fw = safe_num(shell.get("width", 30000), 30000)
         _fl_dim = safe_num(shell.get("length", 50000), 50000)
         _fp_pts_early = shell.get("footprint_points")
-        _occ_density = safe_num(lifts_config.get("occupancy_density", 0.067), 0.067)
+        _typology_for_lifts = manifest.get("typology", "")
+        _default_density = _typology_default(_typology_for_lifts, "occupancy_density_p_per_m2", 0.067)
+        _occ_density = safe_num(lifts_config.get("occupancy_density"), _default_density)
+        # Always log the density and its source, so it's clear in any build whether
+        # the value came from the manifest, the typology default, or the generic fallback.
+        if lifts_config.get("occupancy_density"):
+            _density_src = "manifest (lifts.occupancy_density)"
+        elif _default_density != 0.067:
+            _density_src = "typology default ({})".format(_typology_for_lifts)
+        else:
+            _density_src = "generic fallback (0.067)"
+        self.log("[OccDensity] using {} p/m² (source: {})".format(_occ_density, _density_src))
         # Apply 60% NFA efficiency (core, corridors, toilets occupy ~40% of GFA)
         _NFA_RATIO = 0.60
         if _fp_pts_early and len(_fp_pts_early) >= 3:
-            _floor_area_mm2 = _poly_area_mm2(_fp_pts_early)
+            _floor_area_mm2 = _net_floor_area_mm2(_fp_pts_early, shell.get("footprint_holes"))
         else:
             _floor_area_mm2 = _fw * _fl_dim
         _total_occ = max(100, (_floor_area_mm2 / 1e6) * _NFA_RATIO * _occ_density * num_storeys)
         _auto_lifts = lift_logic.calculate_lift_requirements(num_storeys, typical_h_mm, _total_occ)
+
+        # ── Bank-array negotiation ────────────────────────────────────────────
+        # When the manifest uses lifts.banks: [{count:N, ...}], the legacy
+        # 80%-of-auto sanity check on lifts.count is bypassed entirely. Apply
+        # the same bounds here (80% lower / 150% upper) and rebalance bank
+        # counts evenly when the sum exceeds the upper cap. Min 2 lifts/bank.
+        _banks_for_count = lifts_config.get("banks", [])
+        if _banks_for_count:
+            _bank_sum_orig = sum(int(safe_num(b.get("count", 0), 0)) for b in _banks_for_count)
+            self.log("[LiftCount] Bank counts from manifest: {} (sum={})".format(
+                [b.get("count") for b in _banks_for_count], _bank_sum_orig))
+            _K = len(_banks_for_count)
+            _lower = max(2 * _K, int(_auto_lifts * 0.8))
+            _upper = max(_lower, int(_auto_lifts * 1.5))
+            _capped_total = max(_lower, min(_bank_sum_orig, _upper))
+            if _capped_total < 2 * _K:
+                # Total too small to give every bank ≥2 lifts — collapse to single bank.
+                self.log("[LiftCount] Capped total {} < 2 lifts × {} banks; "
+                         "collapsing to single bank.".format(_capped_total, _K))
+                lifts_config["banks"] = []
+                _banks_for_count = []
+                num_lifts = _capped_total
+            elif _capped_total != _bank_sum_orig:
+                # Rebalance evenly across all banks. ceil(N/K) and floor(N/K) split.
+                _floor_each = _capped_total // _K
+                _ceil_count = _capped_total - _floor_each * _K  # banks getting ceil
+                _ceil_each = _floor_each + 1 if _ceil_count else _floor_each
+                for _i, _b in enumerate(_banks_for_count):
+                    _b["count"] = _ceil_each if _i < _ceil_count else _floor_each
+                self.log("[LiftCount] Rebalanced {} -> {} (auto={}, range {}-{})".format(
+                    _bank_sum_orig, [b["count"] for b in _banks_for_count],
+                    _auto_lifts, _lower, _upper))
+                num_lifts = sum(int(b["count"]) for b in _banks_for_count)
+            else:
+                num_lifts = _bank_sum_orig
+
+        # ── Single-count negotiation (legacy form) ─────────────────────────────
         # AI may return count as a dict e.g. {"passenger": 4, "fire_fighting": 2}
         if isinstance(num_lifts, dict):
             num_lifts = num_lifts.get("passenger", num_lifts.get("total", num_lifts.get("count", None)))
         if num_lifts is None or num_lifts == "random":
             num_lifts = _auto_lifts
-        else:
+        elif not _banks_for_count:
             try:
                 _manifest_n = int(num_lifts)
                 # Accept the manifest count if it is within 20% of the calculated
@@ -4499,6 +4764,22 @@ class RevitWorkers:
         _tds2 = _cp_get_travel2("max_travel_distance_sprinklered_mm")
         if _tds2:
             _cp_overrides["max_travel_distance_sprinklered_mm"] = int(_tds2)
+        # Typology-aware fallbacks when RAG missed the travel-distance values.
+        # These are NOT clause numbers — just architectural defaults consistent
+        # with SCDF Office row + CIBSE Guide D for each typology.
+        _typology_for_fs = manifest.get("typology", "")
+        if not _cp_overrides.get("max_travel_distance_mm"):
+            _td_default = _typology_default(_typology_for_fs, "max_travel_distance_mm", None)
+            if _td_default:
+                _cp_overrides["max_travel_distance_mm"] = int(_td_default)
+                self.log("[ComplianceOverride] max_travel_distance_mm fallback to typology "
+                         "default {}mm (RAG missed; typology={})".format(_td_default, _typology_for_fs))
+        if not _cp_overrides.get("max_travel_distance_sprinklered_mm"):
+            _tds_default = _typology_default(_typology_for_fs, "max_travel_distance_sprinklered_mm", None)
+            if _tds_default:
+                _cp_overrides["max_travel_distance_sprinklered_mm"] = int(_tds_default)
+                self.log("[ComplianceOverride] max_travel_distance_sprinklered_mm fallback to "
+                         "typology default {}mm (RAG missed; typology={})".format(_tds_default, _typology_for_fs))
         self.log("[ComplianceOverride] Travel distance: non-sprinklered={} sprinklered={}".format(
             _cp_overrides.get("max_travel_distance_mm"), _cp_overrides.get("max_travel_distance_sprinklered_mm")))
 
@@ -4511,11 +4792,147 @@ class RevitWorkers:
         _pre_floor_dims = floor_dims  # _check_travel_distance uses footprint_pts polygon directly
         _f_center_pre = list(f_center_mm)  # use manifest-specified position
 
-        # For multi-bank layouts, run the pre-check per bank and merge stair positions
-        # so the travel distance test reflects the actual EW staircase placement.
+        # ── R3: Try the unified optimal-staircase-layout solver first ─────────
+        # When USE_R3_OPTIMAL_LAYOUT is True, replaces both the per-bank
+        # fire-safety analysis and the perimeter pass with a single global
+        # algorithm that picks the most coverage-efficient stair layout.
+        # On failure (or flag off), falls through to legacy per-bank logic.
+        _safety_sets_pre = None
+        _r3_result = None
+        _max_travel = (_cp_overrides.get("max_travel_distance_sprinklered_mm")
+                       or _cp_overrides.get("max_travel_distance_mm")
+                       or 60000)
+        if getattr(fire_safety_logic, "USE_R3_OPTIMAL_LAYOUT", False):
+            try:
+                _r3_banks_info = []
+                _r3_banks_cfg = lifts_config.get("banks", [])
+                if _r3_banks_cfg:
+                    for _bki, _bk in enumerate(_r3_banks_cfg):
+                        _bk_pos = _bk.get("position", [f_center_mm[0], f_center_mm[1]])
+                        _bk_cx = float(_bk_pos[0])
+                        _bk_cy = float(_bk_pos[1])
+                        _bk_n = int(safe_num(
+                            _bk.get("count", max(1, num_lifts // max(len(_r3_banks_cfg), 1))), 1))
+                        _bk_orient = str(_bk.get("orientation", _core_orientation)).upper()
+                        if _bk_orient not in ("NS", "EW", "AUTO"):
+                            _bk_orient = _core_orientation
+                        _bk_layout = lift_logic.get_total_core_layout(_bk_n, lobby_width=lobby_w)
+                        _bk_lcb = (
+                            _bk_cx - _bk_layout["total_w"] / 2.0,
+                            _bk_cy - _bk_layout["total_d"] / 2.0,
+                            _bk_cx + _bk_layout["total_w"] / 2.0,
+                            _bk_cy + _bk_layout["total_d"] / 2.0,
+                        )
+                        _r3_banks_info.append({
+                            "bank_idx": _bki,
+                            "lift_core_bounds_mm": _bk_lcb,
+                            "center_mm": (_bk_cx, _bk_cy),
+                            "num_lifts": _bk_n,
+                            "orientation": _bk_orient,
+                        })
+                else:
+                    # Single-bank
+                    _layout_pre = lift_logic.get_total_core_layout(num_lifts, lobby_width=lobby_w)
+                    _lcb_pre = (
+                        _f_center_pre[0] - _layout_pre["total_w"] / 2.0,
+                        _f_center_pre[1] - _layout_pre["total_d"] / 2.0,
+                        _f_center_pre[0] + _layout_pre["total_w"] / 2.0,
+                        _f_center_pre[1] + _layout_pre["total_d"] / 2.0,
+                    )
+                    _r3_banks_info.append({
+                        "bank_idx": 0,
+                        "lift_core_bounds_mm": _lcb_pre,
+                        "center_mm": tuple(_f_center_pre),
+                        "num_lifts": num_lifts,
+                        "orientation": _core_orientation,
+                    })
+                # Cheap geometric pre-flight first — avoid wasting 30-60s on R3
+                # coverage scoring + a Gemini round-trip when the bank position
+                # itself overlaps a hole or sits outside the footprint.  The
+                # OR-Tools layout engine does this same check downstream, but
+                # only after R3 has already paid its full cost.
+                _preflight = fire_safety_logic.check_bank_placement_conflicts(
+                    _r3_banks_info, _fp_pts_pre, shell.get("footprint_holes", []))
+                if _preflight is not None:
+                    self.log("[R3] Pre-flight CONFLICT (type={}): {}".format(
+                        _preflight.get("type"),
+                        (_preflight.get("description") or "")[:200]))
+                    return _preflight
+                _r3_result = _run_with_ui_pump(
+                    fire_safety_logic.solve_optimal_staircase_layout,
+                    _r3_banks_info,
+                    _fp_pts_pre,
+                    shell.get("footprint_holes", []),
+                    _max_travel,
+                    typical_h_mm,
+                    additional_obstacles=None,
+                    num_required=2,
+                    top_n_for_gemini=4,
+                    try_gemini=True,
+                )
+            except Exception as _r3_e:
+                self.log("[R3] solve_optimal_staircase_layout raised {}; falling "
+                         "back to legacy logic".format(_r3_e))
+                _r3_result = None
+
+        # solve_optimal_staircase_layout may also return a CONFLICT dict if the
+        # pre-flight inside the solver fired (e.g. when called from a different
+        # caller that didn't pre-check).  Bubble it up to the dispatcher.
+        if isinstance(_r3_result, dict) and _r3_result.get("status") == "CONFLICT":
+            self.log("[R3] Solver returned CONFLICT (type={}): {}".format(
+                _r3_result.get("type"),
+                (_r3_result.get("description") or "")[:200]))
+            return _r3_result
+
+        if _r3_result and _r3_result.get("safety_sets"):
+            _safety_sets_pre = _r3_result["safety_sets"]
+            self.log("[R3] Using R3 optimal layout: {} stairs ({} fire-lift, {} perimeter)".format(
+                len(_safety_sets_pre),
+                sum(1 for s in _safety_sets_pre if not s.get("is_perimeter")),
+                sum(1 for s in _safety_sets_pre if s.get("is_perimeter"))))
+            # Cache the pre-pass result + the inputs that produced it. The
+            # exec-time R3 call (later in this method) reuses this when the
+            # inputs match, eliminating a duplicate ~30s solver run + Gemini
+            # call. Inputs hashed: footprint, holes, max_travel, banks_info.
+            try:
+                _r3_pre_cache_key = {
+                    "fp": tuple((round(p[0], 3), round(p[1], 3)) for p in (_fp_pts_pre or [])),
+                    "holes": tuple(
+                        tuple((round(p[0], 3), round(p[1], 3)) for p in (h or []))
+                        for h in (shell.get("footprint_holes", []) or [])
+                    ),
+                    "max_travel": float(_max_travel),
+                    "banks": tuple(
+                        (b["bank_idx"], b["num_lifts"],
+                         tuple(round(x, 3) for x in b["lift_core_bounds_mm"]))
+                        for b in _r3_banks_info
+                    ),
+                }
+                manifest["_r3_pre_cache"] = {
+                    "key": _r3_pre_cache_key,
+                    "result": _r3_result,
+                }
+            except Exception as _r3_cache_e:
+                self.log("[R3] pre-pass cache build failed ({}); exec-pass will recompute".format(
+                    _r3_cache_e))
+
+        # ── Legacy path (fallback when R3 disabled or returns None) ───────────
+        # For multi-bank layouts, run each bank's fire-safety analysis with
+        # skip_perimeter=True (FIRE_LIFT sets only), then run a SINGLE global
+        # perimeter check over the union of all banks' stair centres. This
+        # avoids per-bank duplication of perimeter SMOKE_STOP stairs when the
+        # union already provides 2-stair coverage everywhere.
         _banks_cfg_pre = lifts_config.get("banks", [])
-        if _banks_cfg_pre:
-            _all_sets_pre = []
+        if _safety_sets_pre is not None:
+            # R3 already produced a result; skip legacy path entirely.
+            pass
+        elif _banks_cfg_pre:
+            _all_fire_sets = []
+            _all_stair_pos = []  # union across banks (stair centres, not entry positions)
+            _all_lift_core_obstacles = []  # union of bank lift-core polygons for wall-routed travel
+            _max_travel = (_cp_overrides.get("max_travel_distance_sprinklered_mm")
+                           or _cp_overrides.get("max_travel_distance_mm")
+                           or 60000)
             for _bk_p in _banks_cfg_pre:
                 _bk_p_pos = _bk_p.get("position", [f_center_mm[0], f_center_mm[1]])
                 _bk_p_cx, _bk_p_cy = float(_bk_p_pos[0]), float(_bk_p_pos[1])
@@ -4537,10 +4954,38 @@ class RevitWorkers:
                     footprint_pts=_fp_pts_pre,
                     footprint_holes=shell.get("footprint_holes", []),
                     orientation=_bk_p_orient,
-                    num_banks=len(_banks_cfg_pre)
+                    num_banks=len(_banks_cfg_pre),
+                    skip_perimeter=True,
                 )
-                _all_sets_pre.extend(_bk_p_sets)
-            _safety_sets_pre = _all_sets_pre
+                _all_fire_sets.extend(_bk_p_sets)
+                # Determine effective EW/NS for stair-centre derivation. Mirrors
+                # the same auto-selection logic used inside
+                # calculate_fire_safety_requirements when orientation="AUTO".
+                _sw_nat, _sd_nat = staircase_logic.get_shaft_dimensions(typical_h_mm, None)
+                _bk_use_ew = fire_safety_logic._should_use_ew_orientation(
+                    _bk_p_lcb, _sw_nat, _sd_nat,
+                    orientation=_bk_p_orient, floor_dims=_pre_floor_dims)
+                _bk_stair_centres = fire_safety_logic.stair_centres_from_fire_lift_sets(
+                    _bk_p_sets, _bk_p_lcb, typical_h_mm, use_ew=_bk_use_ew)
+                _all_stair_pos.extend(_bk_stair_centres)
+                # Collect this bank's lift-core rectangle for the global perimeter pass
+                # so wall-routed travel distance correctly routes around lift cores.
+                _all_lift_core_obstacles.append([
+                    [_bk_p_lcb[0], _bk_p_lcb[1]], [_bk_p_lcb[2], _bk_p_lcb[1]],
+                    [_bk_p_lcb[2], _bk_p_lcb[3]], [_bk_p_lcb[0], _bk_p_lcb[3]],
+                ])
+            self.log("[FireSafety] Multi-bank pre-pass: {} banks -> {} FIRE_LIFT sets, "
+                     "{} union stair centres".format(
+                         len(_banks_cfg_pre), len(_all_fire_sets), len(_all_stair_pos)))
+            _perim_sets = fire_safety_logic.add_perimeter_for_coverage(
+                _all_stair_pos, _pre_floor_dims, _max_travel,
+                typical_floor_height_mm=typical_h_mm,
+                footprint_pts=_fp_pts_pre,
+                footprint_holes=shell.get("footprint_holes", []),
+                core_center_mm=_f_center_pre,
+                obstacle_polygons=_all_lift_core_obstacles,
+            )
+            _safety_sets_pre = _all_fire_sets + _perim_sets
         else:
             _layout_pre = lift_logic.get_total_core_layout(num_lifts, lobby_width=lobby_w)
             _lift_bounds_pre = (
@@ -4558,8 +5003,42 @@ class RevitWorkers:
                 orientation=_core_orientation
             )
         _num_stairs_from_travel = max(len(_safety_sets_pre), 2)
+        self.log("[StairCount] Engine wants {} staircase(s) from fire-safety analysis".format(_num_stairs_from_travel))
+
+        # Soft cap: honour manifest.staircases.count when it is >= SCDF minimum (2)
+        # and the engine wanted MORE than the manifest specified. Trim perimeter
+        # SMOKE_STOPs first (least essential — engine added them as overflow);
+        # never trim FIRE_LIFT-attached sets since those are fire-code mandatory.
+        _manifest_stair_count = int(safe_num(manifest.get("staircases", {}).get("count"), 0))
+        if _manifest_stair_count >= 2 and _num_stairs_from_travel > _manifest_stair_count:
+            _fl_sets = [s for s in _safety_sets_pre if not s.get("is_perimeter")]
+            _pm_sets = [s for s in _safety_sets_pre if s.get("is_perimeter")]
+            _keep_pm = max(0, _manifest_stair_count - len(_fl_sets))
+            if _keep_pm < len(_pm_sets):
+                self.log("[StairCount] Manifest count={} < engine count={}; trimming {} "
+                         "perimeter SMOKE_STOP(s) to honour manifest cap.".format(
+                             _manifest_stair_count, _num_stairs_from_travel,
+                             len(_pm_sets) - _keep_pm))
+                _safety_sets_pre = _fl_sets + _pm_sets[:_keep_pm]
+                _num_stairs_from_travel = max(len(_safety_sets_pre), 2)
+
         _num_stairs = _num_stairs_from_travel
-        self.log("[StairCount] Travel-distance compliance requires {} staircases".format(_num_stairs_from_travel))
+        self.log("[StairCount] Final staircase count = {}".format(_num_stairs))
+
+        # ── Refresh the R3 pre-pass cache with the TRIMMED safety_sets ────────
+        # The cache stashed earlier at the R3 call site holds the raw 4-set R3
+        # output; if we stop there, the single-bank exec path at phase 3a would
+        # rebuild 4 sets even though we already trimmed to manifest.count above.
+        # Replace the cached safety_sets with the trimmed list so the exec path
+        # honours the same cap.
+        _existing_cache = manifest.get("_r3_pre_cache")
+        if _existing_cache and isinstance(_existing_cache.get("result"), dict):
+            try:
+                _existing_cache["result"] = dict(_existing_cache["result"])
+                _existing_cache["result"]["safety_sets"] = list(_safety_sets_pre)
+            except Exception as _e_cache:
+                self.log("[R3] cache trim refresh failed ({}); single-bank exec path "
+                         "may recompute".format(_e_cache))
 
         # --- Staircase width calculation (SCDF Table 2.2A method) ---
         # Uses the largest floor plate so the worst-case occupant load governs.
@@ -4586,11 +5065,30 @@ class RevitWorkers:
         _persons_per_unit     = safe_num(cp.get("persons_per_unit_width"), 0) or \
                                 safe_num(_exit_nested.get("persons_per_unit_width"), 0)
 
+        # Typology-aware fallbacks when RAG missed these stair-width inputs.
+        if _occupant_load_factor <= 0:
+            _olf_default = _typology_default(_typology_for_fs, "occupant_load_factor_m2", 0)
+            if _olf_default > 0:
+                _occupant_load_factor = _olf_default
+                self.log("[ComplianceOverride] occupant_load_factor_m2 fallback to typology "
+                         "default {} m²/p (RAG missed; typology={})".format(
+                             _olf_default, _typology_for_fs))
+        if _persons_per_unit <= 0:
+            _ppu_default = _typology_default(_typology_for_fs, "persons_per_unit_width", 0)
+            if _ppu_default > 0:
+                _persons_per_unit = _ppu_default
+                self.log("[ComplianceOverride] persons_per_unit_width fallback to typology "
+                         "default {} (RAG missed; typology={})".format(
+                             _ppu_default, _typology_for_fs))
+        if _exit_width_per_unit <= 0:
+            # Cl.2.2.5a defines this as 500mm always — safe to hardcode
+            _exit_width_per_unit = 500
+
         _calc_flight_width = None
         if _occupant_load_factor > 0 and _persons_per_unit > 0 and _exit_width_per_unit > 0 and floor_dims:
             # Largest floor plate (mm -> m2) — use actual polygon area when available
             if _fp_pts_early and len(_fp_pts_early) >= 3:
-                _largest_area_mm2 = _poly_area_mm2(_fp_pts_early)
+                _largest_area_mm2 = _net_floor_area_mm2(_fp_pts_early, shell.get("footprint_holes"))
             else:
                 _largest_area_mm2 = max(w * l for w, l in floor_dims)
             _largest_area_m2   = _largest_area_mm2 / 1e6
@@ -4773,14 +5271,53 @@ class RevitWorkers:
             float(lift_core_bounds_mm[3] - lift_core_bounds_mm[1]),
             _core_orientation))
 
-        safety_sets = fire_safety_logic.calculate_fire_safety_requirements(
-            _stair_floor_dims, f_center_mm, lift_core_bounds_mm,
-            typical_h_mm, preset_fs, num_lifts, lobby_w,
-            compliance_overrides=_cp_overrides,
-            footprint_pts=_fp_pts,
-            footprint_holes=shell.get("footprint_holes", []),
-            orientation=_core_orientation
-        )
+        # ── Reuse pre-pass R3 result when inputs match (single-bank path) ─────
+        # Phase 3a's pre-pass already ran solve_optimal_staircase_layout and
+        # cached the chosen safety_sets onto manifest["_r3_pre_cache"].  When
+        # inputs match the legacy calculate_fire_safety_requirements call here
+        # would produce a DIFFERENT layout (the legacy code adds perimeter
+        # SMOKE_STOPs along the building edges based on the rectangular travel
+        # test, while R3 picks coverage-optimal positions).  That divergence
+        # caused the bug where R3 picked 4 stairs at (32725,76900),(32725,80000),
+        # (31250,6250),(43750,18750) but the legacy path then placed 5 stairs at
+        # (50000,70600),(50000,89400),(50000,0),(0,50000),(100000,50000).  Use
+        # R3's result so the entire build pipeline sees a single, consistent
+        # set of safety stairs.
+        _exec_max_travel_lookup = (_cp_overrides.get("max_travel_distance_sprinklered_mm")
+                                    or _cp_overrides.get("max_travel_distance_mm")
+                                    or 60000)
+        _single_bank_cache_key = {
+            "fp": tuple((round(p[0], 3), round(p[1], 3)) for p in (_fp_pts or [])),
+            "holes": tuple(
+                tuple((round(p[0], 3), round(p[1], 3)) for p in (h or []))
+                for h in (shell.get("footprint_holes", []) or [])
+            ),
+            "max_travel": float(_exec_max_travel_lookup),
+            "banks": ((0, num_lifts,
+                        tuple(round(x, 3) for x in lift_core_bounds_mm)),),
+        }
+        _pre_cache_sb = manifest.get("_r3_pre_cache")
+        safety_sets = None
+        if _pre_cache_sb and _pre_cache_sb.get("key") == _single_bank_cache_key:
+            _cached_result = _pre_cache_sb.get("result") or {}
+            _cached_sets = _cached_result.get("safety_sets")
+            if _cached_sets:
+                safety_sets = list(_cached_sets)
+                self.log("[R3.Exec] Reusing pre-pass R3 result (single-bank inputs match) — "
+                         "{} sets, skipping calculate_fire_safety_requirements".format(
+                             len(safety_sets)))
+        if safety_sets is None:
+            if _pre_cache_sb:
+                self.log("[R3.Exec] Pre-pass cache present but single-bank inputs differ; "
+                         "falling back to calculate_fire_safety_requirements")
+            safety_sets = fire_safety_logic.calculate_fire_safety_requirements(
+                _stair_floor_dims, f_center_mm, lift_core_bounds_mm,
+                typical_h_mm, preset_fs, num_lifts, lobby_w,
+                compliance_overrides=_cp_overrides,
+                footprint_pts=_fp_pts,
+                footprint_holes=shell.get("footprint_holes", []),
+                orientation=_core_orientation
+            )
         self.log("[CoreSetup] safety_sets returned: {} sets: {}".format(
             len(safety_sets),
             [(s["type"], "({:.0f},{:.0f})".format(float(s["pos"][0]), float(s["pos"][1])),
@@ -4995,6 +5532,251 @@ class RevitWorkers:
             if "walls" not in manifest: manifest["walls"] = []
             if "floors" not in manifest: manifest["floors"] = []
 
+            # ── R3: Try unified solver at execution time ─────────────────────
+            # Mirrors the pre-pass R3 invocation. If R3 produces a result, we
+            # populate _exec_bank_sets_cache directly from it and skip the
+            # legacy per-bank perimeter pass.
+            _exec_bank_sets_cache = None
+            _exec_max_travel = (_cp_overrides.get("max_travel_distance_sprinklered_mm")
+                                or _cp_overrides.get("max_travel_distance_mm")
+                                or 60000)
+            if getattr(fire_safety_logic, "USE_R3_OPTIMAL_LAYOUT", False):
+                try:
+                    _r3_exec_banks_info = []
+                    for _bki_e, _bk_e in enumerate(_banks_cfg):
+                        _bk_pos_e = _bk_e.get("position", [0, 0])
+                        _bk_cx_e = float(_bk_pos_e[0])
+                        _bk_cy_e = float(_bk_pos_e[1])
+                        _svg_off_e = manifest.get("shell", {}).get("_svg_offset")
+                        if _svg_off_e and (_bk_cx_e != 0.0 or _bk_cy_e != 0.0):
+                            _bk_cx_e -= float(_svg_off_e[0])
+                            _bk_cy_e -= float(_svg_off_e[1])
+                        _bk_n_e = int(safe_num(
+                            _bk_e.get("count", max(1, num_lifts // max(len(_banks_cfg), 1))), 1))
+                        _bk_orient_e = str(_bk_e.get("orientation", _core_orientation)).upper()
+                        if _bk_orient_e not in ("NS", "EW", "AUTO"):
+                            _bk_orient_e = _core_orientation
+                        _bk_layout_e = lift_logic.get_total_core_layout(_bk_n_e, lobby_width=lobby_w)
+                        _bk_lcb_e = (
+                            _bk_cx_e - _bk_layout_e["total_w"] / 2.0,
+                            _bk_cy_e - _bk_layout_e["total_d"] / 2.0,
+                            _bk_cx_e + _bk_layout_e["total_w"] / 2.0,
+                            _bk_cy_e + _bk_layout_e["total_d"] / 2.0,
+                        )
+                        _r3_exec_banks_info.append({
+                            "bank_idx": _bki_e,
+                            "lift_core_bounds_mm": _bk_lcb_e,
+                            "center_mm": (_bk_cx_e, _bk_cy_e),
+                            "num_lifts": _bk_n_e,
+                            "orientation": _bk_orient_e,
+                        })
+                    # Try to reuse the pre-pass result if its inputs match.
+                    _r3_exec_result = None
+                    _exec_cache_key = {
+                        "fp": tuple((round(p[0], 3), round(p[1], 3)) for p in (_fp_pts or [])),
+                        "holes": tuple(
+                            tuple((round(p[0], 3), round(p[1], 3)) for p in (h or []))
+                            for h in (shell.get("footprint_holes", []) or [])
+                        ),
+                        "max_travel": float(_exec_max_travel),
+                        "banks": tuple(
+                            (b["bank_idx"], b["num_lifts"],
+                             tuple(round(x, 3) for x in b["lift_core_bounds_mm"]))
+                            for b in _r3_exec_banks_info
+                        ),
+                    }
+                    _pre_cache = manifest.get("_r3_pre_cache")
+                    if _pre_cache and _pre_cache.get("key") == _exec_cache_key:
+                        _r3_exec_result = _pre_cache.get("result")
+                        self.log("[R3.Exec] Reusing pre-pass R3 result (inputs match); "
+                                 "skipping duplicate solver + Gemini call")
+                    else:
+                        if _pre_cache:
+                            self.log("[R3.Exec] Pre-pass cache present but inputs differ; "
+                                     "running R3 solver fresh")
+                        # Pre-flight before the fresh solver run — same fast-fail
+                        # as the pre-pass site, so a Gemini-corrected manifest
+                        # whose bank still overlaps a hole bubbles a CONFLICT
+                        # immediately instead of paying a second R3+Gemini round.
+                        _exec_preflight = fire_safety_logic.check_bank_placement_conflicts(
+                            _r3_exec_banks_info, _fp_pts,
+                            shell.get("footprint_holes", []))
+                        if _exec_preflight is not None:
+                            self.log("[R3.Exec] Pre-flight CONFLICT (type={}): {}".format(
+                                _exec_preflight.get("type"),
+                                (_exec_preflight.get("description") or "")[:200]))
+                            return _exec_preflight
+                        _r3_exec_result = _run_with_ui_pump(
+                            fire_safety_logic.solve_optimal_staircase_layout,
+                            _r3_exec_banks_info,
+                            _fp_pts,
+                            shell.get("footprint_holes", []),
+                            _exec_max_travel,
+                            typical_h_mm,
+                            additional_obstacles=None,
+                            num_required=2,
+                            top_n_for_gemini=4,
+                            try_gemini=True,
+                        )
+                    # solve_optimal_staircase_layout may itself return a CONFLICT dict
+                    # via its own pre-flight (defence in depth).  Bubble it up.
+                    if isinstance(_r3_exec_result, dict) and _r3_exec_result.get("status") == "CONFLICT":
+                        self.log("[R3.Exec] Solver returned CONFLICT (type={}): {}".format(
+                            _r3_exec_result.get("type"),
+                            (_r3_exec_result.get("description") or "")[:200]))
+                        return _r3_exec_result
+                    if _r3_exec_result and _r3_exec_result.get("safety_sets"):
+                        # Group R3 stairs by bank_idx (-1 = perimeter stairs go to nearest bank)
+                        _exec_bank_sets_cache = {bk["bank_idx"]: [] for bk in _r3_exec_banks_info}
+                        for _s in _r3_exec_result["safety_sets"]:
+                            _bidx = _s.get("bank_idx", -1)
+                            if _bidx >= 0 and _bidx in _exec_bank_sets_cache:
+                                _exec_bank_sets_cache[_bidx].append(_s)
+                            else:
+                                # Perimeter stair: assign to nearest bank
+                                _px, _py = _s["pos"]
+                                _nearest = min(
+                                    _r3_exec_banks_info,
+                                    key=lambda b: ((b["center_mm"][0] - _px) ** 2
+                                                   + (b["center_mm"][1] - _py) ** 2),
+                                )
+                                _exec_bank_sets_cache[_nearest["bank_idx"]].append(_s)
+                        self.log("[R3.Exec] Using R3 layout: {} stairs distributed: {}".format(
+                            len(_r3_exec_result["safety_sets"]),
+                            {k: len(v) for k, v in _exec_bank_sets_cache.items()}))
+                except Exception as _r3_exec_e:
+                    self.log("[R3.Exec] solve_optimal_staircase_layout raised {}; "
+                             "falling back to legacy logic".format(_r3_exec_e))
+                    _exec_bank_sets_cache = None
+
+            # ── EXECUTION-TIME GLOBAL PERIMETER PASS (legacy) ────────────────────
+            # Used when R3 disabled or returned no result. Mirror the pre-pass
+            # pattern (R1 Fix 1) at execution time: collect FIRE_LIFT sets from
+            # all banks first (skip_perimeter=True), then run ONE global
+            # perimeter check over the union of stair centres.
+            if _exec_bank_sets_cache is not None:
+                # R3 already populated the cache. Build minimal _exec_per_bank_meta
+                # so downstream code (lookups by idx) still works, but skip the
+                # per-bank fire-safety calls and the perimeter pass.
+                _exec_per_bank_meta = []
+                _exec_lift_obstacles = []
+                for _bk_idx_l, _bk_l in enumerate(_banks_cfg):
+                    _bk_pos_l = _bk_l.get("position", [0, 0])
+                    _bk_cx_l = float(_bk_pos_l[0])
+                    _bk_cy_l = float(_bk_pos_l[1])
+                    _svg_off_l = manifest.get("shell", {}).get("_svg_offset")
+                    if _svg_off_l and (_bk_cx_l != 0.0 or _bk_cy_l != 0.0):
+                        _bk_cx_l -= float(_svg_off_l[0])
+                        _bk_cy_l -= float(_svg_off_l[1])
+                    _bk_n_l = int(safe_num(
+                        _bk_l.get("count", max(1, num_lifts // max(len(_banks_cfg), 1))), 1))
+                    _bk_layout_l = lift_logic.get_total_core_layout(_bk_n_l, lobby_width=lobby_w)
+                    _bk_lcb_l = (
+                        _bk_cx_l - _bk_layout_l["total_w"] / 2.0,
+                        _bk_cy_l - _bk_layout_l["total_d"] / 2.0,
+                        _bk_cx_l + _bk_layout_l["total_w"] / 2.0,
+                        _bk_cy_l + _bk_layout_l["total_d"] / 2.0,
+                    )
+                    _exec_per_bank_meta.append({
+                        "idx": _bk_idx_l, "cx": _bk_cx_l, "cy": _bk_cy_l,
+                        "lcb": _bk_lcb_l,
+                        "fl_sets": [s for s in _exec_bank_sets_cache.get(_bk_idx_l, [])
+                                    if not s.get("is_perimeter")],
+                    })
+                    _exec_lift_obstacles.append([
+                        [_bk_lcb_l[0], _bk_lcb_l[1]], [_bk_lcb_l[2], _bk_lcb_l[1]],
+                        [_bk_lcb_l[2], _bk_lcb_l[3]], [_bk_lcb_l[0], _bk_lcb_l[3]],
+                    ])
+                # Skip the legacy per-bank loop since R3 already produced sets.
+                # The main loop below uses _exec_bank_sets_cache.
+                _exec_legacy_skip = True
+            else:
+                _exec_legacy_skip = False
+                _exec_all_stair_pos = []      # union of stair centres (used by R2-T2 wall-routing)
+                _exec_lift_obstacles = []     # all banks' lift core polygons (R2-T2 obstacles)
+                _exec_per_bank_meta = []      # per-bank info: cx, cy, lcb, sets (FIRE_LIFT only)
+            if not _exec_legacy_skip:
+                for _bk_idx, _bk in enumerate(_banks_cfg):
+                    _bk_pos_p = _bk.get("position", [0, 0])
+                    _bk_cx_p = float(_bk_pos_p[0])
+                    _bk_cy_p = float(_bk_pos_p[1])
+                    _svg_off_p = manifest.get("shell", {}).get("_svg_offset")
+                    if _svg_off_p and (_bk_cx_p != 0.0 or _bk_cy_p != 0.0):
+                        _bk_cx_p -= float(_svg_off_p[0])
+                        _bk_cy_p -= float(_svg_off_p[1])
+                    _bk_n_p = int(safe_num(_bk.get("count", max(1, num_lifts // max(len(_banks_cfg), 1))), 1))
+                    _bk_orient_p = str(_bk.get("orientation", _core_orientation)).upper()
+                    if _bk_orient_p not in ("NS", "EW", "AUTO"):
+                        _bk_orient_p = _core_orientation
+                    _bk_layout_p = lift_logic.get_total_core_layout(_bk_n_p, lobby_width=lobby_w)
+                    _bk_lcb_p = (
+                        _bk_cx_p - _bk_layout_p["total_w"] / 2.0,
+                        _bk_cy_p - _bk_layout_p["total_d"] / 2.0,
+                        _bk_cx_p + _bk_layout_p["total_w"] / 2.0,
+                        _bk_cy_p + _bk_layout_p["total_d"] / 2.0,
+                    )
+                    _bk_sets_fl = fire_safety_logic.calculate_fire_safety_requirements(
+                        _stair_floor_dims, [_bk_cx_p, _bk_cy_p], _bk_lcb_p,
+                        typical_h_mm, preset_fs, _bk_n_p, lobby_w,
+                        compliance_overrides=_cp_overrides,
+                        footprint_pts=_fp_pts,
+                        footprint_holes=shell.get("footprint_holes", []),
+                        orientation=_bk_orient_p,
+                        num_banks=len(_banks_cfg),
+                        skip_perimeter=True,
+                    )
+                    _sw_p, _sd_p = staircase_logic.get_shaft_dimensions(typical_h_mm, None)
+                    _use_ew_p = fire_safety_logic._should_use_ew_orientation(
+                        _bk_lcb_p, _sw_p, _sd_p,
+                        orientation=_bk_orient_p, floor_dims=_stair_floor_dims)
+                    _bk_centres_p = fire_safety_logic.stair_centres_from_fire_lift_sets(
+                        _bk_sets_fl, _bk_lcb_p, typical_h_mm, use_ew=_use_ew_p)
+                    _exec_all_stair_pos.extend(_bk_centres_p)
+                    _exec_lift_obstacles.append([
+                        [_bk_lcb_p[0], _bk_lcb_p[1]], [_bk_lcb_p[2], _bk_lcb_p[1]],
+                        [_bk_lcb_p[2], _bk_lcb_p[3]], [_bk_lcb_p[0], _bk_lcb_p[3]],
+                    ])
+                    _exec_per_bank_meta.append({
+                        "idx": _bk_idx, "cx": _bk_cx_p, "cy": _bk_cy_p,
+                        "lcb": _bk_lcb_p, "fl_sets": _bk_sets_fl,
+                    })
+                # Run global perimeter pass over the union of all banks' stairs
+                _exec_perim_sets = fire_safety_logic.add_perimeter_for_coverage(
+                    _exec_all_stair_pos, _stair_floor_dims, _exec_max_travel,
+                    typical_floor_height_mm=typical_h_mm,
+                    footprint_pts=_fp_pts,
+                    footprint_holes=shell.get("footprint_holes", []),
+                    core_center_mm=[f_center_mm[0], f_center_mm[1]],
+                    obstacle_polygons=_exec_lift_obstacles,
+                )
+                # Distribute each perimeter set to the bank with the closest centre.
+                _exec_perim_by_bank = {m["idx"]: [] for m in _exec_per_bank_meta}
+                for _ps in _exec_perim_sets:
+                    _px, _py = _ps["pos"]
+                    _ranked = sorted(
+                        _exec_per_bank_meta,
+                        key=lambda m: (m["cx"] - _px) ** 2 + (m["cy"] - _py) ** 2,
+                    )
+                    _nearest = _ranked[0]
+                    _nearest_idx = _nearest["idx"]
+                    _dist_to_nearest = ((_nearest["cx"] - _px) ** 2 + (_nearest["cy"] - _py) ** 2) ** 0.5
+                    _exec_perim_by_bank[_nearest_idx].append(_ps)
+                    self.log("[FireSafety] perimeter set at ({:.0f},{:.0f}) assigned to bank "
+                             "{} (centre at ({:.0f},{:.0f}), distance {:.0f}mm)".format(
+                                 _px, _py, _nearest_idx, _nearest["cx"], _nearest["cy"],
+                                 _dist_to_nearest))
+                self.log("[FireSafety] Multi-bank execution: {} banks -> {} FIRE_LIFT sets, "
+                         "{} global perimeter SMOKE_STOPs distributed: {}".format(
+                             len(_banks_cfg),
+                             sum(len(m["fl_sets"]) for m in _exec_per_bank_meta),
+                             len(_exec_perim_sets),
+                             {k: len(v) for k, v in _exec_perim_by_bank.items()}))
+                # Cache the per-bank set assignments
+                _exec_bank_sets_cache = {
+                    m["idx"]: list(m["fl_sets"]) + _exec_perim_by_bank[m["idx"]]
+                    for m in _exec_per_bank_meta
+                }
+
             for _bk_idx, _bk in enumerate(_banks_cfg):
                 _bk_pos = _bk.get("position", [0, 0])
                 _bk_cx = float(_bk_pos[0])
@@ -5030,15 +5812,12 @@ class RevitWorkers:
                     _bk_lcb[2] - _bk_lcb[0], _bk_lcb[3] - _bk_lcb[1],
                     float(_bk_layout["total_w"]), float(_bk_layout["total_d"])))
 
-                _bk_sets = fire_safety_logic.calculate_fire_safety_requirements(
-                    _stair_floor_dims, [_bk_cx, _bk_cy], _bk_lcb,
-                    typical_h_mm, preset_fs, _bk_n, lobby_w,
-                    compliance_overrides=_cp_overrides,
-                    footprint_pts=_fp_pts,
-                    footprint_holes=shell.get("footprint_holes", []),
-                    orientation=_bk_orientation,
-                    num_banks=len(_banks_cfg)
-                )
+                # Use the FIRE_LIFT-only sets + globally-assigned perimeter sets
+                # from the execution-time pre-pass above. This replaces the
+                # previous per-bank call to calculate_fire_safety_requirements
+                # which would re-run the per-bank perimeter logic and produce
+                # redundant SMOKE_STOPs.
+                _bk_sets = list(_exec_bank_sets_cache.get(_bk_idx, []))
                 if _offset_ovr:
                     _bk_sets = [s for s in _bk_sets if not s.get("is_perimeter", False)]
                 self.log("[BankSetup] Bank {} sets ({}): {}".format(
@@ -5396,10 +6175,26 @@ class RevitWorkers:
                         self.log("[BankAlign] Bank {}: x-aligned {:.0f}mm east within arm-group (walls+floors+voids+doors+stairs+lcb)".format(_bidx, dx_al))
 
             # Now merge all per-bank data into combined lists
+            _walls_before_merge = len(manifest.get("walls", []))
+            _floors_before_merge = len(manifest.get("floors", []))
             for _bk_wls in _per_bank_walls:
                 manifest["walls"].extend(_bk_wls)
             for _bk_fls in _per_bank_floors:
                 manifest["floors"].extend(_bk_fls)
+            self.log("[MultiBank-Merge] manifest walls: {} → {} (added {} from {} banks); "
+                     "floors: {} → {} (added {})".format(
+                         _walls_before_merge, len(manifest["walls"]),
+                         len(manifest["walls"]) - _walls_before_merge,
+                         len(_per_bank_walls),
+                         _floors_before_merge, len(manifest["floors"]),
+                         len(manifest["floors"]) - _floors_before_merge))
+            # Sample the first wall in the merged list so we can verify its shape
+            # (id prefix, level_id, start/end coords) is what _process_granular_walls expects.
+            if manifest.get("walls") and len(manifest["walls"]) > _walls_before_merge:
+                _w0 = manifest["walls"][_walls_before_merge]
+                self.log("[MultiBank-Merge] sample bank wall: id={} level_id={} start={} end={}".format(
+                    _w0.get("id"), _w0.get("level_id"),
+                    _w0.get("start"), _w0.get("end")))
             for _bk_ds in _per_bank_door_specs:
                 _bk_all_door_specs.extend(_bk_ds)
             for _bidx2, _pbs in enumerate(_per_bank_stair_sc):

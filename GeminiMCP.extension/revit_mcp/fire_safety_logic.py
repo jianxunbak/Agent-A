@@ -34,6 +34,18 @@ _SMOKE_CLEAR_D  = _PERIMETER_C.get("smoke_stop_lobby_clear_depth_mm",      2000)
 from . import lift_logic
 
 
+# ── R3 Feature Flag ────────────────────────────────────────────────────────────
+# When True, use the new unified solve_optimal_staircase_layout algorithm:
+# - Generates candidate stair pairs (1-per-bank first, then asymmetric).
+# - Picks the configuration with best floor coverage.
+# - Escalates by adding stairs (coverage-maximising greedy) when 2 don't suffice.
+# - Surfaces top configurations + shift ranges to Gemini for architectural pick.
+# When False, falls back to the legacy per-bank logic
+# (calculate_fire_safety_requirements + add_perimeter_for_coverage path).
+# Set to False to disable R3 entirely if regressions appear.
+USE_R3_OPTIMAL_LAYOUT = True
+
+
 def _fsl_log(msg):
     try:
         import os, time
@@ -752,7 +764,8 @@ def calculate_fire_safety_requirements(floor_dims_mm, core_center_mm, lift_core_
                                        typical_floor_height_mm, _preset_fs, num_lifts,
                                        lobby_width=3000, compliance_overrides=None,
                                        footprint_pts=None, footprint_holes=None,
-                                       orientation="AUTO", num_banks=1):
+                                       orientation="AUTO", num_banks=1,
+                                       skip_perimeter=False):
     """Determine positions and types for fire safety cores.
 
     Returns list of dicts: {"pos": (x, y), "type": "FIRE_LIFT"|"SMOKE_STOP"}
@@ -765,6 +778,12 @@ def calculate_fire_safety_requirements(floor_dims_mm, core_center_mm, lift_core_
     compliance_overrides: dict of RAG-derived values that override the static
         module constants (e.g. {"max_travel_distance_mm": 60000, "fire_lift_car_size_mm": 2500}).
         Falls back to module constants for any key not present.
+
+    skip_perimeter: when True, return only the FIRE_LIFT sets without running
+        the perimeter SMOKE_STOP coverage search. Used by the multi-bank pre-pass
+        in revit_workers.py so the perimeter check can be done ONCE globally
+        over the union of all banks' stairs (call add_perimeter_for_coverage
+        afterwards). Avoids per-bank duplication of perimeter stairs.
     """
     co = compliance_overrides or {}
     max_travel_dist = (co.get("max_travel_distance_sprinklered_mm")
@@ -812,6 +831,15 @@ def calculate_fire_safety_requirements(floor_dims_mm, core_center_mm, lift_core_
     l_xmin, l_ymin, l_xmax, l_ymax = lift_core_bounds_mm
     lift_core_cx = (l_xmin + l_xmax) / 2.0
     lift_core_cy = (l_ymin + l_ymax) / 2.0
+
+    # Build the lift-core obstacle polygon so wall-routed travel distance
+    # correctly forces paths around the lift shaft (people can't walk through
+    # the lift core). Stair/lobby walls are NOT obstacles per design.
+    _lift_core_obstacle = [
+        [l_xmin, l_ymin], [l_xmax, l_ymin],
+        [l_xmax, l_ymax], [l_xmin, l_ymax],
+    ]
+    _bank_obstacles = [_lift_core_obstacle]
 
     # Determine whether EW or NS placement gives a more compact core
     _typ_h = typical_floor_height_mm or 4000
@@ -882,7 +910,8 @@ def calculate_fire_safety_requirements(floor_dims_mm, core_center_mm, lift_core_
                             _sp1, floor_dims_mm, max_travel_dist,
                             num_required=1,
                             footprint_pts=_fp_use,
-                            footprint_holes=_fp_holes_use):
+                            footprint_holes=_fp_holes_use,
+                            obstacle_polygons=_bank_obstacles):
                         final_sets.append(_candidate_single)
                         _fsl_log("[FireReqs] EW single-set satisfies travel: pos={}".format(
                             _candidate_single["pos"]))
@@ -906,8 +935,20 @@ def calculate_fire_safety_requirements(floor_dims_mm, core_center_mm, lift_core_
         [(round(p[0]), round(p[1])) for p in stair_pos]))
 
     if staircase_logic._check_travel_distance(stair_pos, floor_dims_mm, max_travel_dist,
-                                              footprint_pts=_fp_use):
+                                              footprint_pts=_fp_use,
+                                              footprint_holes=_fp_holes_use,
+                                              obstacle_polygons=_bank_obstacles):
         _fsl_log("[FireReqs] RETURN {} sets: {}".format(
+            len(final_sets), [(s["type"], s["pos"]) for s in final_sets]))
+        return final_sets
+
+    # Multi-bank pre-pass: caller will run a single global perimeter check
+    # over the union of stairs from all banks (see add_perimeter_for_coverage).
+    # Return FIRE_LIFT sets only, even though travel distance has not been
+    # satisfied by this bank alone — the OTHER bank's stairs may close the gap.
+    if skip_perimeter:
+        _fsl_log("[FireReqs] RETURN {} FIRE_LIFT sets (skip_perimeter=True; perimeter "
+                 "check deferred to global pass): {}".format(
             len(final_sets), [(s["type"], s["pos"]) for s in final_sets]))
         return final_sets
 
@@ -1004,7 +1045,8 @@ def calculate_fire_safety_requirements(floor_dims_mm, core_center_mm, lift_core_
     for try_hl in _unique_dims:
         if staircase_logic._check_travel_distance(all_stair_pos, floor_dims_mm, max_travel_dist,
                                                    footprint_pts=_fp_use,
-                                                   footprint_holes=_fp_holes_use):
+                                                   footprint_holes=_fp_holes_use,
+                                                   obstacle_polygons=_bank_obstacles):
             break  # already compliant from central stairs alone
 
         # Build candidates: polygon-interior grid points (irregular shapes) or
@@ -1042,7 +1084,8 @@ def calculate_fire_safety_requirements(floor_dims_mm, core_center_mm, lift_core_
         while perim_candidates:
             if staircase_logic._check_travel_distance(all_stair_pos, floor_dims_mm, max_travel_dist,
                                                        footprint_pts=_fp_use,
-                                                       footprint_holes=_fp_holes_use):
+                                                       footprint_holes=_fp_holes_use,
+                                                       obstacle_polygons=_bank_obstacles):
                 break
             best = max(perim_candidates, key=lambda c: min(
                 math.sqrt((c[0] - sx) ** 2 + (c[1] - sy) ** 2)
@@ -1074,7 +1117,8 @@ def calculate_fire_safety_requirements(floor_dims_mm, core_center_mm, lift_core_
                     if not staircase_logic._check_travel_distance(
                             stair_pos, [floor_dims_mm[_k]], max_travel_dist,
                             footprint_pts=_fp_use,
-                            footprint_holes=_fp_holes_use):
+                            footprint_holes=_fp_holes_use,
+                            obstacle_polygons=_bank_obstacles):
                         _last = _k
                         break
                 _fs["last_floor_idx"] = _last
@@ -1083,6 +1127,1540 @@ def calculate_fire_safety_requirements(floor_dims_mm, core_center_mm, lift_core_
         len(final_sets),
         [(s["type"], s["pos"], "perim={}".format(s.get("is_perimeter", False))) for s in final_sets]))
     return final_sets
+
+
+def stair_centres_from_fire_lift_sets(fire_lift_sets, lift_core_bounds_mm,
+                                       typical_floor_height_mm, use_ew=True):
+    """Derive staircase centre coordinates from FIRE_LIFT entry positions.
+
+    Mirrors the per-bank stair-centre math used inside
+    calculate_fire_safety_requirements (the local _ew_stair_pos and
+    _ns_bank_ew_stair_pos closures). Exposed so the multi-bank pre-pass in
+    revit_workers.py can build a union of stair centres across banks before
+    running a single global perimeter check.
+
+    fire_lift_sets: list of {"pos": (x, y), "type": "FIRE_LIFT", ...}
+    lift_core_bounds_mm: (xmin, ymin, xmax, ymax) of the bank's lift core
+    typical_floor_height_mm: drives the staircase shaft sizing
+    use_ew: True for EW bank layout, False for NS bank layout
+
+    Returns a list of (stair_cx, stair_cy) tuples — one per FIRE_LIFT set.
+    """
+    if not fire_lift_sets or not lift_core_bounds_mm:
+        return []
+
+    _PAX_CAR_D = 2500
+    fl_shaft_d = _PAX_CAR_D + 2 * _WALL_THICKNESS
+    _typ_h = typical_floor_height_mm or 4000
+    sd_nat = staircase_logic.get_shaft_dimensions(_typ_h, None)[1]
+    _lobby_d_est = max(2000, sd_nat - fl_shaft_d)
+    _stair_centre_offset = fl_shaft_d + _lobby_d_est + sd_nat / 2.0
+
+    l_xmin, l_ymin, l_xmax, l_ymax = lift_core_bounds_mm
+    lift_core_cx = (l_xmin + l_xmax) / 2.0
+    lift_core_cy = (l_ymin + l_ymax) / 2.0
+
+    out = []
+    if use_ew:
+        # FIRE_LIFT sets sit at l_xmax or l_xmin; project stair centre east/west.
+        for s in fire_lift_sets:
+            ex, ey = s["pos"]
+            if ex >= l_xmax - 10:
+                out.append((ex + _stair_centre_offset, ey))
+            else:
+                out.append((ex - _stair_centre_offset, ey))
+    else:
+        # NS bank: clusters allowed E/W → project east and west of bank centre.
+        out.append((l_xmax + _stair_centre_offset, lift_core_cy))
+        out.append((l_xmin - _stair_centre_offset, lift_core_cy))
+    return out
+
+
+# ── R2-T3 candidate scoring helpers ────────────────────────────────────────────
+# Used by add_perimeter_for_coverage to pick the best perimeter stair position
+# from a shortlist that combines coverage gain (how many failing test points
+# the new stair would now satisfy) with spread (how far the new stair is from
+# existing stairs — encourages redundancy and avoids stair clustering).
+
+# Tunable thresholds. Could be moved into compliance_lift_engineering.json.
+_PERIM_MIN_INTER_STAIR_SEPARATION_MM = 15000.0  # hard filter: ≥15m from any existing
+_PERIM_COVERAGE_WEIGHT = 0.6                     # weight on coverage gain
+_PERIM_SEPARATION_WEIGHT = 0.4                   # weight on spread
+_PERIM_TOP_N_TO_GEMINI = 3                       # top N candidates surfaced for LLM choice
+
+
+def _label_candidate_position(cx, cy, footprint_pts, lift_core_obstacles):
+    """Generate a short architectural label for a candidate position so Gemini
+    has context for picking. e.g. 'NE corner zone', 'N edge midpoint',
+    'Interior — between courtyard and east wall', 'Near bank 0 lift core'.
+    """
+    if not footprint_pts or len(footprint_pts) < 3:
+        return "({:.0f}, {:.0f})".format(cx, cy)
+    xs = [p[0] for p in footprint_pts]
+    ys = [p[1] for p in footprint_pts]
+    xmin, xmax = min(xs), max(xs)
+    ymin, ymax = min(ys), max(ys)
+    bbox_w = xmax - xmin
+    bbox_h = ymax - ymin
+    # Quartile thresholds
+    nx = (cx - xmin) / max(bbox_w, 1.0)
+    ny = (cy - ymin) / max(bbox_h, 1.0)
+    parts = []
+    # Horizontal third
+    if nx < 0.33:
+        parts.append("W")
+    elif nx > 0.67:
+        parts.append("E")
+    else:
+        parts.append("mid-X")
+    # Vertical third
+    if ny < 0.33:
+        parts.append("S")
+    elif ny > 0.67:
+        parts.append("N")
+    else:
+        parts.append("mid-Y")
+    label = "/".join(parts) + " sector"
+    # Lift core proximity
+    for i, poly in enumerate(lift_core_obstacles or []):
+        if not poly:
+            continue
+        ccx = sum(p[0] for p in poly) / float(len(poly))
+        ccy = sum(p[1] for p in poly) / float(len(poly))
+        dist = math.sqrt((cx - ccx) ** 2 + (cy - ccy) ** 2)
+        if dist < 10000:
+            label += " (near bank {})".format(i)
+            break
+    return label
+
+
+def _score_perim_candidates(candidates, existing_stair_pos, failing_test_pts,
+                             max_dist_mm, obstacle_polygons):
+    """Score each candidate position by (coverage_gain, min_separation).
+
+    candidates: list of (stair_cx, stair_cy, pos_x, pos_y, rotation_deg) tuples.
+    existing_stair_pos: list of (x, y) stair centres already placed.
+    failing_test_pts: list of (x, y) test points currently NOT 2-stair-covered.
+    max_dist_mm: travel-distance threshold.
+    obstacle_polygons: passed through to _wall_routed_distance.
+
+    Returns a list of dicts: {cand: tuple, coverage: int, separation: float,
+        norm_cov, norm_sep, score} sorted by descending score.
+    Drops candidates with zero coverage or with separation < threshold.
+    """
+    scored = []
+    for c in candidates:
+        cx, cy = c[0], c[1]
+        # Hard filter: minimum separation from existing stairs
+        min_sep = min(
+            (math.sqrt((cx - sx) ** 2 + (cy - sy) ** 2)
+             for sx, sy in existing_stair_pos),
+            default=float("inf"),
+        )
+        if min_sep < _PERIM_MIN_INTER_STAIR_SEPARATION_MM:
+            continue
+        # Coverage gain: how many currently-failing test points would now be
+        # covered (i.e. reach ≥2 stairs within max_dist_mm) if we added this
+        # candidate. We use straight-line distance for coverage scoring (the
+        # outer travel-distance test still uses wall-routed via _check_travel).
+        cov = 0
+        for tx, ty in failing_test_pts:
+            # If candidate is within max_dist_mm of this failing point, it
+            # contributes one more reachable stair → may bring count to 2.
+            d_new = staircase_logic._wall_routed_distance((cx, cy), (tx, ty), obstacle_polygons or [])
+            if d_new <= max_dist_mm:
+                # Check if existing stairs already had ≥1 reach (so candidate
+                # brings total to ≥2). Compute via wall-routed too.
+                existing_reach = sum(
+                    1 for sx, sy in existing_stair_pos
+                    if staircase_logic._wall_routed_distance((sx, sy), (tx, ty), obstacle_polygons or []) <= max_dist_mm
+                )
+                if existing_reach >= 1:
+                    cov += 1
+        if cov <= 0:
+            continue
+        scored.append({
+            "cand": c, "coverage": cov, "separation": min_sep,
+        })
+    if not scored:
+        return []
+    # Normalise and combine
+    max_cov = max(s["coverage"] for s in scored)
+    max_sep = max(s["separation"] for s in scored)
+    for s in scored:
+        s["norm_cov"] = s["coverage"] / max_cov if max_cov > 0 else 0.0
+        s["norm_sep"] = s["separation"] / max_sep if max_sep > 0 else 0.0
+        s["score"] = (_PERIM_COVERAGE_WEIGHT * s["norm_cov"]
+                      + _PERIM_SEPARATION_WEIGHT * s["norm_sep"])
+    scored.sort(key=lambda s: s["score"], reverse=True)
+    return scored
+
+
+def _gemini_pick_perimeter_candidate(scored_candidates, footprint_pts,
+                                       existing_stair_pos, lift_core_obstacles):
+    """Send top-N scored candidates to Gemini for an architectural pick.
+    Returns the chosen candidate dict (one of scored_candidates[:N]).
+
+    Falls back silently to scored_candidates[0] (highest score) if Gemini call
+    fails, returns invalid pick, or is unavailable. The build never blocks on
+    the LLM — Gemini is a judge, not a gatekeeper.
+    """
+    top = scored_candidates[:_PERIM_TOP_N_TO_GEMINI]
+    if len(top) <= 1:
+        return top[0] if top else None
+    try:
+        from revit_mcp.gemini_client import client
+    except Exception as _e:
+        _fsl_log("[PerimChoice] gemini_client import failed ({}); using candidate #1".format(_e))
+        return top[0]
+
+    # Build the prompt
+    prompt_lines = [
+        "We need ONE additional staircase to cover travel-distance gaps in the floor plate.",
+        "All candidates below are geometrically valid (no collision, inside polygon,",
+        "≥{}mm from existing stairs). Pick the most architecturally sensible one.".format(
+            int(_PERIM_MIN_INTER_STAIR_SEPARATION_MM)),
+        "",
+    ]
+    if footprint_pts:
+        xs = [p[0] for p in footprint_pts]
+        ys = [p[1] for p in footprint_pts]
+        prompt_lines.append("Building footprint bbox: ({:.0f}-{:.0f}) × ({:.0f}-{:.0f}) mm".format(
+            min(xs), max(xs), min(ys), max(ys)))
+    prompt_lines.append("Existing stair centres: {}".format(
+        [(round(sx), round(sy)) for sx, sy in existing_stair_pos]))
+    prompt_lines.append("")
+    for i, sc in enumerate(top, 1):
+        cx, cy = sc["cand"][0], sc["cand"][1]
+        label = _label_candidate_position(cx, cy, footprint_pts, lift_core_obstacles)
+        prompt_lines.append(
+            "Candidate {} (score {:.2f}): position ({:.0f}, {:.0f}) — {}".format(
+                i, sc["score"], cx, cy, label))
+        prompt_lines.append("  Coverage gain: {} cells".format(sc["coverage"]))
+        prompt_lines.append("  Min distance to existing stairs: {:.0f}mm".format(sc["separation"]))
+        prompt_lines.append("")
+    prompt_lines.append(
+        "Pick by responding with just the candidate number (1{}).".format(
+            "" if len(top) == 1 else (", 2" if len(top) == 2 else ", 2, or 3")))
+    prompt = "\n".join(prompt_lines)
+
+    _fsl_log("[PerimChoice] Sending {} candidate(s) to Gemini. Prompt:\n{}".format(
+        len(top), prompt))
+    try:
+        raw = client.generate_content(prompt, thinking_budget=0, temperature=0.1)
+    except Exception as _e:
+        _fsl_log("[PerimChoice] Gemini call FAILED ({}); using candidate #1".format(_e))
+        return top[0]
+    _fsl_log("[PerimChoice] Gemini response: {}".format(
+        (raw or "").strip()[:300]))
+
+    # Parse response: look for first digit 1..N
+    import re as _re
+    m = _re.search(r"\b([1-{}])\b".format(len(top)), raw or "")
+    if not m:
+        _fsl_log("[PerimChoice] Gemini returned no valid candidate index; using #1. raw={}".format(
+            (raw or "")[:200]))
+        return top[0]
+    idx = int(m.group(1)) - 1
+    _fsl_log("[PerimChoice] Gemini chose candidate #{} (score={:.2f}, coverage={}, sep={:.0f}mm)".format(
+        idx + 1, top[idx]["score"], top[idx]["coverage"], top[idx]["separation"]))
+    return top[idx]
+
+
+def add_perimeter_for_coverage(existing_stair_positions, floor_dims_mm,
+                                max_travel_dist, typical_floor_height_mm,
+                                footprint_pts=None, footprint_holes=None,
+                                core_center_mm=None, obstacle_polygons=None):
+    """Globally add perimeter SMOKE_STOP staircases until the FULL union of
+    existing stair positions covers every floor-plate point within max travel.
+
+    Used after a multi-bank pre-pass where each bank returned only its
+    FIRE_LIFT sets (skip_perimeter=True). Running this ONCE over the union
+    avoids duplicating perimeter stairs on a per-bank basis when the union
+    already provides coverage.
+
+    obstacle_polygons: list of impassable rectangles (lift cores) — passed to
+        wall-routed travel-distance check so paths route around them. Stair/
+        lobby walls are NOT in this list per design.
+
+    Returns a list of new SMOKE_STOP safety sets (possibly empty) to be
+    appended to the merged FIRE_LIFT sets. Each returned set has the same
+    schema as the perimeter sets emitted by calculate_fire_safety_requirements
+    (type="SMOKE_STOP", is_perimeter=True, ref_half_l, rotation_deg, last_floor_idx).
+    """
+    new_sets = []
+    _fp_use = footprint_pts
+    _fp_holes_use = footprint_holes
+    _obstacles = obstacle_polygons or []
+    _typ_h = typical_floor_height_mm or 4000
+
+    # Already compliant with the union of existing stairs? Nothing to add.
+    if staircase_logic._check_travel_distance(existing_stair_positions, floor_dims_mm,
+                                              max_travel_dist,
+                                              footprint_pts=_fp_use,
+                                              footprint_holes=_fp_holes_use,
+                                              obstacle_polygons=_obstacles):
+        _fsl_log("[FireReqs.PerimGlobal] union of {} stairs already covers floor; "
+                 "no perimeter SMOKE_STOPs needed.".format(len(existing_stair_positions)))
+        return new_sets
+
+    # ── Build candidate list (replicates the logic from the per-bank perimeter loop) ──
+    if floor_dims_mm:
+        unique_half_l = sorted(set(d[1] / 2.0 for d in floor_dims_mm))
+        unique_half_w = sorted(set(d[0] / 2.0 for d in floor_dims_mm))
+    else:
+        unique_half_l = [25000.0]
+        unique_half_w = [25000.0]
+
+    _sd_approx = staircase_logic.get_shaft_dimensions(_typ_h, None)[1]
+
+    def _is_simple_rectangle(pts):
+        unique = list({(round(p[0]), round(p[1])) for p in pts})
+        if len(unique) != 4:
+            return False
+        xs = sorted(set(p[0] for p in unique))
+        ys = sorted(set(p[1] for p in unique))
+        return len(xs) == 2 and len(ys) == 2
+
+    _poly_candidates = None
+    if footprint_pts and len(footprint_pts) >= 3 and not _is_simple_rectangle(footprint_pts):
+        _fp_xs = [p[0] for p in footprint_pts]
+        _fp_ys = [p[1] for p in footprint_pts]
+        _fp_xmin, _fp_xmax = min(_fp_xs), max(_fp_xs)
+        _fp_ymin, _fp_ymax = min(_fp_ys), max(_fp_ys)
+        _gN = 8
+        _gdx = (_fp_xmax - _fp_xmin) / float(_gN)
+        _gdy = (_fp_ymax - _fp_ymin) / float(_gN)
+        _holes = footprint_holes or []
+        _interior = []
+        for _ix in range(_gN):
+            for _iy in range(_gN):
+                _gx = _fp_xmin + (_ix + 0.5) * _gdx
+                _gy = _fp_ymin + (_iy + 0.5) * _gdy
+                if not staircase_logic._point_in_polygon(_gx, _gy, footprint_pts):
+                    continue
+                if any(staircase_logic._point_in_polygon(_gx, _gy, h) for h in _holes):
+                    continue
+                _interior.append((_gx, _gy))
+        if _interior:
+            _poly_candidates = _interior
+
+    all_stair_pos = list(existing_stair_positions)
+
+    if footprint_pts and len(footprint_pts) >= 3:
+        _fp_xs_c = [p[0] for p in footprint_pts]
+        _fp_ys_c = [p[1] for p in footprint_pts]
+        _cx0 = (min(_fp_xs_c) + max(_fp_xs_c)) / 2.0
+        _cy0 = (min(_fp_ys_c) + max(_fp_ys_c)) / 2.0
+    elif core_center_mm:
+        _cx0 = core_center_mm[0]
+        _cy0 = core_center_mm[1]
+    else:
+        _cx0 = 0.0
+        _cy0 = 0.0
+
+    _unique_dims = sorted(set(unique_half_l + unique_half_w))
+
+    # ── Iterative coverage-aware placement (R2-T3) ──────────────────────────
+    # Replaces the previous greedy-by-distance approach. Each iteration:
+    #   1. Build a fresh candidate pool from edge midpoints, polygon vertices,
+    #      and (when applicable) interior-grid candidates.
+    #   2. Identify currently-failing test points (cells where < 2 stairs reach
+    #      within max_travel_dist using wall-routed distance).
+    #   3. Score candidates by combined coverage gain + spatial separation;
+    #      hard-filter for min_inter_stair_separation and coverage > 0.
+    #   4. Pick top-N (default 3) — let Gemini choose architecturally if more
+    #      than one survivor; otherwise use the highest-scored candidate.
+    #   5. Loop until coverage achieved or no valid candidates remain.
+    _MAX_ITER = 8  # safety cap — should converge in 1-3 iterations for typical builds
+    for _iter in range(_MAX_ITER):
+        if staircase_logic._check_travel_distance(all_stair_pos, floor_dims_mm, max_travel_dist,
+                                                   footprint_pts=_fp_use,
+                                                   footprint_holes=_fp_holes_use,
+                                                   obstacle_polygons=_obstacles):
+            break
+
+        # Build candidate pool from all source types — caller can rely on edge
+        # midpoints AND polygon-interior grid AND polygon vertices simultaneously.
+        _all_cands = []
+        if _poly_candidates is not None:
+            _all_cands.extend([(cx, cy, None, None, None) for cx, cy in _poly_candidates])
+        # Edge midpoints across all dimension tiers
+        for try_hl in _unique_dims:
+            _ns_hl = try_hl if try_hl in unique_half_l else max(unique_half_l)
+            _ew_hw = try_hl if try_hl in unique_half_w else max(unique_half_w)
+            _sc_ns = _sd_approx / 2.0
+            _sc_ew = _sd_approx / 2.0
+            _all_cands.extend([
+                (_cx0,  _cy0 - _ns_hl + _sc_ns,  _cx0,  _cy0 - _ns_hl,  0.0),
+                (_cx0,  _cy0 + _ns_hl - _sc_ns,  _cx0,  _cy0 + _ns_hl,  0.0),
+                (_cx0 - _ew_hw + _sc_ew,  _cy0,  _cx0 - _ew_hw,  _cy0,  90.0),
+                (_cx0 + _ew_hw - _sc_ew,  _cy0,  _cx0 + _ew_hw,  _cy0,  90.0),
+            ])
+        # Drop duplicates against already-placed stairs
+        _placed = set((round(sx), round(sy)) for sx, sy in all_stair_pos)
+        _dedup_cands = []
+        _seen_xy = set()
+        for c in _all_cands:
+            key = (round(c[0]), round(c[1]))
+            if key in _placed or key in _seen_xy:
+                continue
+            _seen_xy.add(key)
+            _dedup_cands.append(c)
+
+        # Identify currently-failing test points
+        _all_test_pts = staircase_logic._generate_test_points(_fp_use, _fp_holes_use)
+        _failing_pts = []
+        for _tp in _all_test_pts:
+            _dists = sorted(
+                staircase_logic._wall_routed_distance((sx, sy), _tp, _obstacles)
+                for sx, sy in all_stair_pos
+            )
+            if len(_dists) < 2 or _dists[1] > max_travel_dist:
+                _failing_pts.append(_tp)
+        if not _failing_pts:
+            break  # nothing to fix
+        _fsl_log("[PerimChoice] iter {}: {} failing test points, {} candidate(s) before scoring".format(
+            _iter, len(_failing_pts), len(_dedup_cands)))
+
+        # Score candidates (filters for ≥15m separation + coverage_gain > 0)
+        _scored = _score_perim_candidates(
+            _dedup_cands, all_stair_pos, _failing_pts, max_travel_dist, _obstacles)
+        if not _scored:
+            # Diagnostic: dump per-candidate separation + coverage so the user
+            # can see WHY everything was filtered out (e.g. all candidates
+            # were within 15m of an existing stair, or no candidate covered
+            # any failing cell).
+            _diag = []
+            for c in _dedup_cands[:8]:
+                cx, cy = c[0], c[1]
+                _min_sep = min(
+                    (math.sqrt((cx - sx) ** 2 + (cy - sy) ** 2)
+                     for sx, sy in all_stair_pos),
+                    default=float("inf"),
+                )
+                _cov = sum(
+                    1 for tp in _failing_pts
+                    if staircase_logic._wall_routed_distance((cx, cy), tp, _obstacles) <= max_travel_dist
+                )
+                _diag.append("({:.0f},{:.0f}) sep={:.0f} cov={}".format(cx, cy, _min_sep, _cov))
+            _fsl_log("[PerimChoice] iter {}: no valid candidates after hard filter "
+                     "(min_sep={}mm, need cov>0). First {} dropped: {} | aborting; "
+                     "{} test cells will remain uncovered.".format(
+                         _iter, int(_PERIM_MIN_INTER_STAIR_SEPARATION_MM),
+                         min(8, len(_dedup_cands)), _diag, len(_failing_pts)))
+            break
+        _fsl_log("[PerimChoice] iter {}: {} valid candidate(s); top: {}".format(
+            _iter, len(_scored),
+            [(round(s["cand"][0]), round(s["cand"][1]), s["coverage"], int(s["separation"]),
+              round(s["score"], 2)) for s in _scored[:5]]))
+
+        # Pick best — Gemini chooses among top-N if there are multiple
+        _picked = _gemini_pick_perimeter_candidate(
+            _scored, _fp_use, all_stair_pos, _obstacles)
+        if _picked is None:
+            break
+        _bcx, _bcy, _bpx, _bpy, _brot = _picked["cand"]
+        if _bpx is None:
+            _bpx = _bcx
+            _bpy = _bcy - _sd_approx / 2.0 if _bcy < _cy0 else _bcy + _sd_approx / 2.0
+            _brot = 0.0
+            if _fp_use and len(_fp_use) >= 3:
+                _brot = _nearest_polygon_edge_angle_deg(_bcx, _bcy, _fp_use)
+        new_sets.append({"pos": (_bpx, _bpy), "type": "SMOKE_STOP",
+                          "is_perimeter": True,
+                          "rotation_deg": _brot})
+        all_stair_pos.append((_bcx, _bcy))
+        _fsl_log("[PerimChoice] iter {}: placed perimeter stair at ({:.0f},{:.0f}) "
+                 "(score={:.2f}, coverage={}, sep={:.0f}mm)".format(
+                     _iter, _bcx, _bcy, _picked["score"], _picked["coverage"], _picked["separation"]))
+
+    # Tag last_floor_idx using ONLY the original (non-perimeter) stair positions,
+    # so a perimeter stair can stop at the floor index above which the union of
+    # bank stairs alone covers the plate. Matches the per-bank function's tagging.
+    if floor_dims_mm:
+        for _fs in new_sets:
+            _last = 0
+            for _k in range(len(floor_dims_mm) - 1, -1, -1):
+                if not staircase_logic._check_travel_distance(
+                        existing_stair_positions, [floor_dims_mm[_k]], max_travel_dist,
+                        footprint_pts=_fp_use,
+                        footprint_holes=_fp_holes_use,
+                        obstacle_polygons=_obstacles):
+                    _last = _k
+                    break
+            _fs["last_floor_idx"] = _last
+
+    _fsl_log("[FireReqs.PerimGlobal] added {} SMOKE_STOP perimeter set(s) over union of {} "
+             "fire-lift stairs: {}".format(
+        len(new_sets), len(existing_stair_positions),
+        [(s["pos"], "perim=True") for s in new_sets]))
+    return new_sets
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# R3: Unified optimal staircase layout solver
+# ═══════════════════════════════════════════════════════════════════════════════
+# Replaces the per-bank "single-set vs 2-set" decision and the greedy-by-distance
+# perimeter loop with a unified algorithm that:
+#   1. Enumerates candidate stair-attachment points per bank.
+#   2. Tries 1-per-bank starting pairs first, then asymmetric (2-on-1-bank).
+#   3. Picks the pair with best floor coverage (num_required=2, wall-routed, 75m).
+#   4. Escalates by adding stairs greedy-by-coverage when 2 don't suffice.
+#   5. Surfaces top configurations to Gemini with per-stair shift ranges so
+#      Gemini can pick architecturally and tweak positions within a safe range.
+# Behind feature flag USE_R3_OPTIMAL_LAYOUT for easy rollback.
+
+def _bank_stair_candidates(bank_idx, lift_core_bounds_mm, typical_floor_height_mm,
+                            footprint_pts=None, footprint_holes=None,
+                            obstacle_polygons=None):
+    """Enumerate the valid stair-attachment positions for a single bank.
+
+    Returns a list of dicts: {bank_idx, label, fire_lift_entry_pos, stair_centre,
+        face ('east'|'west'|'north'|'south'), row ('north'|'south'|'mid')}.
+    Only positions inside the building polygon, outside holes, and not clashing
+    with other obstacles are returned.
+    """
+    if not lift_core_bounds_mm:
+        return []
+    l_xmin, l_ymin, l_xmax, l_ymax = lift_core_bounds_mm
+    lift_core_cx = (l_xmin + l_xmax) / 2.0
+    lift_core_cy = (l_ymin + l_ymax) / 2.0
+    _typ_h = typical_floor_height_mm or 4000
+    _PAX_CAR_D = 2500
+    fl_shaft_d = _PAX_CAR_D + 2 * _WALL_THICKNESS
+    sd_nat = staircase_logic.get_shaft_dimensions(_typ_h, None)[1]
+    _lobby_d_est = max(2000, sd_nat - fl_shaft_d)
+    _stair_centre_offset = fl_shaft_d + _lobby_d_est + sd_nat / 2.0
+    # Row Y positions for EW layout (from existing logic at line 873-874)
+    lobby_w_est = 3000  # mirrors default lobby_width used in the engine
+    row_cy_n = lift_core_cy + lobby_w_est / 2.0 + fl_shaft_d / 2.0
+    row_cy_s = lift_core_cy - lobby_w_est / 2.0 - fl_shaft_d / 2.0
+
+    # 6 candidates per bank: east/west × {north-row, south-row, mid-row}.
+    raw_cands = [
+        {"face": "east", "row": "north", "entry": (l_xmax, row_cy_n),
+         "centre": (l_xmax + _stair_centre_offset, row_cy_n)},
+        {"face": "east", "row": "south", "entry": (l_xmax, row_cy_s),
+         "centre": (l_xmax + _stair_centre_offset, row_cy_s)},
+        {"face": "east", "row": "mid", "entry": (l_xmax, lift_core_cy),
+         "centre": (l_xmax + _stair_centre_offset, lift_core_cy)},
+        {"face": "west", "row": "north", "entry": (l_xmin, row_cy_n),
+         "centre": (l_xmin - _stair_centre_offset, row_cy_n)},
+        {"face": "west", "row": "south", "entry": (l_xmin, row_cy_s),
+         "centre": (l_xmin - _stair_centre_offset, row_cy_s)},
+        {"face": "west", "row": "mid", "entry": (l_xmin, lift_core_cy),
+         "centre": (l_xmin - _stair_centre_offset, lift_core_cy)},
+    ]
+    # Filter: stair centre must be inside the floor polygon and not in any
+    # courtyard/void, and not inside any other obstacle (lift cores, etc).
+    valid = []
+    for c in raw_cands:
+        cx, cy = c["centre"]
+        if footprint_pts and len(footprint_pts) >= 3:
+            if not staircase_logic._point_in_polygon(cx, cy, footprint_pts):
+                continue
+            if footprint_holes and any(
+                staircase_logic._point_in_polygon(cx, cy, h)
+                for h in footprint_holes if h and len(h) >= 3
+            ):
+                continue
+        # Other obstacles (other banks' lift cores etc): pass through
+        if obstacle_polygons:
+            in_obstacle = False
+            for poly in obstacle_polygons:
+                if not poly or len(poly) < 3:
+                    continue
+                # Skip THIS bank's own lift core (we want our stair centre OUTSIDE
+                # our own bank, which it already is by construction).
+                if staircase_logic._point_in_polygon(cx, cy, poly):
+                    in_obstacle = True
+                    break
+            if in_obstacle:
+                continue
+        c["bank_idx"] = bank_idx
+        c["label"] = "bank{}-{}-{}row".format(bank_idx, c["face"], c["row"])
+        valid.append(c)
+    return valid
+
+
+# ── R3 perf helpers ─────────────────────────────────────────────────────────
+# Memoization for _generate_test_points + the cleaned obstacle list. Both inputs
+# are recomputed in every call to _coverage_count / _failing_cells / _shift_range_for_stair
+# during R3.Solve (thousands of calls per solve). Caching brings the cost of
+# the inner loop to roughly O(test_pts × n_stairs × obstacles) Dijkstra work
+# only — the polygon-rebuild and grid generation are amortised across the
+# whole solve.
+def _polygon_key(polygon_pts):
+    """Hashable key for a polygon (round to mm)."""
+    if not polygon_pts:
+        return ()
+    return tuple((round(p[0], 3), round(p[1], 3)) for p in polygon_pts)
+
+
+def _holes_key(holes):
+    if not holes:
+        return ()
+    return tuple(_polygon_key(h) for h in holes)
+
+
+_TEST_PTS_CACHE = {}  # (footprint_key, holes_key) -> list of (x, y)
+
+
+def _cached_test_points(footprint_pts, footprint_holes):
+    key = (_polygon_key(footprint_pts), _holes_key(footprint_holes))
+    pts = _TEST_PTS_CACHE.get(key)
+    if pts is None:
+        pts = staircase_logic._generate_test_points(footprint_pts, footprint_holes)
+        # Cap cache size — different footprints during a session can fill memory.
+        if len(_TEST_PTS_CACHE) > 32:
+            _TEST_PTS_CACHE.clear()
+        _TEST_PTS_CACHE[key] = pts
+    return pts
+
+
+def _cleaned_obstacles(footprint_holes, obstacle_polygons):
+    """Build the merged + filtered obstacle list once; reused per coverage call."""
+    obs = list(footprint_holes or []) + list(obstacle_polygons or [])
+    return [o for o in obs if o and len(o) >= 3]
+
+
+def _r3_clear_caches():
+    """Drop memoised test-point grids. Call at the start of solve_optimal_staircase_layout
+    so a stale prior solve (e.g. different building geometry on the same session)
+    can't leak into the new run.
+    """
+    _TEST_PTS_CACHE.clear()
+
+
+# ── ProcessPool helper with Revit-environment detection + serial fallback ──
+# Pure-Python coverage scoring is CPU-bound and the GIL serialises threads, so
+# threading buys nothing on a single Python interpreter. A ProcessPoolExecutor
+# would give a true 4-8× speedup, BUT inside Revit's embedded Python (loaded
+# via pythonnet/clr) child processes cannot bootstrap — `pool.submit` returns
+# a future whose `f.result()` blocks forever because no worker can spawn. We
+# therefore detect the Revit environment and disable the pool there, and we
+# also enforce a hard timeout on the FIRST job to catch any environment where
+# detection fails.
+_R3_POOL = None
+_R3_POOL_DISABLED = False
+_R3_POOL_WORKERS = 4
+_R3_POOL_FIRST_JOB_TIMEOUT_S = 3.0  # if first worker doesn't respond in 3s, abandon
+
+
+def _r3_in_embedded_revit():
+    """True when this module is running inside Revit's embedded Python via
+    pythonnet/clr (where ProcessPoolExecutor cannot spawn children). Errs on
+    the safe side: if we can't tell, assume we're in Revit and disable the
+    pool. The pool only matters for unit tests + standalone runs; on a real
+    build the cost of disabling it is the memoised serial path (still much
+    faster than the pre-fix code).
+    """
+    # Cheapest check: pyrevit/__revit__ available in builtins.
+    try:
+        import builtins
+        if hasattr(builtins, "__revit__"):
+            return True
+    except Exception:
+        pass
+    # sys.executable inside Revit points at Revit.exe (or similar) instead of
+    # python.exe. If it doesn't start with "python", assume we're embedded.
+    try:
+        import sys, os
+        _exe = (getattr(sys, "executable", "") or "").lower()
+        _exe_name = os.path.basename(_exe)
+        if _exe_name and not _exe_name.startswith("python"):
+            return True
+    except Exception:
+        pass
+    # clr present + Revit assembly loaded → embedded.
+    try:
+        import clr  # type: ignore
+        try:
+            import System  # type: ignore
+            for _asm in System.AppDomain.CurrentDomain.GetAssemblies():
+                _name = getattr(_asm, "FullName", "") or ""
+                if _name.startswith("RevitAPI") or _name.startswith("RevitAPIUI"):
+                    return True
+        except Exception:
+            # clr present but assembly enumeration failed — assume embedded.
+            return True
+    except Exception:
+        # No clr → standard CPython, pool is safe.
+        return False
+    return False
+
+
+def _r3_get_pool():
+    """Lazy-init a ProcessPoolExecutor. Returns None if we're inside Revit
+    or if pool creation failed (caller must fall back to serial).
+    """
+    global _R3_POOL, _R3_POOL_DISABLED
+    if _R3_POOL_DISABLED:
+        return None
+    if _R3_POOL is not None:
+        return _R3_POOL
+    if _r3_in_embedded_revit():
+        _fsl_log("[R3.Pool] Embedded-Revit environment detected — pool disabled, "
+                 "running serially (memoization still active)")
+        _R3_POOL_DISABLED = True
+        return None
+    try:
+        from concurrent.futures import ProcessPoolExecutor
+        _R3_POOL = ProcessPoolExecutor(max_workers=_R3_POOL_WORKERS)
+        _fsl_log("[R3.Pool] ProcessPoolExecutor initialised (workers={})".format(
+            _R3_POOL_WORKERS))
+        return _R3_POOL
+    except Exception as _e:
+        _fsl_log("[R3.Pool] ProcessPoolExecutor unavailable ({}); "
+                 "running serially".format(_e))
+        _R3_POOL_DISABLED = True
+        _R3_POOL = None
+        return None
+
+
+def _r3_disable_pool(reason):
+    """Disable the pool for the rest of the session and shut down any handle."""
+    global _R3_POOL, _R3_POOL_DISABLED
+    _fsl_log("[R3.Pool] Disabling pool: {}".format(reason))
+    _R3_POOL_DISABLED = True
+    try:
+        if _R3_POOL is not None:
+            _R3_POOL.shutdown(wait=False)
+    except Exception:
+        pass
+    _R3_POOL = None
+
+
+def _r3_parallel_map(fn, items, chunk_label="task"):
+    """Map fn over items, in parallel via ProcessPool when available, else serial.
+    fn must be a top-level picklable callable. Items must be picklable.
+    Returns a list of results in input order.
+
+    Critical: enforces a wall-clock timeout on the FIRST job to detect cases
+    where the pool spawned but workers can't actually run (e.g. embedded
+    interpreter). On timeout we fall back to serial and disable the pool.
+    """
+    if not items:
+        return []
+    pool = _r3_get_pool() if len(items) >= 4 else None
+    if pool is None:
+        return [fn(it) for it in items]
+    try:
+        from concurrent.futures import TimeoutError as _FutTimeout
+    except Exception:
+        _FutTimeout = Exception
+    try:
+        futures = [pool.submit(fn, it) for it in items]
+    except Exception as _e:
+        _r3_disable_pool("submit failed during {} ({})".format(chunk_label, _e))
+        return [fn(it) for it in items]
+    results = []
+    try:
+        # First future: short timeout. If workers can't actually run, this
+        # is where we'll detect the hang BEFORE it freezes the build.
+        try:
+            results.append(futures[0].result(timeout=_R3_POOL_FIRST_JOB_TIMEOUT_S))
+        except _FutTimeout:
+            _r3_disable_pool(
+                "first {} job did not complete within {:.1f}s — workers cannot "
+                "execute (likely embedded Python). Falling back to serial.".format(
+                    chunk_label, _R3_POOL_FIRST_JOB_TIMEOUT_S))
+            # Cancel pending futures (best-effort) and run the whole batch serially.
+            for f in futures:
+                try:
+                    f.cancel()
+                except Exception:
+                    pass
+            return [fn(it) for it in items]
+        # Remaining futures: bounded timeout per future to prevent indefinite hang
+        # if a single worker stalls.
+        per_job_timeout = max(60.0, _R3_POOL_FIRST_JOB_TIMEOUT_S * 20)
+        for f in futures[1:]:
+            results.append(f.result(timeout=per_job_timeout))
+        return results
+    except Exception as _e:
+        _r3_disable_pool("execution failed during {} ({})".format(chunk_label, _e))
+        # We may have partial results; rerun the whole batch serially for
+        # determinism rather than mixing partial pool output with serial output.
+        return [fn(it) for it in items]
+
+
+def _coverage_count(stair_positions, footprint_pts, footprint_holes,
+                     max_travel_dist, obstacle_polygons, num_required=2,
+                     _test_pts=None, _obs=None):
+    """Count how many test cells satisfy the num_required-stair travel-distance
+    rule with this set of stair positions. Higher = better coverage.
+
+    Optional precomputed inputs (`_test_pts`, `_obs`) skip the per-call rebuild —
+    pass these inside hot loops.
+    """
+    if len(stair_positions) < num_required:
+        return 0
+    test_pts = _test_pts if _test_pts is not None else _cached_test_points(
+        footprint_pts, footprint_holes)
+    obs = _obs if _obs is not None else _cleaned_obstacles(
+        footprint_holes, obstacle_polygons)
+    covered = 0
+    for tp in test_pts:
+        dists = sorted(
+            staircase_logic._wall_routed_distance((sx, sy), tp, obs)
+            for sx, sy in stair_positions
+        )
+        if dists[num_required - 1] <= max_travel_dist:
+            covered += 1
+    return covered
+
+
+def _failing_cells(stair_positions, footprint_pts, footprint_holes,
+                    max_travel_dist, obstacle_polygons, num_required=2,
+                    _test_pts=None, _obs=None):
+    """Return list of test points that DON'T satisfy num_required-reach."""
+    test_pts = _test_pts if _test_pts is not None else _cached_test_points(
+        footprint_pts, footprint_holes)
+    obs = _obs if _obs is not None else _cleaned_obstacles(
+        footprint_holes, obstacle_polygons)
+    failing = []
+    for tp in test_pts:
+        if len(stair_positions) < num_required:
+            failing.append(tp)
+            continue
+        dists = sorted(
+            staircase_logic._wall_routed_distance((sx, sy), tp, obs)
+            for sx, sy in stair_positions
+        )
+        if dists[num_required - 1] > max_travel_dist:
+            failing.append(tp)
+    return failing
+
+
+def _shift_range_for_stair(stair_pos, all_stair_positions, footprint_pts,
+                            footprint_holes, max_travel_dist, obstacle_polygons,
+                            num_required=2, max_shift_mm=5000, step_mm=1000,
+                            _test_pts=None, _obs=None):
+    """Compute the shift range for a single stair such that the OVERALL coverage
+    still passes when this stair is moved by ±dX, ±dY independently.
+
+    Returns dict: {dx_min, dx_max, dy_min, dy_max} in mm (negative = shift in
+    -X/-Y direction). The four values are independent — i.e. the actual valid
+    region is a rectangle (dx_min, dy_min) to (dx_max, dy_max).
+
+    Cheap binary search along each axis. Tells Gemini how much it can wiggle
+    each stair to match design intent. Optional precomputed `_test_pts`/`_obs`
+    skip per-probe rebuild — this loop calls _coverage_count up to 40× per axis
+    so caching is critical.
+    """
+    sx, sy = stair_pos
+    others = [p for p in all_stair_positions if p != stair_pos]
+
+    test_pts = _test_pts if _test_pts is not None else _cached_test_points(
+        footprint_pts, footprint_holes)
+    obs = _obs if _obs is not None else _cleaned_obstacles(
+        footprint_holes, obstacle_polygons)
+    target_total = len(test_pts)
+
+    def passes_with(new_pos):
+        all_pos = others + [new_pos]
+        return _coverage_count(all_pos, footprint_pts, footprint_holes,
+                                max_travel_dist, obstacle_polygons, num_required,
+                                _test_pts=test_pts, _obs=obs) == target_total
+
+    def find_max_shift(dx, dy):
+        # Step outward in (dx, dy) direction until coverage breaks. dx and dy
+        # are unit vectors (one is 0).
+        last_ok = 0
+        for s in range(step_mm, max_shift_mm + step_mm, step_mm):
+            new_pos = (sx + dx * s, sy + dy * s)
+            # Must stay inside polygon
+            if footprint_pts and not staircase_logic._point_in_polygon(new_pos[0], new_pos[1], footprint_pts):
+                break
+            if footprint_holes and any(
+                staircase_logic._point_in_polygon(new_pos[0], new_pos[1], h)
+                for h in footprint_holes if h and len(h) >= 3
+            ):
+                break
+            if not passes_with(new_pos):
+                break
+            last_ok = s
+        return last_ok
+
+    return {
+        "dx_max": find_max_shift(1, 0),
+        "dx_min": -find_max_shift(-1, 0),
+        "dy_max": find_max_shift(0, 1),
+        "dy_min": -find_max_shift(0, -1),
+    }
+
+
+def _enumerate_starting_pairs(per_bank_candidates):
+    """Generate candidate (config_id, list_of_chosen_candidates) tuples.
+
+    Strategy:
+        1. 1-per-bank: one stair from each bank. For 2 banks with 6 each → up to 36 pairs.
+        2. 2-on-one-bank (asymmetric): 2 stairs from one bank, 0 from others.
+
+    Each yielded value is a list of candidate dicts (length = total stair count).
+    """
+    n_banks = len(per_bank_candidates)
+    # 1-per-bank (always try first)
+    if n_banks >= 2 and all(per_bank_candidates):
+        # Cartesian product of one-per-bank
+        from itertools import product as _product
+        for combo in _product(*per_bank_candidates):
+            yield list(combo)
+    # Single-bank with 2 stairs (asymmetric)
+    if n_banks == 1 and len(per_bank_candidates[0]) >= 2:
+        from itertools import combinations as _combinations
+        for pair in _combinations(per_bank_candidates[0], 2):
+            yield list(pair)
+    # 2-on-one-bank for multi-bank (rare; lower priority)
+    if n_banks >= 2:
+        from itertools import combinations as _combinations
+        for bk_i, bk_cands in enumerate(per_bank_candidates):
+            if len(bk_cands) < 2:
+                continue
+            for pair in _combinations(bk_cands, 2):
+                yield list(pair)
+
+
+def _additional_candidates_for_coverage(failing_pts, existing_stair_pos,
+                                          footprint_pts, footprint_holes,
+                                          max_travel_dist, obstacle_polygons,
+                                          min_separation_mm=15000, _obs=None):
+    """Generate candidate positions for an ADDITIONAL stair when 2-stair pair
+    doesn't fully cover. Returns list of candidate dicts:
+    {position, coverage_gain, separation, label}.
+
+    Sources: polygon-interior 8x8 grid + edge midpoints + polygon vertices,
+    all collision-checked against existing stairs and obstacles.
+    """
+    if not footprint_pts or len(footprint_pts) < 3:
+        return []
+    obs = _obs if _obs is not None else _cleaned_obstacles(
+        footprint_holes, obstacle_polygons)
+
+    # Build candidate pool
+    xs = [p[0] for p in footprint_pts]
+    ys = [p[1] for p in footprint_pts]
+    xmin, xmax = min(xs), max(xs)
+    ymin, ymax = min(ys), max(ys)
+    pool = []
+    # 8x8 interior grid
+    for ix in range(8):
+        for iy in range(8):
+            gx = xmin + (ix + 0.5) * (xmax - xmin) / 8.0
+            gy = ymin + (iy + 0.5) * (ymax - ymin) / 8.0
+            if not staircase_logic._point_in_polygon(gx, gy, footprint_pts):
+                continue
+            if footprint_holes and any(
+                staircase_logic._point_in_polygon(gx, gy, h)
+                for h in footprint_holes if h and len(h) >= 3
+            ):
+                continue
+            pool.append((gx, gy))
+    # Polygon vertices (inset toward centroid)
+    cx0 = sum(xs) / float(len(xs))
+    cy0 = sum(ys) / float(len(ys))
+    for vx, vy in footprint_pts:
+        dxv = cx0 - vx
+        dyv = cy0 - vy
+        dlen = math.sqrt(dxv * dxv + dyv * dyv) or 1.0
+        ux = vx + (dxv / dlen) * 1500
+        uy = vy + (dyv / dlen) * 1500
+        if staircase_logic._point_in_polygon(ux, uy, footprint_pts) and \
+           not any(staircase_logic._point_in_polygon(ux, uy, h)
+                    for h in (footprint_holes or []) if h and len(h) >= 3):
+            pool.append((ux, uy))
+
+    # Score
+    scored = []
+    for cx, cy in pool:
+        # Hard filter: ≥min_separation from any existing stair
+        min_sep = min(
+            (math.sqrt((cx - sx) ** 2 + (cy - sy) ** 2)
+             for sx, sy in existing_stair_pos),
+            default=float("inf"),
+        )
+        if min_sep < min_separation_mm:
+            continue
+        # Hard filter: not inside an obstacle
+        in_obs = any(
+            staircase_logic._point_in_polygon(cx, cy, poly) for poly in obs
+        )
+        if in_obs:
+            continue
+        # Coverage gain: how many failing pts would now reach 2 stairs?
+        # (existing_stair_pos must already provide ≥1 reach, candidate provides 2nd)
+        gain = 0
+        for tp in failing_pts:
+            d_new = staircase_logic._wall_routed_distance((cx, cy), tp, obs)
+            if d_new <= max_travel_dist:
+                existing_reach = sum(
+                    1 for sx, sy in existing_stair_pos
+                    if staircase_logic._wall_routed_distance((sx, sy), tp, obs) <= max_travel_dist
+                )
+                if existing_reach >= 1:
+                    gain += 1
+        if gain <= 0:
+            continue
+        scored.append({
+            "position": (cx, cy), "coverage_gain": gain,
+            "separation": min_sep,
+            "label": "interior ({:.0f},{:.0f})".format(cx, cy),
+        })
+    scored.sort(key=lambda s: s["coverage_gain"], reverse=True)
+    return scored
+
+
+# ── Picklable workers for ProcessPool ───────────────────────────────────────
+# These must be top-level (not closures or methods) so the pool can pickle
+# them. They take the heavy inputs as args and return only what the caller
+# needs.
+
+def _r3_score_combo_worker(args):
+    """Compute coverage for one starting-config tuple. Used by _r3_parallel_map.
+
+    args = (positions_list, footprint_pts, footprint_holes, max_travel_dist,
+            full_obstacles, num_required)
+    Returns: (signature, cov, n_stairs)
+    """
+    (positions, footprint_pts, footprint_holes, max_travel_dist,
+     full_obstacles, num_required) = args
+    sig = tuple(sorted(((round(p[0]), round(p[1])) for p in positions)))
+    cov = _coverage_count(positions, footprint_pts, footprint_holes,
+                           max_travel_dist, full_obstacles, num_required)
+    return (sig, cov, len(positions))
+
+
+def _r3_shift_range_worker(args):
+    """Compute the shift range for one stair. Used by _r3_parallel_map.
+
+    args = (stair_pos, all_positions, footprint_pts, footprint_holes,
+            max_travel_dist, full_obstacles, num_required)
+    Returns: dict with dx_min/dx_max/dy_min/dy_max.
+    """
+    (stair_pos, all_positions, footprint_pts, footprint_holes,
+     max_travel_dist, full_obstacles, num_required) = args
+    return _shift_range_for_stair(
+        stair_pos, all_positions, footprint_pts, footprint_holes,
+        max_travel_dist, full_obstacles, num_required)
+
+
+def check_bank_placement_conflicts(banks_info, footprint_pts, footprint_holes):
+    """Cheap pre-flight: does each bank's lift_core_bounds AABB sit inside the
+    footprint and clear of every courtyard/void?
+
+    Returns:
+        None when all banks are clear (no conflict).
+        Dict {status: "CONFLICT", type, description, resolution_hints} when any
+        bank overlaps a hole or extends outside the footprint.
+
+    Why this exists: the OR-Tools layout engine already reports the same
+    conflict, but only AFTER R3.Solve has finished a 30-60s coverage sweep and
+    a Gemini stair-pick round-trip. Catching it here saves that whole budget
+    when Gemini hands us a geometrically broken bank position.
+    """
+    if not banks_info or not footprint_pts:
+        return None
+
+    # Footprint AABB used for "outside footprint" detection.
+    _xs = [p[0] for p in footprint_pts]
+    _ys = [p[1] for p in footprint_pts]
+    _fp_xmin, _fp_xmax = min(_xs), max(_xs)
+    _fp_ymin, _fp_ymax = min(_ys), max(_ys)
+
+    # Approximate chain depth used by the OR-Tools engine when computing valid
+    # repositioning ranges. Mirrors the value the engine itself reports
+    # (fire_lift shaft + lobby + stair shaft). Using the staircase shaft
+    # depth as the dominant term keeps the hint usable without re-deriving
+    # every constant the engine uses.
+    _PAX_CAR_D = 2500
+    _fl_shaft_d = _PAX_CAR_D + 2 * _WALL_THICKNESS  # 3200mm at default 350mm walls
+    _lb_d = max(2000, _fl_shaft_d)                  # ≥2000 lobby per SCDF
+    try:
+        _sd_nat = staircase_logic.get_shaft_dimensions(4000, None)[1]
+    except Exception:
+        _sd_nat = 7000
+    _chain_d = _sd_nat  # use stair as worst case (≥ fl_shaft + lobby)
+
+    for _bk in banks_info:
+        _lcb = _bk.get("lift_core_bounds_mm")
+        if not _lcb or len(_lcb) < 4:
+            continue
+        _ax1, _ay1, _ax2, _ay2 = _lcb
+        _bank_hd = (_ay2 - _ay1) / 2.0
+        _bank_hw = (_ax2 - _ax1) / 2.0
+
+        # 1. Outside footprint AABB?
+        if (_ax1 < _fp_xmin - 1 or _ax2 > _fp_xmax + 1
+                or _ay1 < _fp_ymin - 1 or _ay2 > _fp_ymax + 1):
+            _desc = (
+                "Passenger lift bank {} [{:.0f},{:.0f}]->[{:.0f},{:.0f}]mm "
+                "extends outside the footprint AABB [{:.0f},{:.0f}]->[{:.0f},{:.0f}]mm. "
+                "Move lifts.position so the full bank AABB sits inside the floor plate."
+            ).format(
+                _bk.get("bank_idx", "?"),
+                _ax1, _ay1, _ax2, _ay2, _fp_xmin, _fp_ymin, _fp_xmax, _fp_ymax)
+            _fsl_log("[R3.PreFlight] CONFLICT: " + _desc)
+            return {
+                "status": "CONFLICT",
+                "type":   "BANK_OUTSIDE_FOOTPRINT",
+                "description": _desc,
+                "resolution_hints": [
+                    "Re-pick lifts.position so the bank AABB lies inside the building footprint.",
+                    "Bank half-width = {:.0f}mm, half-depth = {:.0f}mm — keep the bank centre at "
+                    "least these distances from each footprint edge.".format(_bank_hw, _bank_hd),
+                ],
+            }
+
+        # 2. Overlap any courtyard hole?
+        if footprint_holes:
+            for _h in footprint_holes:
+                if not _h or len(_h) < 3:
+                    continue
+                _hxs = [p[0] for p in _h]; _hys = [p[1] for p in _h]
+                _hx1, _hx2 = min(_hxs), max(_hxs)
+                _hy1, _hy2 = min(_hys), max(_hys)
+                # AABB overlap with 1mm tolerance (matches engine's check)
+                if _ax1 < _hx2 - 1 and _ax2 > _hx1 + 1 and _ay1 < _hy2 - 1 and _ay2 > _hy1 + 1:
+                    _s_lo = int(_fp_ymin + _chain_d + _bank_hd)
+                    _s_hi = int(_hy1 - _bank_hd)
+                    _n_lo = int(_hy2 + _bank_hd)
+                    _n_hi = int(_fp_ymax - _chain_d - _bank_hd)
+                    _e_lo = int(_hx2 + _bank_hw)
+                    _e_hi = int(_fp_xmax - _chain_d - _bank_hw)
+                    _w_lo = int(_fp_xmin + _chain_d + _bank_hw)
+                    _w_hi = int(_hx1 - _bank_hw)
+                    _hints = []
+                    if _s_lo <= _s_hi:
+                        _hints.append("South of void: bank_centre_y in [{:.0f}, {:.0f}]mm".format(_s_lo, _s_hi))
+                    if _n_lo <= _n_hi:
+                        _hints.append("North of void: bank_centre_y in [{:.0f}, {:.0f}]mm".format(_n_lo, _n_hi))
+                    if _e_lo <= _e_hi:
+                        _hints.append("East of void: bank_centre_x in [{:.0f}, {:.0f}]mm".format(_e_lo, _e_hi))
+                    if _w_lo <= _w_hi:
+                        _hints.append("West of void: bank_centre_x in [{:.0f}, {:.0f}]mm".format(_w_lo, _w_hi))
+                    _desc = (
+                        "Passenger lift bank [{:.0f},{:.0f}]->[{:.0f},{:.0f}]mm overlaps "
+                        "courtyard void [{:.0f},{:.0f}]->[{:.0f},{:.0f}]mm. "
+                        "The bank must sit entirely outside the void. "
+                        "Chain depth needed: {:.0f}mm (fire_lift {:.0f} + lobby {:.0f} + stair {:.0f}). "
+                        "{}".format(
+                            _ax1, _ay1, _ax2, _ay2,
+                            _hx1, _hy1, _hx2, _hy2,
+                            _chain_d, _fl_shaft_d, _lb_d, _sd_nat,
+                            " | ".join(_hints) if _hints else
+                            "No valid bank position outside the void with sufficient chain clearance."
+                        )
+                    )
+                    _fsl_log("[R3.PreFlight] CONFLICT: anchor ({:.0f},{:.0f},{:.0f},{:.0f}) "
+                             "overlaps hole ({:.0f},{:.0f},{:.0f},{:.0f})".format(
+                                 _ax1, _ay1, _ax2, _ay2, _hx1, _hy1, _hx2, _hy2))
+                    return {
+                        "status": "CONFLICT",
+                        "type":   "ANCHOR_OVERLAPS_VOID",
+                        "description": _desc,
+                        "resolution_hints": _hints if _hints else [
+                            "No valid bank position exists outside the void with sufficient "
+                            "chain clearance — consider reducing bank size or moving to a different side.",
+                        ],
+                    }
+
+    return None
+
+
+def solve_optimal_staircase_layout(banks_info, footprint_pts, footprint_holes,
+                                     max_travel_dist, typical_floor_height_mm,
+                                     additional_obstacles=None,
+                                     num_required=2, top_n_for_gemini=4,
+                                     try_gemini=True):
+    """Unified algorithm to determine the optimal staircase positions.
+
+    banks_info: list of dicts, each with {bank_idx, lift_core_bounds_mm,
+        center_mm, num_lifts, orientation}. The bank's own lift_core is
+        automatically excluded from obstacle checks for its own candidates.
+    footprint_pts: building outer polygon (list of [x,y]).
+    footprint_holes: list of hole polygons (courtyards).
+    max_travel_dist: travel-distance limit (mm). Use 75000 for sprinklered office.
+    additional_obstacles: list of polygons to treat as obstacles in addition
+        to footprint_holes (typically the lift cores from OTHER banks; this bank's
+        own core is NOT an obstacle for ITS OWN candidates because its stair sits
+        outside its own core).
+    num_required: number of stairs each test cell must reach (default 2).
+    top_n_for_gemini: how many configurations to surface for the LLM picker.
+    try_gemini: if False, skip the LLM call and return engine's best directly.
+
+    Returns dict: {
+        "configurations": [list of cfg dicts, sorted by score],
+        "chosen": cfg dict (the one Gemini picked, or [0] if Gemini unavailable),
+        "n_stairs": int (number of stairs in chosen config),
+    }
+    Each cfg dict has: {stairs: [{position, bank_idx, label, shift_range}, ...],
+                        coverage: int, total_cells: int, score: float}.
+
+    On bank/footprint geometry mismatch (bank outside footprint or overlapping
+    a courtyard hole), returns the CONFLICT dict from check_bank_placement_conflicts
+    immediately — saves the 30-60s of coverage scoring and Gemini round-trip
+    that would otherwise be wasted on a layout the OR-Tools engine will reject
+    downstream.
+    """
+    # ── Step 0: cheap geometric pre-flight — abort before any expensive work ──
+    _preflight = check_bank_placement_conflicts(banks_info, footprint_pts,
+                                                  footprint_holes)
+    if _preflight is not None:
+        _fsl_log("[R3.Solve] Pre-flight CONFLICT — short-circuiting before "
+                 "candidate enumeration. type={}".format(_preflight.get("type")))
+        return _preflight
+
+    # ── Step 1: enumerate per-bank candidates ──────────────────────────────────
+    per_bank_cands = []
+    all_lift_obstacles = []
+    for bk in banks_info:
+        lcb = bk["lift_core_bounds_mm"]
+        all_lift_obstacles.append([
+            [lcb[0], lcb[1]], [lcb[2], lcb[1]],
+            [lcb[2], lcb[3]], [lcb[0], lcb[3]],
+        ])
+    for i, bk in enumerate(banks_info):
+        # Obstacles for THIS bank's candidates: holes + OTHER banks' lift cores
+        # (exclude this bank's own core since its stair will sit outside it)
+        other_lift_obs = [o for j, o in enumerate(all_lift_obstacles) if j != i]
+        extra_obs = list(other_lift_obs) + list(additional_obstacles or [])
+        cands = _bank_stair_candidates(
+            bk["bank_idx"], bk["lift_core_bounds_mm"],
+            typical_floor_height_mm,
+            footprint_pts=footprint_pts,
+            footprint_holes=footprint_holes,
+            obstacle_polygons=extra_obs,
+        )
+        per_bank_cands.append(cands)
+        _fsl_log("[R3.Solve] Bank {}: {} candidate stair positions ({})".format(
+            i, len(cands), [c["label"] for c in cands]))
+
+    if not all(per_bank_cands):
+        _fsl_log("[R3.Solve] At least one bank has no valid candidates; aborting "
+                 "to legacy logic")
+        return None
+
+    # Drop any stale memoised test-point grids from a prior solve (different
+    # building geometry on the same session). The new run will warm the cache.
+    _r3_clear_caches()
+
+    # Precompute test points and the cleaned obstacle list ONCE for the whole
+    # solve. All inner loops below pass these via _test_pts/_obs to skip rebuild.
+    full_obstacles = list(additional_obstacles or []) + all_lift_obstacles
+    _test_pts = _cached_test_points(footprint_pts, footprint_holes)
+    _obs = _cleaned_obstacles(footprint_holes, full_obstacles)
+    total_cells = len(_test_pts)
+
+    # ── Step 2: try starting pairs in priority order ──────────────────────────
+    # Deduplicate by position-signature first, then evaluate coverage in
+    # parallel via ProcessPool (with serial fallback).
+    unique_combos = []
+    seen_signatures = set()
+    for combo in _enumerate_starting_pairs(per_bank_cands):
+        positions = [c["centre"] for c in combo]
+        sig = tuple(sorted(((round(p[0]), round(p[1])) for p in positions)))
+        if sig in seen_signatures:
+            continue
+        seen_signatures.add(sig)
+        unique_combos.append((sig, combo, positions))
+
+    _score_args = [
+        (positions, footprint_pts, footprint_holes, max_travel_dist,
+         full_obstacles, num_required)
+        for (_sig, _combo, positions) in unique_combos
+    ]
+    _score_results = _r3_parallel_map(
+        _r3_score_combo_worker, _score_args, chunk_label="starting-pair scoring")
+
+    all_configs = []
+    for (sig, combo, positions), (_sig_back, cov, _n) in zip(unique_combos, _score_results):
+        cfg = {
+            "stairs": [{"position": c["centre"], "bank_idx": c["bank_idx"],
+                         "label": c["label"]} for c in combo],
+            "coverage": cov,
+            "total_cells": total_cells,
+            "n_stairs": len(combo),
+        }
+        all_configs.append(cfg)
+
+    if not all_configs:
+        _fsl_log("[R3.Solve] No starting configurations generated; aborting")
+        return None
+
+    # Sort by coverage desc, then by stair count asc (prefer fewer stairs)
+    all_configs.sort(key=lambda c: (-c["coverage"], c["n_stairs"]))
+    _fsl_log("[R3.Solve] Generated {} starting configurations. Top 5 by coverage: {}".format(
+        len(all_configs),
+        [(c["coverage"], c["n_stairs"], [s["label"] for s in c["stairs"]])
+         for c in all_configs[:5]]))
+
+    # ── Step 3: keep configs that achieve full coverage. If none do, escalate ──
+    full_cov_configs = [c for c in all_configs if c["coverage"] >= total_cells]
+    if not full_cov_configs:
+        _fsl_log("[R3.Solve] No 2-stair config covers floor. Escalating with "
+                 "coverage-maximising additional stairs...")
+        # Take top 3 BEST partial-coverage configs and try to escalate each
+        for partial_cfg in all_configs[:3]:
+            current_positions = [s["position"] for s in partial_cfg["stairs"]]
+            current_stairs = list(partial_cfg["stairs"])
+            for _iter in range(6):  # safety cap
+                failing = _failing_cells(current_positions, footprint_pts,
+                                          footprint_holes, max_travel_dist,
+                                          full_obstacles, num_required,
+                                          _test_pts=_test_pts, _obs=_obs)
+                if not failing:
+                    break
+                add_cands = _additional_candidates_for_coverage(
+                    failing, current_positions, footprint_pts, footprint_holes,
+                    max_travel_dist, full_obstacles, _obs=_obs)
+                if not add_cands:
+                    _fsl_log("[R3.Solve] No additional candidate found for partial "
+                             "config {}; abandoning escalation path".format(
+                                 [s["label"] for s in partial_cfg["stairs"]]))
+                    break
+                best_add = add_cands[0]
+                current_positions.append(best_add["position"])
+                current_stairs.append({
+                    "position": best_add["position"],
+                    "bank_idx": -1,  # additional stair, not bound to a bank
+                    "label": best_add["label"] + " (added for coverage)",
+                })
+                _fsl_log("[R3.Solve] Escalation iter {}: added stair at {} (gain={}, "
+                         "separation={:.0f}mm)".format(
+                             _iter, best_add["position"], best_add["coverage_gain"],
+                             best_add["separation"]))
+            cov_final = _coverage_count(current_positions, footprint_pts,
+                                          footprint_holes, max_travel_dist,
+                                          full_obstacles, num_required,
+                                          _test_pts=_test_pts, _obs=_obs)
+            if cov_final >= total_cells:
+                full_cov_configs.append({
+                    "stairs": current_stairs,
+                    "coverage": cov_final,
+                    "total_cells": total_cells,
+                    "n_stairs": len(current_stairs),
+                })
+
+    if not full_cov_configs:
+        _fsl_log("[R3.Solve] No configuration achieves full coverage even after "
+                 "escalation; returning best partial as fallback")
+        full_cov_configs = all_configs[:1]
+
+    # Sort full-cov configs: prefer fewer stairs, then by total spatial spread
+    def _spread_score(cfg):
+        # Sum of pairwise distances (more spread = more redundant coverage)
+        positions = [s["position"] for s in cfg["stairs"]]
+        if len(positions) < 2:
+            return 0.0
+        total = 0.0
+        for i in range(len(positions)):
+            for j in range(i + 1, len(positions)):
+                total += math.sqrt(
+                    (positions[i][0] - positions[j][0]) ** 2
+                    + (positions[i][1] - positions[j][1]) ** 2
+                )
+        return total
+
+    full_cov_configs.sort(key=lambda c: (c["n_stairs"], -_spread_score(c)))
+    _fsl_log("[R3.Solve] {} configuration(s) achieve full coverage. Top {} for Gemini:".format(
+        len(full_cov_configs), min(top_n_for_gemini, len(full_cov_configs))))
+    for cfg in full_cov_configs[:top_n_for_gemini]:
+        _fsl_log("[R3.Solve]   - n={}, spread={:.0f}, stairs={}".format(
+            cfg["n_stairs"], _spread_score(cfg),
+            [(round(s["position"][0]), round(s["position"][1]), s["label"])
+             for s in cfg["stairs"]]))
+
+    # ── Step 4: compute shift ranges for each stair in the top configs ────────
+    # Cost: ~5 probes/axis × 4 axes × n_stairs × n_top_configs full-coverage
+    # checks. With memoised test points each check is ~30-50ms — for a 4-config
+    # × 2-stair plan that's ~30s. We aggressively skip this work:
+    #   - Skip entirely when only 1 config exists (Gemini has nothing to pick).
+    #   - Skip when try_gemini=False (no LLM means no use for shift ranges).
+    # In practice Gemini observed across builds always picks dx=0,dy=0, so
+    # the shift_range is almost dead-weight. Keep it ON for the main multi-
+    # config case to preserve LLM optionality.
+    top_configs = full_cov_configs[:top_n_for_gemini]
+    _skip_shift_ranges = (not try_gemini) or (len(top_configs) < 2)
+    if _skip_shift_ranges:
+        _fsl_log("[R3.Solve] Skipping shift-range computation (try_gemini={}, "
+                 "n_top_configs={})".format(try_gemini, len(top_configs)))
+        for cfg in top_configs:
+            for s in cfg["stairs"]:
+                s["shift_range"] = {"dx_min": 0, "dx_max": 0,
+                                      "dy_min": 0, "dy_max": 0}
+    else:
+        _shift_jobs = []  # list of (cfg_idx, stair_idx, args_tuple)
+        for _cfg_idx, cfg in enumerate(top_configs):
+            positions = [s["position"] for s in cfg["stairs"]]
+            for _s_idx, s in enumerate(cfg["stairs"]):
+                _shift_jobs.append((_cfg_idx, _s_idx, (
+                    s["position"], positions, footprint_pts, footprint_holes,
+                    max_travel_dist, full_obstacles, num_required,
+                )))
+        _shift_results = _r3_parallel_map(
+            _r3_shift_range_worker, [j[2] for j in _shift_jobs],
+            chunk_label="shift-range computation")
+        for (_cfg_idx, _s_idx, _args), _sr in zip(_shift_jobs, _shift_results):
+            top_configs[_cfg_idx]["stairs"][_s_idx]["shift_range"] = _sr
+
+    # ── Step 5: ask Gemini to pick (or skip if try_gemini=False or only 1 cfg) ─
+    chosen = top_configs[0]
+    if try_gemini and len(top_configs) >= 2:
+        chosen = _gemini_pick_layout_config(top_configs, footprint_pts,
+                                              footprint_holes, max_travel_dist,
+                                              full_obstacles, num_required)
+    elif len(top_configs) == 1:
+        _fsl_log("[R3.Solve] Only 1 valid configuration; skipping Gemini pick")
+
+    # ── Step 6: build safety_sets in the format the rest of engine expects ────
+    safety_sets = []
+    for s in chosen["stairs"]:
+        # Each chosen stair becomes a FIRE_LIFT set when bound to a bank, else
+        # a SMOKE_STOP perimeter set (additional stair).
+        if s.get("bank_idx", -1) >= 0:
+            safety_sets.append({
+                "pos": s["position"],
+                "type": "FIRE_LIFT",
+                "is_perimeter": False,
+                "bank_idx": s["bank_idx"],
+                "label": s["label"],
+            })
+        else:
+            safety_sets.append({
+                "pos": s["position"],
+                "type": "SMOKE_STOP",
+                "is_perimeter": True,
+                "rotation_deg": 0.0,
+                "label": s["label"],
+            })
+
+    return {
+        "configurations": top_configs,
+        "chosen": chosen,
+        "n_stairs": chosen["n_stairs"],
+        "safety_sets": safety_sets,
+    }
+
+
+def _gemini_pick_layout_config(configs, footprint_pts, footprint_holes,
+                                 max_travel_dist, obstacle_polygons, num_required):
+    """Send top configurations + shift ranges to Gemini for an architectural pick.
+    Falls back to configs[0] silently if Gemini is unavailable or returns
+    invalid output. Validates Gemini's pick by re-running coverage test.
+    """
+    try:
+        from revit_mcp.gemini_client import client
+    except Exception as _e:
+        _fsl_log("[R3.GeminiPick] gemini_client import failed ({}); using config #1".format(_e))
+        return configs[0]
+
+    lines = [
+        "Building staircase layout — choose the architecturally best configuration.",
+        "All configurations below satisfy SCDF travel distance ({} mm, {}-stair reach)".format(
+            int(max_travel_dist), num_required),
+        "with the same number of stairs ({}). They differ by stair placement.".format(
+            configs[0]["n_stairs"]),
+        "",
+    ]
+    if footprint_pts:
+        xs = [p[0] for p in footprint_pts]
+        ys = [p[1] for p in footprint_pts]
+        lines.append("Building footprint bbox: ({:.0f}-{:.0f}) x ({:.0f}-{:.0f}) mm".format(
+            min(xs), max(xs), min(ys), max(ys)))
+        if footprint_holes:
+            lines.append("Voids/courtyards: {}".format(footprint_holes))
+        lines.append("")
+    for i, cfg in enumerate(configs, 1):
+        lines.append("Configuration {} ({} stairs):".format(i, cfg["n_stairs"]))
+        for j, s in enumerate(cfg["stairs"]):
+            sr = s.get("shift_range", {})
+            lines.append("  Stair {}: position ({:.0f}, {:.0f}) [{}]".format(
+                j + 1, s["position"][0], s["position"][1], s["label"]))
+            if sr:
+                lines.append("    Shift range: dX [{}, {}] mm, dY [{}, {}] mm".format(
+                    int(sr.get("dx_min", 0)), int(sr.get("dx_max", 0)),
+                    int(sr.get("dy_min", 0)), int(sr.get("dy_max", 0))))
+        lines.append("")
+    lines.append(
+        "Reply with JSON only:")
+    lines.append(
+        '  {"config": <number>, "shifts": [{"dx": 0, "dy": 0}, ...]}')
+    lines.append(
+        "where 'shifts' has one entry per stair in the chosen config (in order).")
+    lines.append(
+        "Set dx=0, dy=0 to use the engine's exact position. Or shift within the")
+    lines.append(
+        "given range to better fit your design intent. The chosen config + shifts")
+    lines.append(
+        "must produce a layout that still passes the travel-distance test.")
+    prompt = "\n".join(lines)
+    _fsl_log("[R3.GeminiPick] Sending {} configurations to Gemini. Prompt:\n{}".format(
+        len(configs), prompt))
+
+    try:
+        raw = client.generate_content(prompt, thinking_budget=0, temperature=0.1)
+    except Exception as _e:
+        _fsl_log("[R3.GeminiPick] Gemini call FAILED ({}); using config #1".format(_e))
+        return configs[0]
+    _fsl_log("[R3.GeminiPick] Gemini response: {}".format((raw or "").strip()[:400]))
+
+    # Parse JSON
+    import re as _re
+    import json as _json
+    m = _re.search(r"\{[\s\S]*\}", raw or "")
+    if not m:
+        _fsl_log("[R3.GeminiPick] No JSON object in response; using config #1")
+        return configs[0]
+    try:
+        parsed = _json.loads(m.group())
+    except Exception as _e:
+        _fsl_log("[R3.GeminiPick] JSON parse FAILED ({}); using config #1".format(_e))
+        return configs[0]
+
+    cfg_idx = parsed.get("config")
+    if not isinstance(cfg_idx, int) or cfg_idx < 1 or cfg_idx > len(configs):
+        _fsl_log("[R3.GeminiPick] Invalid config index {}; using config #1".format(cfg_idx))
+        return configs[0]
+    chosen = configs[cfg_idx - 1]
+
+    # Apply shifts (if provided)
+    shifts = parsed.get("shifts", [])
+    if isinstance(shifts, list) and len(shifts) == len(chosen["stairs"]):
+        adjusted_stairs = []
+        for s, sh in zip(chosen["stairs"], shifts):
+            dx = sh.get("dx", 0) if isinstance(sh, dict) else 0
+            dy = sh.get("dy", 0) if isinstance(sh, dict) else 0
+            sr = s.get("shift_range", {})
+            # Clamp shifts to declared range
+            dx = max(sr.get("dx_min", 0), min(sr.get("dx_max", 0), dx))
+            dy = max(sr.get("dy_min", 0), min(sr.get("dy_max", 0), dy))
+            new_pos = (s["position"][0] + dx, s["position"][1] + dy)
+            adjusted_stairs.append({**s, "position": new_pos,
+                                    "shift_applied": {"dx": dx, "dy": dy}})
+        # Validate — does the adjusted layout still pass coverage?
+        adjusted_positions = [s["position"] for s in adjusted_stairs]
+        _val_test_pts = _cached_test_points(footprint_pts, footprint_holes)
+        _val_obs = _cleaned_obstacles(footprint_holes, obstacle_polygons)
+        cov = _coverage_count(adjusted_positions, footprint_pts, footprint_holes,
+                                max_travel_dist, obstacle_polygons, num_required,
+                                _test_pts=_val_test_pts, _obs=_val_obs)
+        total = len(_val_test_pts)
+        if cov >= total:
+            _fsl_log("[R3.GeminiPick] Gemini chose config #{} with shifts; adjusted "
+                     "layout passes coverage ({}/{}). Stairs: {}".format(
+                         cfg_idx, cov, total,
+                         [(round(s["position"][0]), round(s["position"][1])) for s in adjusted_stairs]))
+            chosen = {**chosen, "stairs": adjusted_stairs}
+        else:
+            _fsl_log("[R3.GeminiPick] Gemini's shifted layout FAILED coverage "
+                     "({}/{}); using engine positions for config #{}".format(
+                         cov, total, cfg_idx))
+    else:
+        _fsl_log("[R3.GeminiPick] Gemini chose config #{} without valid shifts".format(cfg_idx))
+
+    return chosen
 
 
 def _mirror_layout(layout, anchor_bounds, mirror_side, log_fn=None):
@@ -1905,9 +3483,18 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
                     if _sidx == 0:
                         _mirror = _mirror_layout(_layout, lift_core_bounds_mm,
                                                  _preferred_side, _fslog)
-                        # Validate the mirror doesn't collide with Set 0.
-                        # If it does (can happen when anchor isn't centred at origin),
-                        # fall through to OR-Tools for Set 1 instead of using the mirror.
+                        # Validate the mirror:
+                        #   1. No collision with already-placed Set 0 (existing).
+                        #   2. No overlap with any footprint hole (NEW — defence in
+                        #      depth for the upstream prompt range fix).  When a bank
+                        #      is close enough to a courtyard, the mirror reflection
+                        #      can land partly inside the void.  The upstream prompt
+                        #      reservation prevents Gemini from picking such positions
+                        #      in the first place; this check catches anything that
+                        #      slipped through (e.g. user-supplied manifest, or an
+                        #      under-budgeted prompt assumption).
+                        #   3. Mirror result lies fully inside the outer footprint.
+                        # On any failure, fall through to OR-Tools for Set 1.
                         _mirror_ok = False
                         if _mirror:
                             _mir_boxes = [_mirror["fire_lift"], _mirror["lobby"], _mirror["staircase"]]
@@ -1923,6 +3510,28 @@ def generate_fire_safety_manifest(safety_sets, levels_data, stair_spec,
                                         break
                                 if not _mirror_ok:
                                     break
+                            # Hole / footprint validation (defence in depth)
+                            if _mirror_ok and (footprint_pts or footprint_holes):
+                                from .core_layout_engine import (
+                                    _box_overlaps_hole as _bovh,
+                                    _box_inside_footprint as _bifp,
+                                )
+                                _holes_chk = footprint_holes or []
+                                for _mb in _mir_boxes:
+                                    if any(_bovh(_mb, _h) for _h in _holes_chk
+                                           if _h and len(_h) >= 3):
+                                        _mirror_ok = False
+                                        _fslog("[LayoutEngine] Mirror box ({:.0f},{:.0f},{:.0f},{:.0f}) "
+                                               "overlaps a footprint hole — re-solving Set 1".format(
+                                                   _mb[0], _mb[1], _mb[2], _mb[3]))
+                                        break
+                                    if (footprint_pts and len(footprint_pts) >= 3
+                                            and not _bifp(_mb, footprint_pts)):
+                                        _mirror_ok = False
+                                        _fslog("[LayoutEngine] Mirror box ({:.0f},{:.0f},{:.0f},{:.0f}) "
+                                               "extends outside the footprint — re-solving Set 1".format(
+                                                   _mb[0], _mb[1], _mb[2], _mb[3]))
+                                        break
                         if _mirror_ok:
                             _placed_layouts.append(_mirror)
                             _placed_boxes.extend([_mirror["fire_lift"],

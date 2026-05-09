@@ -3,10 +3,8 @@ import math
 import sys
 import os
 
-# Mocking relevant modules if not in Revit environment
-sys.path.append(os.path.dirname(__file__))
-from .fire_safety_logic import calculate_fire_safety_requirements, _check_radius_coverage
-from . import staircase_logic
+from revit_mcp.fire_safety_logic import calculate_fire_safety_requirements, _check_radius_coverage
+from revit_mcp import staircase_logic
 
 def test_coverage():
     floor_dims = [(60000, 60000)] # 60m x 60m floor plate

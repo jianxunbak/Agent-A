@@ -92,12 +92,24 @@ def calculate_lift_requirements(num_floors, avg_floor_height_mm, total_building_
     num_lifts = max(lifts_by_demand, _MIN_LIFTS)
     num_lifts = min(num_lifts, max_from_pop, _MAX_TOTAL)
 
+    # Identify which constraint was binding for diagnostics.
+    if num_lifts == _MAX_TOTAL and _MAX_TOTAL < lifts_by_demand:
+        _binding = "MAX_TOTAL hard cap ({})".format(_MAX_TOTAL)
+    elif num_lifts == max_from_pop and max_from_pop < lifts_by_demand:
+        _binding = "population cap (1 lift per {} occ)".format(_OCC_PER_LIFT)
+    elif num_lifts == _MIN_LIFTS and lifts_by_demand < _MIN_LIFTS:
+        _binding = "MIN_LIFTS floor ({})".format(_MIN_LIFTS)
+    else:
+        _binding = "RTT demand"
+
     _ll_log("[LiftCalc] floors={} avg_h={}mm occ={} height={:.1f}m speed={:.1f}m/s "
             "H={:.1f} RTT={:.1f}s S={:.1f} peak_demand={:.0f} "
-            "handling_per_lift={:.1f} lifts_by_demand={} max_from_pop={} -> lifts={}".format(
+            "handling_per_lift={:.1f} lifts_by_demand={} max_from_pop={} -> lifts={} "
+            "(binding: {})".format(
             num_floors, avg_floor_height_mm, int(total_building_occupancy),
             total_height_m, V, H, RTT, S, peak_demand,
-            handling_capacity_per_lift, int(lifts_by_demand), max_from_pop, int(num_lifts)))
+            handling_capacity_per_lift, int(lifts_by_demand), max_from_pop, int(num_lifts),
+            _binding))
     return int(num_lifts)
 
 def get_core_dimensions(num_lifts, internal_size=(2500, 2500), lobby_width=3000):

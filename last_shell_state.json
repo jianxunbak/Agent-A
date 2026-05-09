@@ -1,1 +1,0 @@
-{"shape": "ellipse", "width": 45000.0, "length": 70000.0, "column_spacing": 13000, "parapet_height": 1100, "cantilever_depth": 0, "columns_center_only": true, "footprint_scale_overrides": {"1": 1.0, "30": 0.85}, "footprint_offset_overrides": {"1": [0, 0], "7": [8000, 0], "15": [0, 0], "23": [-8000, 0], "30": [0, 0]}, "position": [0.0, 0.0]}

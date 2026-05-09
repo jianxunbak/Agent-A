@@ -490,10 +490,12 @@ Self-check: first sentence in `<architectural_intent>` MUST be:
 Apply the polygon self-check rule: if using `footprint_points`, trace the outline mentally and verify the polygon does not self-intersect.
 
 ## L/U/H SHAPES — MINIMUM 2 CLUSTERS (MANDATORY)
-For any L, U, H, or other arm-based floor plate, always plan for 2 fire clusters (= 2 staircases).
-- Set `"staircases": {"count": 2}` (minimum — the engine may add perimeter stairs on top).
+For any L, U, H, or other arm-based floor plate, always plan for 2 fire clusters.
 - In Pass 2 you will provide BOTH clusters on OPPOSITE sides of the bank.
 - If an arm is too narrow for a cluster, widen it in Pass 1 NOW (not in Pass 2). Each arm must be at least 15000mm wide. If the user specified a narrower arm, widen to 15000mm and note it.
+
+## STAIRCASE COUNT
+Always set `"staircases": {"count": 2}` — this is the SCDF minimum. The engine computes the actual number of staircases from floor coverage and travel-distance compliance, and will add more on top if needed. Do NOT inflate this count to match cluster or bank counts; the engine handles that.
 
 ## COMPLIANCE PARAMETERS
 Copy all relevant RAG values to `compliance_parameters` exactly as in full builds.
@@ -507,7 +509,7 @@ The engine uses these for core pre-computation in the analysis pass.
   "project_setup": { "levels": N, "level_height": H },
   "shell": { ... },
   "lifts": { "count": N },
-  "staircases": { "count": N }
+  "staircases": { "count": 2 }
 }
 ```
 
@@ -642,7 +644,7 @@ Single-bank example (simple rectangular building):
       {"side": "south"}
     ]
   },
-  "staircases": { "count": N }
+  "staircases": { "count": 2 }
 }
 ```
 
@@ -667,7 +669,7 @@ Two-bank example (courtyard building — lifts split evenly):
       }
     ]
   },
-  "staircases": { "count": N }
+  "staircases": { "count": 2 }
 }
 ```
 Note: for EW bank → use "north"/"south" clusters. For NS bank → use "east"/"west" clusters.

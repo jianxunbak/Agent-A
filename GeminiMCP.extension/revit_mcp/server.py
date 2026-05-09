@@ -331,14 +331,3 @@ async def rollback_to_option(option_number: int = 1, revision_number: int = None
     rev_str = str(revision_number) if revision_number is not None else None
     return await asyncio.to_thread(orchestrator._execute_rollback, str(option_number), rev_str)
 
-@mcp.tool()
-def export_option_to_notion(option_number: int = 1, revision_number: int = None) -> str:
-    """Export a saved design option or revision to Notion as a new database page.
-    Uploads the manifest JSON and design metadata (name, typology, duration, etc.).
-    option_number: the option number (e.g. 1 for Opt-001).
-    revision_number: optional; omit to export the base option.
-    Use when the user says 'export option 1 to Notion' or 'upload design 2 to Notion'.
-    """
-    from revit_mcp.build_memory import get_options_manager
-    rev_str = str(revision_number) if revision_number is not None else None
-    return get_options_manager().export_to_notion(str(option_number), rev_str)

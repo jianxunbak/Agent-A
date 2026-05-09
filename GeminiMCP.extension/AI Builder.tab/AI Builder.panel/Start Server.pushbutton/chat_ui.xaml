@@ -1,6 +1,6 @@
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Gemini MCP Chat" Height="600" Width="450"
+        Title="AI Builder" Height="600" Width="450"
         Background="#1E1E1E" Foreground="#FFFFFF" FontFamily="Segoe UI"
         WindowStartupLocation="CenterScreen"
         Topmost="True">
@@ -19,7 +19,7 @@
                     <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
                 <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
-                    <TextBlock Text="Gemini MCP Chat" FontSize="20" FontWeight="SemiBold" VerticalAlignment="Center" Foreground="#E0E0E0"/>
+                    <TextBlock Text="AI Builder" FontSize="20" FontWeight="SemiBold" VerticalAlignment="Center" Foreground="#E0E0E0"/>
                     <TextBlock x:Name="StatusDot" Text=" ●" FontSize="14" VerticalAlignment="Center" Foreground="#4CAF50" Margin="10,0,0,0"/>
                     <TextBlock x:Name="StatusText" Text="MCP Server Active" FontSize="12" VerticalAlignment="Center" Foreground="#AAAAAA" Margin="5,0,0,0"/>
                 </StackPanel>
@@ -67,6 +67,7 @@
                                 </Style>
                             </ContextMenu.Resources>
                             <MenuItem x:Name="ClearChatMenuItem" Header="Clear Chat"/>
+                            <MenuItem x:Name="ClearRagCacheMenuItem" Header="Clear RAG Cache"/>
                         </ContextMenu>
                     </Button.ContextMenu>
                 </Button>
@@ -76,8 +77,8 @@
         <!-- Chat History Area -->
         <ScrollViewer Grid.Row="1" Name="ChatScroller" VerticalScrollBarVisibility="Auto" Margin="0,10,0,10">
             <StackPanel Name="ChatHistory" VerticalAlignment="Bottom">
-                <Border Background="#2D2D2D" CornerRadius="8" Padding="12" HorizontalAlignment="Left" Margin="0,5,50,5">
-                    <TextBlock Text="Hello! I am your Gemini-powered Revit assistant. The MCP server is running and I'm ready to help." TextWrapping="Wrap" MaxWidth="300" Foreground="#FFFFFF"/>
+                <Border Background="#2D2D2D" CornerRadius="8" Padding="12" HorizontalAlignment="Stretch" Margin="0,5,10,5">
+                    <TextBlock Text="Hello! I am your Gemini-powered Revit assistant. The MCP server is running and I'm ready to help." TextWrapping="Wrap" Foreground="#FFFFFF"/>
                 </Border>
             </StackPanel>
         </ScrollViewer>
