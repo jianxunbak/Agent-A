@@ -218,14 +218,18 @@ def _expand_with_gemini(topic: str, intent: dict, log_fn=None) -> list | None:
 def build_queries(topic: str, intent: dict) -> list:
     """Return a list of search queries for the given topic.
 
-    Primary: Gemini-driven expansion based on building intent (no hardcoded clauses).
-    Fallback: legacy TOPIC_QUERIES with simple substitution if Gemini expansion fails.
+    Primary: legacy TOPIC_QUERIES with intent substitution (fast, no LLM call).
+    Fallback: Gemini expansion only for topics with no legacy template — preserves
+    flexibility for unknown topics without paying the LLM latency on every build.
     """
     try:
         from revit_mcp.gemini_client import client as _client
         log_fn = lambda m: _client.log(f"[RAG] {m}")
     except Exception:
         log_fn = None
+
+    if topic in TOPIC_QUERIES:
+        return _legacy_queries(topic, intent)
 
     cache_key = (topic, intent.get("building_type", ""), _storey_bucket(intent.get("storeys", "")))
     with _expansion_cache_lock:
@@ -242,7 +246,7 @@ def build_queries(topic: str, intent: dict) -> list:
         return expanded
 
     if log_fn:
-        log_fn(f"[query_builder] falling back to legacy hardcoded queries for {topic}")
+        log_fn(f"[query_builder] no legacy template and Gemini expansion failed for {topic} — using generic fallback")
     return _legacy_queries(topic, intent)
 
 

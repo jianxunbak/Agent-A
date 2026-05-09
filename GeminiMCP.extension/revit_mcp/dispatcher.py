@@ -1970,6 +1970,8 @@ class Orchestrator:
             if opt_num:
                 self.log("Dispatcher: Use/rollback intent — option={}, revision={}".format(opt_num, rev_num))
                 return self._execute_rollback(opt_num, rev_num), classified
+            self.log("Dispatcher: {} intent missing option number — asking user to clarify.".format(intent))
+            return ("Which option would you like to use?\n\n" + mgr.list_options()), classified
 
         if intent == "reorder_option":
             opt_num = str(classified.get("option", ""))
@@ -1978,6 +1980,9 @@ class Orchestrator:
                 self.log("Dispatcher: Reorder-option intent — option={} → position={}".format(opt_num, tgt_pos))
                 ok, msg = mgr.reorder_option(opt_num, tgt_pos)
                 return msg, classified
+            self.log("Dispatcher: reorder_option intent missing option/target — asking user to clarify.")
+            return ("Which option would you like to reorder, and to which position? "
+                    "(e.g. 'move option 2 to position 1')\n\n" + mgr.list_options()), classified
 
         if intent == "delete_revision":
             opt_num = str(classified.get("option", ""))
@@ -1986,6 +1991,10 @@ class Orchestrator:
                 self.log("Dispatcher: Delete-revision intent — option={}, rev={}".format(opt_num, rev_num))
                 ok, msg = mgr.delete_revision(opt_num, rev_num)
                 return msg, classified
+            self.log("Dispatcher: delete_revision intent missing option/revision — asking user to clarify.")
+            return ("Which revision would you like to delete? "
+                    "Please specify both the option and revision number "
+                    "(e.g. 'delete revision 2 of option 1').\n\n" + mgr.list_options()), classified
 
         if intent == "delete_all_options":
             self.log("Dispatcher: Delete-all-options intent.")
@@ -1998,6 +2007,9 @@ class Orchestrator:
                 self.log("Dispatcher: Delete-option intent — option={}".format(opt_num))
                 ok, msg = mgr.delete_option(opt_num)
                 return msg, classified
+            self.log("Dispatcher: delete_option intent missing option number — asking user to clarify.")
+            return ("Which option would you like to delete? "
+                    "(e.g. 'delete option 1')\n\n" + mgr.list_options()), classified
 
         if intent == "recreate_option":
             opt_num = str(classified.get("option", ""))
@@ -2005,6 +2017,9 @@ class Orchestrator:
             if opt_num:
                 self.log("Dispatcher: Recreate-option intent — option={}, revision={}".format(opt_num, rev_num))
                 return self._execute_rollback(opt_num, rev_num), classified
+            self.log("Dispatcher: recreate_option intent missing option number — asking user to clarify.")
+            return ("Which option would you like to recreate? "
+                    "(e.g. 'recreate option 2')\n\n" + mgr.list_options()), classified
 
         if intent == "export_option":
             opt_num = str(classified.get("option", ""))
@@ -2043,6 +2058,9 @@ class Orchestrator:
                     src_opt_num, src_rev_num, tgt_opt_num))
                 ok, msg = mgr.move_to_revision(src_opt_num, tgt_opt_num, src_rev_num)
                 return msg, classified
+            self.log("Dispatcher: move_to_revision intent missing target option — asking user to clarify.")
+            return ("Which option should the revision be moved to? "
+                    "(e.g. 'move revision 2 of option 1 to option 3')\n\n" + mgr.list_options()), classified
 
         if intent == "new_build":
             # Explicit "from scratch" / "start over" → clear context, fall through to Gemini
@@ -2342,6 +2360,39 @@ class Orchestrator:
 
         tracker.report("\n".join(lines))
 
+    def _trim_to_balanced_braces(self, s):
+        """Return the substring from the first '{' to the matching closing '}', or None.
+
+        Honours strings and escapes so braces inside string literals don't throw off the
+        depth counter. Used by _extract_json to drop trailing text after the JSON object.
+        """
+        start = s.find("{")
+        if start == -1:
+            return None
+        depth = 0
+        in_string = False
+        escape_next = False
+        for i in range(start, len(s)):
+            ch = s[i]
+            if escape_next:
+                escape_next = False
+                continue
+            if ch == "\\" and in_string:
+                escape_next = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return s[start:i+1].strip()
+        return None
+
     def _extract_json(self, text):
         # Log tail of response to diagnose extraction failures
         self.log("_extract_json: text len={}, tail={}".format(
@@ -2354,6 +2405,14 @@ class Orchestrator:
         if fence_match:
             candidate = fence_match.group(1).strip()
             if candidate and candidate.startswith("{"):
+                # Trim any trailing non-JSON text after the closing brace (e.g. when
+                # Gemini puts an <architectural_intent> block inside the fence). Run a
+                # brace-depth scan to find the real end of the JSON object.
+                trimmed = self._trim_to_balanced_braces(candidate)
+                if trimmed is not None and trimmed != candidate:
+                    self.log("_extract_json: trimmed trailing text inside fence ({} -> {} chars)".format(
+                        len(candidate), len(trimmed)))
+                    return trimmed
                 self.log("_extract_json: extracted via ```json fence ({} chars)".format(len(candidate)))
                 return candidate
 

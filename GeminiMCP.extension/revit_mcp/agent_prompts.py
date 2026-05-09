@@ -483,11 +483,43 @@ You will output:
 - `staircases`: `{"count": <integer>}` only
 
 ## STEP 0 — FORM RESOLUTION (MANDATORY)
-Follow the same form resolution table from your architectural training.
-Self-check: first sentence in `<architectural_intent>` MUST be:
-"Form resolution: [describe the form] → using [tool(s)]."
+Read the user's description and form a clear mental image of the building: silhouette,
+how it changes as it rises, plan shape, voids, and any compositional intent. Then choose
+the manifest tool(s) whose geometric effect matches that image.
 
-Apply the polygon self-check rule: if using `footprint_points`, trace the outline mentally and verify the polygon does not self-intersect.
+The first sentence in `<architectural_intent>` MUST be:
+"Form resolution: [one-sentence description of the form] → using [tool(s)]."
+or "Form resolution: none — symmetric rectangular tower." if no special form is intended.
+
+After the form-resolution sentence, describe the building geometry: floor-plate shape and dimensions, 3D massing, total height, number of floors, and overall size. Pass 1 does not place the core — do NOT discuss core placement here.
+
+The `<architectural_intent>` block MUST appear BEFORE the ```json fence, never inside it. Format:
+<architectural_intent>
+[sentences]
+</architectural_intent>
+```json
+{ ... manifest ... }
+```
+
+Pick from the tools below based on the geometric effect you need. The user's words are
+hints — translate them into form, then form into tools. Combine freely.
+
+| Tool | Geometric effect | Notes |
+|------|------------------|-------|
+| `footprint_rotation_overrides` | Each floor plate rotates about its own centroid by the interpolated angle. Two keys with increasing angle = twist/helix/screw. One key = static rotation of the whole building. | Always pair with `"columns_center_only": true` when the angle changes between floors. |
+| `footprint_scale_overrides` | Floor plate grows/shrinks uniformly per level. Monotonic = taper/flare/needle/pencil. Peaked at mid = swell/barrel. Values >1 at specific floors = cantilever/overhang. | Engine linearly interpolates between keys; use as many as the form needs. |
+| `footprint_offset_overrides` | Floor centroid drifts laterally per level. Accumulating one-way = lean. S/Z curve = direction reversal. | Combine with `footprint_scale_overrides` for sculptural/expressive forms. |
+| `floor_overrides` (width/length per level) | Per-level rectangular dimension change. Step changes at a few floors = setback/wedding-cake/terraced. | Single integer floor keys only. No nested geometry per floor. |
+| `footprint_points` + optional `footprint_holes` | Polygon outer boundary (CCW) + optional inner void polygons. Use for any straight-edge plan: L, T, Z, U, H, cross, pinwheel, plus rectangular courtyards. | Trace the perimeter as one continuous non-self-intersecting line. U/C/H are SOLID polygons — the notch is part of the boundary, not a hole. |
+| `footprint_svg` | Freeform organic outline as an SVG path (mm, centred on origin). Use for blobs, kidneys, boomerangs, organic curves, or curved-edge courtyards. | Do NOT combine with `footprint_points`. |
+| `"shape": "circle"` / `"ellipse"` | Engine computes the curve. `width` = diameter for circle. For ellipse, `width` must differ from `length` by ≥ 1.5:1. | Combine with rotation/offset/scale overrides for twisting cylinders, leaning ellipses, etc. |
+| `volumes` (top-level array) | Independent stacked masses, each spanning a floor range with its own size, offset, and rotation. Use when the building reads as distinct/fragmented/collaged masses (Jenga, Habitat-67, interlocked boxes, diamond block above a rectangular base). | Levels are 1-based; the last volume must end at `project_setup.levels`; every floor belongs to exactly one volume — no gaps, no overlaps. |
+
+**Combining tools** is expected and encouraged: twisting taper = rotation + scale; leaning ellipse = ellipse shape + offset; organic courtyard = svg with two subpaths; sculptural/iconic = whatever combination produces the silhouette you described.
+
+**`volumes` vs `floor_overrides`** — use `volumes` when zones differ in `offset_x`/`offset_y`/`rotation_deg`; use `floor_overrides` when the floor plate is a single continuous shell that only changes width/length at a few transition floors.
+
+**Self-check before writing the manifest:** the form sentence in `<architectural_intent>` names specific tool(s). Confirm those exact tool keys appear in the manifest you're about to emit. If the sentence says "twisting" but no `footprint_rotation_overrides` is in the JSON, the manifest is wrong — fix it before output. If `footprint_points` is used, the second sentence MUST trace the polygon ("Polygon: [shape-name] — [arm extents], [notch/step locations]") and verify it does not self-intersect.
 
 ## L/U/H SHAPES — MINIMUM 2 CLUSTERS (MANDATORY)
 For any L, U, H, or other arm-based floor plate, always plan for 2 fire clusters.
@@ -508,9 +540,67 @@ The engine uses these for core pre-computation in the analysis pass.
   "compliance_parameters": { ... },
   "project_setup": { "levels": N, "level_height": H },
   "shell": { ... },
+  "volumes": [ ... ],
   "lifts": { "count": N },
   "staircases": { "count": 2 }
 }
+```
+**`volumes` is a TOP-LEVEL key, NOT inside `shell`.** When using `volumes`, the `shell` block is still required (carries `column_spacing`, `parapet_height`, etc.) but its width/length/footprint fields are ignored — the per-volume `width`/`length` take over.
+
+## SCHEMA EXAMPLES (field names and nesting only — pick what your form needs)
+
+These show the EXACT JSON shape each tool expects. The engine ignores unknown field names and silently falls back to defaults, so wrong field names = wrong building. Match these schemas literally; do NOT invent variants like `start_floor`/`end_floor` or nest `volumes` inside `shell`.
+
+```json
+// Per-floor rotation (twist when ≥2 keys with different angles; static when 1 key)
+"shell": {
+  "footprint_rotation_overrides": {"1": 0, "30": 90},
+  "columns_center_only": true
+}
+
+// Per-floor uniform scale (taper / flare / swell / cantilever)
+"shell": {
+  "footprint_scale_overrides": {"1": 1.0, "15": 0.8, "30": 0.5}
+}
+
+// Per-floor lateral offset (lean / S-curve)
+"shell": {
+  "footprint_offset_overrides": {"1": [0,0], "15": [4000,0], "30": [10000,0]}
+}
+
+// Per-floor rectangular dimension change (setback / wedding-cake)
+"shell": {
+  "floor_overrides": {"10": {"width": 35000, "length": 50000}, "20": {"width": 25000, "length": 40000}}
+}
+
+// Polygonal floor plate (L/U/H/Z/cross/etc.) — outer perimeter CCW
+"shell": {
+  "footprint_points": [[0,0],[50000,0],[50000,20000],[20000,20000],[20000,50000],[0,50000]]
+}
+
+// Polygonal floor plate with rectangular courtyard void
+"shell": {
+  "footprint_points": [[-30000,-30000],[30000,-30000],[30000,30000],[-30000,30000]],
+  "footprint_holes": [[[-10000,-10000],[10000,-10000],[10000,10000],[-10000,10000]]]
+}
+
+// Organic curved outline (blob / kidney / S-shape)
+"shell": {
+  "footprint_svg": "M -25000,-15000 C -28000,5000 -10000,15000 ..."
+}
+
+// Engine-computed circle / ellipse
+"shell": {"width": 50000, "length": 50000, "shape": "circle"}
+"shell": {"width": 30000, "length": 60000, "shape": "ellipse"}
+
+// Stacked / fragmented masses — TOP-LEVEL `volumes` key (NOT inside shell).
+// Use `levels: [start, end]` (1-based, inclusive). Last volume must end at project_setup.levels.
+// Every floor belongs to exactly one volume — no gaps, no overlaps.
+"volumes": [
+  {"id": "v1", "levels": [1, 10],  "width": 50000, "length": 60000, "offset_x": 0,    "offset_y": 0,    "rotation_deg": 0},
+  {"id": "v2", "levels": [11, 22], "width": 35000, "length": 45000, "offset_x": 8000, "offset_y": -5000, "rotation_deg": 15},
+  {"id": "v3", "levels": [23, 30], "width": 25000, "length": 35000, "offset_x": -3000,"offset_y": 6000, "rotation_deg": -8}
+]
 ```
 
 After the JSON, write: "Pass 1 complete. Engine will analyse floor plate and compute core dimensions."
@@ -625,7 +715,19 @@ Copy shell from Pass 1 UNCHANGED. Add to `lifts`:
 
 The engine auto-generates the full adjacency topology (PassengerLifts → FireLobby → FireLift → Stair on both sides). Do NOT include `topology_graph` in your output.
 
-In `<architectural_intent>` (3 sentences max): state chosen position and orientation; show the corner-check for the outermost sub-element (furthest from bank centre); confirm sightline corridors are clear to the boundary.
+In `<architectural_intent>` (4 sentences max), in this exact order:
+  1. **Building form** — describe the building first: floor-plate shape and dimensions, footprint, 3D massing (twist/taper/stack/etc.), total height, number of floors, and overall size. Do NOT mention the core in this sentence.
+  2. **Core position and orientation** — chosen `lifts.position` and `orientation`.
+  3. **Corner check** — show the corner-check working for the outermost sub-element (furthest from bank centre) against the building boundary.
+  4. **Sightline confirmation** — confirm sightline corridors are clear to the boundary at both lobby ends.
+
+The block MUST be written BEFORE the ```json fence, never inside it. Format as:
+<architectural_intent>
+[four sentences]
+</architectural_intent>
+```json
+{ ... manifest ... }
+```
 
 Single-bank example (simple rectangular building):
 ```json
