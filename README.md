@@ -6,18 +6,172 @@ The chat window is the primary UI. The extension also exposes the same tools via
 
 ---
 
-## Architecture at a glance
+## Workflow
+
+The system has four moving parts: a **WPF chat window** running on Revit's UI thread, a **FastMCP/Uvicorn server** running on a background thread, a **dispatcher** that talks to Gemini and assembles a JSON building manifest, and a **6-phase worker** that executes that manifest inside Revit transactions. The four diagrams below zoom in from the top-level loop to the threading bridge that holds it all together.
+
+### 1. End-to-end flow (high level)
 
 ```
-You type into the chat window inside Revit
-            │
-            ▼
-   script.py  ──►  dispatcher.py  ──►  Gemini API   (set GEMINI_MODEL in .env)
-                          │
-                          │  produces a JSON building manifest
-                          ▼
-                   revit_workers.py  ──►  Revit Transactions  ──►  Built model
+┌──────────────┐   prompt    ┌────────────┐   classified    ┌────────────┐
+│ Chat window  │ ──────────► │ dispatcher │ ──────────────► │   Gemini   │
+│  (in Revit)  │             │  .py       │                 │    API     │
+└──────────────┘             └────────────┘ ◄─────────────  └────────────┘
+       ▲                          │           JSON manifest
+       │                          ▼
+       │                    ┌────────────┐   Transactions   ┌────────────┐
+       │  result text       │ revit_     │ ───────────────► │ Revit 2026 │
+       └────────────────────│ workers.py │                  │   model    │
+                            └────────────┘ ◄─────────────── └────────────┘
+                                              built elements
 ```
+
+1. User clicks **AI Builder → Start Server**. `script.py` boots the chat window (WPF) and launches Uvicorn on `localhost:8001`.
+2. User types a prompt; the chat panel forwards it to `gemini_client.client.chat_with_orchestrator()` which calls `orchestrator.run_full_stack(uiapp, prompt, history)` in `dispatcher.py`.
+3. The dispatcher classifies intent, gathers BIM state, runs RAG (if enabled), and asks Gemini for a JSON building manifest.
+4. `revit_workers.execute_fast_manifest()` consumes the manifest and creates levels, walls, floors, columns, lifts, and stairs across six transactional phases.
+5. The chat window streams progress (via `progress_tracker.py` SSE) and displays the final result.
+
+### 2. Dispatcher detail (what happens between prompt and manifest)
+
+```
+                user_prompt + history
+                        │
+                        ▼
+        ┌────────────────────────────────┐
+        │ classify_intent (Gemini call)  │── multi-intent: clarify / query /
+        │  → {intents: [...]}            │   authority_query / build / new_build /
+        └────────────────────────────────┘   delete / clear_chat / rollback
+                        │
+        ┌───────────────┴────────────────┐
+        │                                │
+   fast intents                    build / new_build
+   (clarify, query,                       │
+    authority, delete,                    ▼
+    rollback)                   ┌──────────────────┐
+        │                       │ gather BIM state │  cached 30 s; force-refresh
+        │                       │ (main thread)    │  on "create"/"delete"/"clear"
+        │                       └──────────────────┘
+        │                                │
+        │                                ▼
+        │                       ┌──────────────────┐
+        │                       │ RAG block        │  Vertex AI Search
+        │                       │ (if RAG_ENABLED) │  → rag_rules_cache.json
+        │                       └──────────────────┘
+        │                                │
+        │                                ▼
+        │                       ┌──────────────────┐
+        │                       │ Build Gemini     │  DISPATCHER_PROMPT +
+        │                       │ prompt           │  presets + compliance +
+        │                       └──────────────────┘  state + history + RAG
+        │                                │
+        │                                ▼
+        │                       ┌──────────────────┐
+        │                       │ Gemini → JSON    │  4000-char output budget
+        │                       │ manifest         │  retry on malformed JSON (×3)
+        │                       └──────────────────┘
+        │                                │
+        │                                ▼
+        │                       ┌──────────────────┐
+        │                       │ QC validation    │  second Gemini pass checks
+        │                       │ pass             │  manifest sanity
+        │                       └──────────────────┘
+        │                                │
+        │                                ▼
+        │                       ┌──────────────────┐    CONFLICT
+        │                       │ revit_workers    │ ──────────────┐
+        │                       │ .execute_fast_   │               │
+        │                       │ manifest()       │               │
+        │                       └──────────────────┘               │
+        │                                │                         │
+        │                                │ OK                      │
+        │                                ▼                         │
+        │                       ┌──────────────────┐               │
+        │                       │ build_memory →   │               │
+        │                       │ save Option/Rev  │               │
+        │                       └──────────────────┘               │
+        │                                │                         │
+        ▼                                ▼                         ▼
+   text reply                       text reply              append conflict
+   to chat window                   to chat window          → retry (≤3 attempts)
+```
+
+1. **Classify** — `client.classify_intent()` returns `{"intents": [...]}`. Multiple intents per message are supported (e.g. *"clear the model and tell me about SCDF Table 2.2A"*).
+2. **Fast-path** — `clarify`, `clear_chat`, `query`, `authority_query`, `delete`, `rollback` complete without touching the build pipeline.
+3. **State gather** — `gather_state()` runs on Revit's main thread, returns levels / heights / overrides / element counts. Cached 30 s; invalidated by `create`/`delete`/`clear`/`wipe` keywords.
+4. **RAG (optional)** — when `RAG_ENABLED=true`, `vertex_rag.py` retrieves authority rules keyed by `(building_type, storeys)`. Result cached on disk in `rag_rules_cache.json`.
+5. **Prompt assembly** — `DISPATCHER_PROMPT` + presets JSON + compliance JSON + current state + chat history + RAG block + user prompt.
+6. **Manifest generation** — Gemini at temperature 0.1, 4000-char output budget. Up to 3 retries if the response isn't valid JSON.
+7. **QC pass** — second Gemini call validates the manifest before execution.
+8. **Execute** — `revit_workers.execute_fast_manifest()` runs the 6-phase build (next diagram).
+9. **Conflict retry** — if a phase returns `{"status": "CONFLICT", "description": "..."}`, the description is appended to the prompt and Gemini is re-invoked. Max 3 attempts.
+10. **Persist** — successful manifest saved to `build_options.json` as a named **Option**. Subsequent edits become **Revisions** of that option.
+
+### 3. The 6-phase build (inside `revit_workers.py`)
+
+```
+                 ┌──────────────────────── TransactionGroup ────────────────────────┐
+                 │                                                                  │
+   manifest ───► │  Phase 1   Phase 2          Phase 3    Phase 4    Phase 5    P6  │ ───► built
+                 │  ┌──────┐ ┌──────────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌──┐ │     model
+                 │  │Levels│ │Vert. circul. │ │ Shell  │ │Structure│ │Override│ │Cl│ │
+                 │  └──────┘ │ • passenger  │ │ • walls│ │• columns│ │• per-  │ │ea│ │
+                 │           │   lifts      │ │ • floors│ │  on grid│ │  floor │ │nu│ │
+                 │           │ • fire stairs│ │        │ │        │ │  width │ │p │ │
+                 │           │ • fire lifts │ │        │ │        │ │  /len  │ │  │ │
+                 │           │ • fire lobby │ │        │ │        │ │        │ │  │ │
+                 │           └──────────────┘ └────────┘ └────────┘ └────────┘ └──┘ │
+                 │                                                                  │
+                 │  each phase = its own Transaction with IFailuresPreprocessor     │
+                 └──────────────────────────────────────────────────────────────────┘
+```
+
+1. **Levels** — create or reuse Revit `Level` objects matching `project_setup.levels` and `level_height`/`height_overrides`.
+2. **Vertical circulation** — `core_layout_engine.py` (OR-Tools CP-SAT) places fire stair / fire lobby / fire lift / passenger lift modules around an anchor; `lift_logic.py` sizes passenger lifts (BS EN 81-20), `staircase_logic.py` builds fire-escape stairs (150 mm riser / 300 mm tread, min 2/building), `fire_safety_logic.py` adds fire-fighting lifts and lobbies (BS EN 81-72, BS 9999). `nuclear_lockdown(doc)` runs first to disjoint walls. Returns `CONFLICT` if `spatial_registry.py` detects an AABB collision.
+3. **Shell** — exterior walls and floors (rectangular, polygon, or SVG-path footprint, with optional courtyard hole). `nuclear_lockdown()` again before this phase.
+4. **Structure** — columns placed on the column-spacing grid.
+5. **Granular overrides** — per-floor width / length / cantilever changes from `floor_overrides`.
+6. **Cleanup** — delete obsolete AI-managed elements that aren't in the new manifest (identified via Extensible Storage `AI_ID`).
+
+A `CONFLICT` from any phase aborts the TransactionGroup and bubbles back to step 9 of diagram 2.
+
+### 4. Threading bridge (why none of this deadlocks)
+
+```
+   ┌─────────────────── Revit main thread (single, STA) ───────────────────┐
+   │                                                                       │
+   │   UIApplication.Idling ──► pump_commands(uiapp) ──► drain queue       │
+   │   ▲                                ▲                     │            │
+   │   │  (also Win32 PostMessage      │                     │            │
+   │   │   + DispatcherTimer fallback) │                     ▼            │
+   │   │                                │              run lambdas in     │
+   │   │  WPF Chat Window               │              Revit Transactions │
+   │   │  (XAML, on UI thread)          │                                 │
+   │   └────────────────────────────────┴─────────────────────────────────┘
+                       ▲                         ▲
+                       │ result                  │ blocks 1200 s max
+                       │                         │
+   ─────────────────── │ ─── thread boundary ─── │ ───────────────────────
+                       │                         │
+   ┌─────────────────  │ ──── Uvicorn / FastMCP background thread ───────┐
+   │                   │                         │                       │
+   │   server.py  ──►  tool_logic.py  ──►  bridge.run_on_main_thread(fn)│
+   │   (FastMCP            │                                             │
+   │    tool handler)      │  enqueues fn + Event                        │
+   │                       │  waits on Event                             │
+   └───────────────────────┼─────────────────────────────────────────────┘
+                           │
+                  same bridge is used by
+                  dispatcher.py for state-gather
+                  and main-thread tool calls
+```
+
+1. Revit's API is **single-threaded** — calls are only legal on the UI thread, inside an Idling event or an `ExternalEvent`.
+2. Uvicorn / FastMCP runs on a **background thread**, so it cannot call Revit directly.
+3. `bridge.run_on_main_thread(fn)` enqueues `fn` plus a `threading.Event`, then blocks the caller (1200 s timeout).
+4. Three wake strategies push Revit to drain the queue: registered `UIApplication.Idling` handler, Win32 `PostMessage` + WPF `DispatcherTimer` (fallback), and Idling-only (last resort, requires user mouse activity).
+5. `pump_commands(uiapp)` runs on the main thread, executes each queued lambda inside a fresh `Transaction`, stores the return value, and signals the Event — unblocking the background caller with the result.
+6. **Rule:** every Revit DB / UI call inside `tool_logic.py`, `dispatcher.py`, and `revit_workers.py` is wrapped in `mcp_event_handler.run_on_main_thread(...)`. Direct DB access from a background context is a bug.
 
 ---
 
