@@ -1606,6 +1606,21 @@ class Orchestrator:
         _seen_q = set()
         queries = [q for q in queries if not (_seen_q.add(q.lower().strip()) or q.lower().strip() in _seen_q - {q.lower().strip()})]
 
+        # If the user explicitly named a table (e.g. "table 2.2a"), append a query phrased
+        # like the chunk's own content header. Tables in the datastore open with lines such
+        # as "TABLE 2.2A : DETERMINATION OF EXIT REQUIREMENT" — matching that string lifts
+        # the grid-bearing chunk into the top results even when its metadata title is off
+        # (e.g. titled after an adjacent clause). Only fires when a table ref is present,
+        # so non-table queries are unaffected.
+        _user_table_refs = _re.findall(r'table\s+(\d+\.\d+[a-z]?)', user_prompt.lower())
+        if _user_table_refs:
+            for _ref in _user_table_refs:
+                _verbatim = f"TABLE {_ref.upper()} :"
+                if _verbatim.lower() not in _seen_q:
+                    queries.append(_verbatim)
+                    _seen_q.add(_verbatim.lower())
+            self.log(f"[AuthorityQuery] injected verbatim table-header queries for refs: {_user_table_refs}")
+
         self.log(f"[AuthorityQuery] firing {len(queries)} parallel queries: {queries}")
         all_results = []
         import concurrent.futures as _cf
@@ -1730,11 +1745,21 @@ class Orchestrator:
                                      "code", "rule", "table"}]
 
         def _score(chunk):
-            text = (chunk.get("content", "") + " " + (chunk.get("metadata", {}).get("title", ""))).lower()
+            content_lc = chunk.get("content", "").lower()
+            text = (content_lc + " " + (chunk.get("metadata", {}).get("title", ""))).lower()
             score = 0
             for ref in _table_refs:
+                # Grid-bearing chunks open with "TABLE 2.2A : ..." — give them the largest
+                # boost so they outrank prose chunks that merely reference the table by name.
+                # Gated on _table_refs so non-table queries see no behaviour change.
+                if f"table {ref} :" in content_lc or f"table {ref}:" in content_lc:
+                    score += 25
                 if f"table {ref}" in text: score += 10
                 elif ref in text:          score += 4
+            # When the user asked about a specific table, prefer chunks that actually contain
+            # tabular structure over prose. _has_table is defined in the enclosing scope.
+            if _table_refs and _has_table(chunk.get("content", "")):
+                score += 6
             for term in _query_terms:
                 if term in text: score += 1
             return -score  # negative for ascending sort = highest score first
