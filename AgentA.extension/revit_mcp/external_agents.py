@@ -13,6 +13,7 @@ Public surface:
 import json
 import os
 import re
+import threading
 import time
 
 try:
@@ -32,6 +33,32 @@ from revit_mcp.gemini_client import client as _gemini_client
 
 _REGISTRY_PATH = os.path.join(os.path.dirname(__file__), "external_agents.json")
 _registry_cache = {"mtime": 0.0, "data": None}
+
+# In-flight dispatch counter per agent. Lets the chat-window status indicator
+# show "Agent I is working" (amber) while Agent A is mid-call to it, without
+# probing the remote endpoint. Ground truth from our side, not a guess.
+_inflight_lock = threading.Lock()
+_inflight_counts = {}  # agent_name -> int
+
+
+def _inflight_inc(name):
+    with _inflight_lock:
+        _inflight_counts[name] = _inflight_counts.get(name, 0) + 1
+
+
+def _inflight_dec(name):
+    with _inflight_lock:
+        n = _inflight_counts.get(name, 0) - 1
+        if n <= 0:
+            _inflight_counts.pop(name, None)
+        else:
+            _inflight_counts[name] = n
+
+
+def is_busy(name):
+    """True iff Agent A has an in-flight dispatch to `name` right now."""
+    with _inflight_lock:
+        return _inflight_counts.get(name, 0) > 0
 
 
 def _log(msg):
@@ -143,9 +170,40 @@ def health_check(name, timeout=0.5):
         return False
 
 
+def _prewarm(name, timeout=12.0):
+    """Wake a cloud-hosted agent whose host (e.g. Railway free tier) may have
+    slept its dyno. Sends a HEAD with a longer timeout than health_check so
+    Railway has time to spin the container back up. Fire-and-forget — return
+    True if we got any response, False otherwise. Never raises.
+
+    Only call this for agents that declare "prewarm": true in the registry.
+    Loopback agents (Agent D) don't need it.
+    """
+    agent = get_agent(name)
+    if agent is None:
+        return False
+    url = _resolve_url(agent)
+    if not url:
+        return False
+    try:
+        with httpx.Client(timeout=timeout) as c:
+            c.request("HEAD", url)
+        _log("{}: prewarm ok".format(name))
+        return True
+    except Exception as e:
+        _log("{}: prewarm failed — {}: {}".format(name, type(e).__name__, e))
+        return False
+
+
 def startup_report(tracker_callback=None):
     """Run a health check on every registered agent. Returns a list of
     {"name", "display_name", "ok"} dicts. Safe to call from any thread.
+
+    For agents with "prewarm": true in the registry, spawns a background
+    thread that retries with a longer timeout — handy for Railway-hosted
+    agents whose dyno may have slept. The initial result still reflects the
+    short probe; the background thread just nudges the host awake so the
+    user's first real query lands on a hot service.
 
     `tracker_callback`: optional one-arg callable invoked with each agent's
     status line — useful for logging during chat-window startup.
@@ -161,6 +219,21 @@ def startup_report(tracker_callback=None):
                 tracker_callback("{}: {}".format(display, "online" if ok else "offline"))
             except Exception:
                 pass
+
+        # Kick a background prewarm if the agent asked for it AND the short
+        # probe didn't already confirm it's hot. Don't block the chat window.
+        if not ok and agent.get("prewarm"):
+            def _bg(n=name, d=display, cb=tracker_callback):
+                woke = _prewarm(n)
+                if cb:
+                    try:
+                        cb("{}: {}".format(d, "woke up" if woke else "still unreachable"))
+                    except Exception:
+                        pass
+            t = threading.Thread(target=_bg, name="prewarm-" + name)
+            t.daemon = True
+            t.start()
+
     return results
 
 
@@ -231,6 +304,8 @@ def dispatch(classified, tracker=None):
     _log("dispatching {}.{} payload={}".format(agent_name, action, json.dumps(payload)[:200]))
 
     started = time.time()
+    heartbeat_stop = threading.Event()
+    _inflight_inc(agent_name)
     try:
         with httpx.stream("POST", url, json=payload, timeout=timeout) as resp:
             resp.raise_for_status()
@@ -239,7 +314,13 @@ def dispatch(classified, tracker=None):
             if "text/event-stream" in content_type:
                 return _consume_stream(resp, tracker, agent_name, display, action)
 
+            # Non-stream branch: Agent D returns one JSON blob after processing
+            # every row. For large schedules this can take minutes. Tick the
+            # tracker so the chat UI doesn't look frozen.
+            if tracker:
+                _start_heartbeat(heartbeat_stop, tracker, display, action, started)
             body = resp.read().decode("utf-8", errors="replace")
+            heartbeat_stop.set()
             _log("{}.{} returned {} bytes in {:.1f}s".format(
                 agent_name, action, len(body), time.time() - started))
             try:
@@ -250,10 +331,18 @@ def dispatch(classified, tracker=None):
             return _format_result(display, action, payload_out)
 
     except httpx.ConnectError:
+        # Local agents (have a port_file) need their in-Revit bridge started;
+        # remote agents (no port_file) are cloud services that we can't help
+        # the user restart from here. Tailor the hint accordingly.
+        if agent.get("port_file"):
+            return ("I couldn't reach **{}** at {}.\n\n"
+                    "Click the **Start Bridge** button under the {} ribbon tab to start it, "
+                    "then try again. (If auto-start is configured, restart Revit.)"
+                    .format(display, url, display))
         return ("I couldn't reach **{}** at {}.\n\n"
-                "Click the **Start Bridge** button under the {} ribbon tab to start it, "
-                "then try again. (If auto-start is configured, restart Revit.)"
-                .format(display, url, display))
+                "It looks like the remote service is offline or unreachable from this network. "
+                "Check the service status and try again."
+                .format(display, url))
     except httpx.TimeoutException:
         return "**{} → {}** timed out after {:.0f}s.".format(display, action, timeout)
     except httpx.HTTPStatusError as e:
@@ -261,6 +350,37 @@ def dispatch(classified, tracker=None):
     except Exception as e:
         _log("dispatch crashed: {}: {}".format(type(e).__name__, e))
         return "**{} → {}** failed: {}: {}".format(display, action, type(e).__name__, e)
+    finally:
+        heartbeat_stop.set()
+        _inflight_dec(agent_name)
+
+
+def _start_heartbeat(stop_event, tracker, display, action, started):
+    """Tick the chat tracker every few seconds while Agent D's non-stream call
+    is in flight, so the user can see it's still working rather than frozen.
+
+    Why: Agent D's /run for fill_data blocks until every row is processed —
+    minutes for a large schedule. Without this the UI looks dead.
+    """
+    def _tick():
+        # First nudge after 3s so quick calls (8-row schedules) stay quiet.
+        if stop_event.wait(3.0):
+            return
+        while not stop_event.is_set():
+            if is_cancelled():
+                return
+            elapsed = int(time.time() - started)
+            try:
+                tracker.set_status("{} → {} still working… ({}s elapsed)".format(
+                    display, action, elapsed))
+            except Exception:
+                return
+            if stop_event.wait(5.0):
+                return
+
+    t = threading.Thread(target=_tick, name="agent-d-heartbeat")
+    t.daemon = True
+    t.start()
 
 
 def _consume_stream(resp, tracker, agent_name, display, action):

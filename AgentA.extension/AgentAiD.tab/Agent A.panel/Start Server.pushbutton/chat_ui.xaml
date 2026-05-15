@@ -20,8 +20,20 @@
                 </Grid.ColumnDefinitions>
                 <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
                     <TextBlock Text="AI Builder" FontSize="20" FontWeight="SemiBold" VerticalAlignment="Center" Foreground="#E0E0E0"/>
-                    <TextBlock x:Name="StatusDot" Text=" ●" FontSize="14" VerticalAlignment="Center" Foreground="#4CAF50" Margin="10,0,0,0"/>
-                    <TextBlock x:Name="StatusText" Text="MCP Server Active" FontSize="12" VerticalAlignment="Center" Foreground="#AAAAAA" Margin="5,0,0,0"/>
+                    <Border x:Name="StatusIndicator"
+                            Margin="10,0,0,0"
+                            Padding="4,1"
+                            Background="Transparent"
+                            CornerRadius="3"
+                            Cursor="Hand"
+                            ToolTip="Click to re-check all agents">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock x:Name="LetterA" Text="A" FontSize="14" FontWeight="Bold" VerticalAlignment="Center" Foreground="#4CAF50"/>
+                            <TextBlock x:Name="LetterI" Text="i" FontSize="14" FontWeight="Bold" VerticalAlignment="Center" Foreground="#4CAF50"/>
+                            <TextBlock x:Name="LetterD" Text="D" FontSize="14" FontWeight="Bold" VerticalAlignment="Center" Foreground="#4CAF50"/>
+                        </StackPanel>
+                    </Border>
+                    <TextBlock x:Name="StatusText" Text="Checking agents..." FontSize="12" VerticalAlignment="Center" Foreground="#AAAAAA" Margin="8,0,0,0"/>
                 </StackPanel>
                 <Button x:Name="MenuButton"
                         Grid.Column="1"

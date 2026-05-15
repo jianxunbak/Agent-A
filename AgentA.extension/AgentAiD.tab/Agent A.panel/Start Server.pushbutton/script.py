@@ -485,6 +485,11 @@ class AIChatWindow(object):
         self.ChatScroller = self.window.FindName("ChatScroller")
         self.StopButton = self.window.FindName("StopButton")
         self.MenuButton = self.window.FindName("MenuButton")
+        self.StatusIndicator = self.window.FindName("StatusIndicator")
+        self.LetterA = self.window.FindName("LetterA")
+        self.LetterI = self.window.FindName("LetterI")
+        self.LetterD = self.window.FindName("LetterD")
+        self.StatusText = self.window.FindName("StatusText")
 
         if self.UserInput:
             self.UserInput.Focus()
@@ -498,6 +503,292 @@ class AIChatWindow(object):
             # ContextMenu is not in the visual tree; wire by index
             self.MenuButton.ContextMenu.Items[0].Click += self.on_clear_chat
             self.MenuButton.ContextMenu.Items[1].Click += self.on_clear_rag_cache
+        if self.StatusIndicator:
+            self.StatusIndicator.MouseLeftButtonUp += self.on_status_click
+
+        # Status-indicator state. Poll thread runs every 30s by default but
+        # accelerates to ~3s for the next tick whenever any agent's state
+        # changes, so transitions (e.g. build finishes → A goes green) feel
+        # snappy. The stop event lets us shut it down cleanly on window close.
+        # _status_busy prevents overlapping refreshes (timer + user click).
+        self._status_stop = threading.Event()
+        self._status_busy = threading.Lock()
+        self._status_thread = None
+        self._status_next_interval = 30.0  # seconds; reset on each tick
+        # Brushes used by the indicator (cached so we don't allocate per tick).
+        self._brush_green = _color(76, 175, 80)    # online
+        self._brush_amber = _color(255, 167, 38)   # busy/working
+        self._brush_red = _color(229, 57, 53)      # offline
+        self._brush_muted = _color(170, 170, 170)
+        # Last known per-agent state ("green"/"amber"/"red"), used to detect
+        # transitions and drive the fast-recovery cadence.
+        self._agent_state = {"a": None, "i": None, "d": None}
+
+        self.window.Closed += self._on_window_closed
+
+    # ── Agent status indicator (AiD) ──────────────────────────────────────────
+    #
+    # Each agent has three states:
+    #   green ("online")  — reachable and idle
+    #   amber ("busy")    — reachable but actively working (mid-build, mid-call)
+    #   red   ("offline") — unreachable or plumbing not initialized
+    #
+    # The poll runs every 30s normally, but accelerates to ~3s for the next
+    # tick after any state change so transitions feel snappy. The first poll
+    # is kicked off by main() AFTER init_bridge runs — not from window.Loaded,
+    # because at Loaded the bridge isn't wired up yet and Agent A would
+    # spuriously appear red until the first 30s tick.
+
+    def start_status_poll(self):
+        """Kick off the first status check and the 30s poll loop. Called by
+        main() after init_bridge() has wired up the bridge plumbing."""
+        if self._status_thread is not None:
+            return  # already started
+        # Diagnostic — verify FindName resolved every element. If any are None
+        # the indicator can never update (the guards in _apply_status_to_ui
+        # silently skip None elements), which would leave the XAML defaults
+        # (all-green letters + "Checking agents...") stuck on screen.
+        try:
+            client.log("[status] wiring check: "
+                       "StatusIndicator={} LetterA={} LetterI={} LetterD={} StatusText={}".format(
+                           self.StatusIndicator is not None,
+                           self.LetterA is not None,
+                           self.LetterI is not None,
+                           self.LetterD is not None,
+                           self.StatusText is not None,
+                       ))
+        except Exception:
+            pass
+        self._refresh_status_async(is_click=False)
+        self._status_thread = threading.Thread(target=self._status_poll_loop)
+        self._status_thread.daemon = True
+        self._status_thread.start()
+        try:
+            client.log("[status] poll loop started")
+        except Exception:
+            pass
+
+    def _on_window_closed(self, sender, e):
+        self._status_stop.set()
+
+    def _status_poll_loop(self):
+        """Sleep _status_next_interval, then refresh. Interval resets to 30s
+        each tick unless the last tick detected a state change, in which case
+        _refresh_status_async drops it to ~3s for one cycle (fast recovery)."""
+        while not self._status_stop.wait(self._status_next_interval):
+            try:
+                self._refresh_status_async(is_click=False)
+            except Exception as ex:
+                client.log("[status] poll tick crashed: {}".format(ex))
+
+    def _refresh_status_async(self, is_click):
+        """Run health checks on a worker thread; UI updates marshal back to
+        the Dispatcher. `is_click=True` prewarms Agent I (wakes the Railway
+        dyno) and surfaces a chat hint if Agent D stays offline.
+
+        Defensive wrapping: this thread is the ONLY place that updates the
+        AiD indicator. Any uncaught exception here would leave the indicator
+        stuck on its XAML defaults ("Checking agents..." + all-green) and the
+        user has no way to know something went wrong. So we wrap the body in
+        a try/except that logs the failure AND posts a visible state update
+        ("red" + diagnostic text) so the indicator can never be silently
+        wedged in the initial state.
+        """
+        def _work():
+            if not self._status_busy.acquire(False):
+                return  # another refresh already in flight; skip this tick
+            try:
+                try:
+                    a_state = self._evaluate_agent_a()
+                    if is_click:
+                        try:
+                            from revit_mcp.external_agents import _prewarm
+                            _prewarm("agent_i")
+                        except Exception as ex:
+                            client.log("[status] prewarm failed: {}".format(ex))
+                    try:
+                        from revit_mcp.external_agents import health_check, is_busy
+                        i_state = self._evaluate_remote_agent("agent_i", health_check, is_busy)
+                        d_state = self._evaluate_remote_agent("agent_d", health_check, is_busy)
+                    except Exception as ex:
+                        client.log("[status] external health_check failed: {}".format(ex))
+                        i_state = "red"
+                        d_state = "red"
+
+                    prev = self._agent_state
+                    new_state = {"a": a_state, "i": i_state, "d": d_state}
+                    changed = (prev != new_state)
+                    self._agent_state = new_state
+                    # Fast-recovery cadence: if anything changed, re-check
+                    # sooner so transitions (build finishes → A green) feel
+                    # snappy instead of waiting up to 30s.
+                    self._status_next_interval = 3.0 if changed else 30.0
+
+                    try:
+                        client.log("[status] tick: a={} i={} d={} changed={}".format(
+                            a_state, i_state, d_state, changed))
+                    except Exception:
+                        pass
+                    self.window.Dispatcher.BeginInvoke(
+                        Action(lambda: self._apply_status_to_ui(a_state, i_state, d_state))
+                    )
+
+                    if is_click and d_state == "red":
+                        msg = ("Agent D bridge not responding. If it didn't auto-start with Revit, "
+                               "restart Revit, or click the **Bridge** button in the Agent D ribbon panel.")
+                        self.window.Dispatcher.BeginInvoke(
+                            Action(lambda: self.add_message(msg, is_user=False))
+                        )
+                except Exception as ex:
+                    import traceback
+                    err = "[status] refresh crashed: {}\n{}".format(ex, traceback.format_exc())
+                    try:
+                        client.log(err)
+                    except Exception:
+                        pass
+                    # Surface the failure in the UI so the indicator never
+                    # stays stuck on its XAML defaults.
+                    try:
+                        self.window.Dispatcher.BeginInvoke(
+                            Action(lambda: self._apply_status_to_ui("red", "red", "red"))
+                        )
+                    except Exception:
+                        pass
+            finally:
+                self._status_busy.release()
+
+        t = threading.Thread(target=_work)
+        t.daemon = True
+        t.start()
+
+    def _evaluate_agent_a(self):
+        """Return 'green', 'amber', or 'red' for Agent A.
+
+        Strategy:
+          - is_thinking is True       → amber (we're actively driving work)
+          - bridge not initialized    → red
+          - PING returns within 2s    → green
+          - PING times out            → amber (bridge wired but busy/wedged)
+                                         The bridge has a 1200s deadline with
+                                         no per-call timeout, so we wrap the
+                                         PING in a sacrificial thread + join.
+        """
+        try:
+            if self.is_thinking:
+                return "amber"
+            from revit_mcp.bridge import is_bridge_initialized
+            if not is_bridge_initialized():
+                return "red"
+        except Exception:
+            return "red"
+
+        result = {"pong": False, "error": False}
+
+        def _do_ping():
+            try:
+                def ping_action():
+                    return "PONG"
+                res = bridge.mcp_event_handler.run_on_main_thread(ping_action)
+                result["pong"] = (res == "PONG")
+            except Exception:
+                result["error"] = True
+
+        t = threading.Thread(target=_do_ping)
+        t.daemon = True
+        t.start()
+        t.join(2.0)
+
+        if result["pong"]:
+            return "green"
+        if result["error"]:
+            return "red"
+        # Timeout: queue is alive (we got here past is_bridge_initialized) but
+        # something on the main thread is blocking the drain. That's "busy".
+        return "amber"
+
+    def _evaluate_remote_agent(self, agent_name, health_check, is_busy):
+        """Return 'green'/'amber'/'red' for Agent I or Agent D.
+
+        We treat 'busy' as authoritative: if we currently have an in-flight
+        dispatch to this agent, it is by definition reachable AND working. No
+        need to probe — and probing during a long call would just add load.
+        """
+        if is_busy(agent_name):
+            return "amber"
+        return "green" if health_check(agent_name) else "red"
+
+    def _apply_status_to_ui(self, a_state, i_state, d_state):
+        """Paint the letters and rewrite the status text. UI thread only."""
+        try:
+            client.log("[status] apply: a={} i={} d={}".format(a_state, i_state, d_state))
+        except Exception:
+            pass
+        brushes = {"green": self._brush_green,
+                   "amber": self._brush_amber,
+                   "red":   self._brush_red}
+        if self.LetterA:
+            self.LetterA.Foreground = brushes.get(a_state, self._brush_red)
+        if self.LetterI:
+            self.LetterI.Foreground = brushes.get(i_state, self._brush_red)
+        if self.LetterD:
+            self.LetterD.Foreground = brushes.get(d_state, self._brush_red)
+        if self.StatusText:
+            self.StatusText.Text = self._format_status_text(a_state, i_state, d_state)
+
+    def _format_status_text(self, a_state, i_state, d_state):
+        """Plain-English summary so users don't have to decode the colors.
+
+        Priority: working > offline > all online. We don't mix "X is working"
+        with "Y is offline" in the same line — keeps it short and the most
+        urgent signal wins (someone *is* doing work right now).
+        """
+        working = []
+        if a_state == "amber":
+            working.append("Agent A")
+        if i_state == "amber":
+            working.append("Agent I")
+        if d_state == "amber":
+            working.append("Agent D")
+
+        if working:
+            return "{} {} working".format(
+                self._join_agents(working),
+                "is" if len(working) == 1 else "are",
+            )
+
+        offline = []
+        if a_state == "red":
+            offline.append("Agent A")
+        if i_state == "red":
+            offline.append("Agent I")
+        if d_state == "red":
+            offline.append("Agent D")
+
+        if offline:
+            if a_state == "red":
+                # Without Agent A, the others are unreachable from here anyway.
+                return "Agent A offline — chat unavailable"
+            return "{} offline".format(self._join_agents(offline))
+
+        return "All agents online"
+
+    @staticmethod
+    def _join_agents(names):
+        """Oxford-comma join: ['A'] → 'A'; ['A','B'] → 'A and B';
+        ['A','B','C'] → 'A, B, and C'."""
+        if not names:
+            return ""
+        if len(names) == 1:
+            return names[0]
+        if len(names) == 2:
+            return "{} and {}".format(names[0], names[1])
+        return "{}, and {}".format(", ".join(names[:-1]), names[-1])
+
+    def on_status_click(self, sender, e):
+        """Manual refresh: re-evaluate everything, prewarm Agent I."""
+        if self.StatusText:
+            self.StatusText.Text = "Re-checking agents..."
+        self._refresh_status_async(is_click=True)
 
     # ── Spinner bubble helpers ────────────────────────────────────────────────
 
@@ -1028,6 +1319,14 @@ def main():
     # INITIALIZE BRIDGE (CRITICAL for non-blocking UI)
     from revit_mcp.bridge import init_bridge
     init_bridge(uiapp)
+
+    # Start the agent status poll only AFTER init_bridge — at window.Loaded
+    # time the bridge isn't wired yet, so the first PING would always fail
+    # and Agent A would show red for up to 30s before the next tick fixes it.
+    try:
+        _current_chat_window.start_status_poll()
+    except Exception as _e:
+        client.log("[status] failed to start poll: {}".format(_e))
 
     output.print_md("**UI Active.** (Keep this window open to maintain AI connection)")
     output.print_md("---")

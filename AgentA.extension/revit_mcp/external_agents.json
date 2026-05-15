@@ -2,7 +2,7 @@
   "agents": [
     {
       "name": "agent_d",
-      "display_name": "Data Agent",
+      "display_name": "Agent D",
       "description": "Audits Revit schedules for missing parameter values and uses Claude to predict and fill missing data. Use this agent for any prompt about checking, auditing, filling, or populating schedule parameters (e.g. Fire Rating, Door Mark, room finishes).",
       "url": "http://127.0.0.1:8101/run",
       "port_file": "%TEMP%\\agentd_bridge.port",
@@ -23,6 +23,42 @@
       "input_schema": {
         "schedule_name": "string — exact name of the Revit ViewSchedule to operate on",
         "parameter_name": "string — exact parameter name to audit/fill"
+      },
+      "timeout_seconds": 600
+    },
+    {
+      "name": "agent_i",
+      "display_name": "Agent I",
+      "description": "Cloud-hosted Revit-to-Notion BIM assistant. Holds a cloud copy of the Revit model uploaded via its own PyRevit button and uses Claude to answer natural-language questions about that data, push it to Notion databases, and diff snapshots to report what changed. Use this agent for any prompt about the cloud-uploaded model, summarising/querying elements (doors/walls/rooms etc.), exporting or pushing to Notion, or detecting changes between uploads.",
+      "url": "https://problem-statement-2-production.up.railway.app/run",
+      "prewarm": true,
+      "actions": [
+        {
+          "name": "query_revit_data",
+          "description": "Natural-language question about the cloud-uploaded Revit data (counts, breakdowns by level/category, filtered samples). Read-only."
+        },
+        {
+          "name": "push_to_notion",
+          "description": "Push filtered Revit elements to Notion — either as a brand-new database (mode='new_database') or as a versioned push to the fixed DB (mode='versioned'). Returns a job_id."
+        },
+        {
+          "name": "compare_snapshots",
+          "description": "Diff the two most recently uploaded snapshots and report Added / Deleted / Modified elements. Set push_report=true to also push the diff to a new Notion database."
+        },
+        {
+          "name": "check_job_status",
+          "description": "Poll a background Notion push job by job_id."
+        }
+      ],
+      "input_schema": {
+        "query": "string — natural-language question (query_revit_data only)",
+        "mode": "string — 'new_database' or 'versioned' (push_to_notion only)",
+        "category": "string (optional) — filter by category before push",
+        "keyword": "string (optional) — substring match on element name",
+        "level": "string (optional) — substring match on level",
+        "version_label": "string (optional) — label for versioned push",
+        "push_report": "bool (optional) — also push diff to Notion (compare_snapshots only)",
+        "job_id": "string — job to poll (check_job_status only)"
       },
       "timeout_seconds": 600
     }

@@ -209,6 +209,18 @@ def idling_handler(sender, args):
         pass
 
 
+def is_bridge_initialized():
+    """Cheap, side-effect-free check: is the bridge plumbing wired up?
+
+    Returns True iff `init_bridge()` has run and at least one drain mechanism
+    (ExternalEvent dispatch timer OR the Idling subscription via _uiapp) is in
+    place. Used by the status indicator to distinguish "Agent A is busy"
+    (initialized but not draining right now — e.g. mid-build) from "Agent A is
+    dead" (never initialized or torn down).
+    """
+    return _uiapp is not None and (_dispatch_timer is not None or _external_event is not None)
+
+
 # Backward-compatibility shim
 class MCPEventHandler:
     def run_on_main_thread(self, func, *args, **kwargs):
