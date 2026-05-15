@@ -179,6 +179,14 @@ class Orchestrator:
                 multi_results.append(self._answer_authority_query(user_prompt, tracker, history=history, classified=it_obj))
                 continue
 
+            # External agent (Agent D and any future agents registered in external_agents.json)
+            if it == "external_agent":
+                from revit_mcp.external_agents import dispatch as _ext_dispatch
+                self.log("Dispatcher: external_agent intent — agent={}, action={}".format(
+                    it_obj.get("agent_name"), it_obj.get("agent_action")))
+                multi_results.append(_ext_dispatch(it_obj, tracker=tracker))
+                continue
+
             # Build / new_build — defer to pipeline below (only first one is executed)
             if it in ("build", "new_build", None):
                 if build_classified is None:

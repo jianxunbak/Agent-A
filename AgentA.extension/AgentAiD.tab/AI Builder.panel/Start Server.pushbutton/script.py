@@ -991,6 +991,40 @@ def main():
     _current_chat_window = AIChatWindow(xaml_file)
     _current_chat_window.Show(uiapp)
 
+    # ── External-agent health check (Agent D and any future registered agents) ──
+    # Runs on a background thread so it never blocks the chat from opening.
+    # Posts a one-line hint into the chat for any agent whose bridge isn't
+    # listening yet. The agent_d intent itself still works without this — it
+    # just falls back to the "couldn't reach" error if the user tries to use
+    # an offline agent. This is purely a helpful nag.
+    def _external_agents_startup_probe():
+        try:
+            from revit_mcp.external_agents import startup_report
+            from revit_mcp.gemini_client import client as _gc
+            results = startup_report(tracker_callback=lambda line: _gc.log("[startup probe] " + line))
+            offline = [r for r in results if not r["ok"]]
+            if not offline:
+                return
+            lines = ["**Tip:** these external agents aren't running yet. Click their ribbon button (or restart Revit if auto-start is configured) to enable them:"]
+            for r in offline:
+                lines.append("- {} ({})".format(r["display_name"], r["name"]))
+            msg = "\n".join(lines)
+            try:
+                _current_chat_window.window.Dispatcher.BeginInvoke(
+                    Action(lambda: _current_chat_window.add_message(msg, is_user=False))
+                )
+            except Exception as _e:
+                _gc.log("[startup probe] failed to post nag: {}".format(_e))
+        except Exception as _e:
+            try:
+                from revit_mcp.gemini_client import client as _gc
+                _gc.log("[startup probe] crashed: {}".format(_e))
+            except Exception:
+                pass
+
+    import threading as _t
+    _t.Thread(target=_external_agents_startup_probe, daemon=True).start()
+
     # INITIALIZE BRIDGE (CRITICAL for non-blocking UI)
     from revit_mcp.bridge import init_bridge
     init_bridge(uiapp)

@@ -1,0 +1,30 @@
+{
+  "agents": [
+    {
+      "name": "agent_d",
+      "display_name": "Data Agent",
+      "description": "Audits Revit schedules for missing parameter values and uses Claude to predict and fill missing data. Use this agent for any prompt about checking, auditing, filling, or populating schedule parameters (e.g. Fire Rating, Door Mark, room finishes).",
+      "url": "http://127.0.0.1:8101/run",
+      "port_file": "%TEMP%\\agentd_bridge.port",
+      "actions": [
+        {
+          "name": "audit_data",
+          "description": "Check a schedule for missing parameter values; return statistics only (no writes)."
+        },
+        {
+          "name": "fill_data",
+          "description": "Predict and write missing parameter values via Claude. Modifies the Revit model."
+        },
+        {
+          "name": "start_pipeline",
+          "description": "Run audit + fill + AI sanity check end-to-end and return combined results."
+        }
+      ],
+      "input_schema": {
+        "schedule_name": "string — exact name of the Revit ViewSchedule to operate on",
+        "parameter_name": "string — exact parameter name to audit/fill"
+      },
+      "timeout_seconds": 600
+    }
+  ]
+}

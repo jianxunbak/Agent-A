@@ -143,7 +143,19 @@ class GeminiClient:
                 "Recent conversation (for context only — classify the LATEST user message below):\n"
                 "{}\n\n"
             ).format(conversation_context)
-        classification_prompt = ctx_block + (
+
+        # Inject the external-agent registry so the classifier learns about new agents
+        # purely from `external_agents.json` — no prompt edits needed for future agents.
+        try:
+            from revit_mcp.external_agents import registry_prompt_block
+            _ext_agents_block = registry_prompt_block()
+        except Exception as _e:
+            self.log("classify_intent: external_agents registry unavailable — {}".format(_e))
+            _ext_agents_block = ""
+        if _ext_agents_block:
+            _ext_agents_block = "\n" + _ext_agents_block + "\n"
+
+        classification_prompt = ctx_block + _ext_agents_block + (
             "You are an intent classifier for a BIM (Building Information Modeling) assistant. "
             "The user message may request ONE OR MORE actions. "
             "Return ONLY a valid JSON object with an 'intents' array, where each element is one action. "
@@ -165,6 +177,7 @@ class GeminiClient:
             "- query: user is asking a question about the current model state\n"
             "- authority_query: user is asking about building codes, regulations, or authority requirements (SCDF, URA, LTA, NEA, NPARKS, PUB, or any authority) — NOT about the current model state\n"
             "- clarify: the user message is too vague, ambiguous, or incomplete to act on — a clarifying question is needed before proceeding. Use this ONLY when the intent is genuinely unclear and cannot be reasonably inferred. Do NOT use this for normal building requests.\n"
+            "- external_agent: delegate to one of the EXTERNAL AGENTS listed above. Use this when the user's request matches an external agent's description (e.g. auditing schedule data, filling missing parameter values). Include fields agent_name (one of the names in EXTERNAL AGENTS), agent_action (one of that agent's actions), plus any input fields listed for the agent (e.g. schedule_name, parameter_name).\n"
             "- build: user wants to modify/edit the existing building (not a new build)\n\n"
             "FIELDS (include only what applies to each intent object):\n"
             "  option (int): the option number referenced as the subject\n"
@@ -238,6 +251,9 @@ class GeminiClient:
             '  "how many floors are there"                                           -> {{"intents":[{{"intent":"query","goal":"checking current model state","detail_level":"brief","tone":"conversational"}}]}}\n'
             '  "what is the minimum stair width per SCDF"                           -> {{"intents":[{{"intent":"authority_query","goal":"verifying a code requirement for a design decision","detail_level":"standard","tone":"technical"}}]}}\n'
             '  "give me the full breakdown of Table 2.2A with all occupancy types"  -> {{"intents":[{{"intent":"authority_query","goal":"needs complete reference material for a detailed compliance review","detail_level":"detailed","tone":"technical"}}]}}\n'
+            '  "audit the door schedule for missing Fire Rating values"            -> {{"intents":[{{"intent":"external_agent","agent_name":"agent_d","agent_action":"audit_data","schedule_name":"Door Schedule","parameter_name":"Fire Rating","goal":"checking door schedule data completeness","detail_level":"standard","tone":"technical"}}]}}\n'
+            '  "use the data agent to fill missing Fire Rating in doors"           -> {{"intents":[{{"intent":"external_agent","agent_name":"agent_d","agent_action":"fill_data","schedule_name":"Door Schedule","parameter_name":"Fire Rating","goal":"populating missing door fire ratings via AI","detail_level":"standard","tone":"technical"}}]}}\n'
+            '  "run agent D to check and fill the window schedule"                 -> {{"intents":[{{"intent":"external_agent","agent_name":"agent_d","agent_action":"start_pipeline","schedule_name":"Window Schedule","goal":"end-to-end audit and fill for window schedule","detail_level":"standard","tone":"conversational"}}]}}\n'
             '  "do something cool"                                                   -> {{"intents":[{{"intent":"clarify","question":"I\'d love to help — what did you have in mind? I can design a new building, give the current one a dramatic form, or look up a code requirement.","goal":"user wants something creative but hasn\'t specified","detail_level":"standard","tone":"conversational"}}]}}\n'
             '  "update it"                                                           -> {{"intents":[{{"intent":"clarify","question":"What would you like me to update? If you mean the building, I can change the dimensions, floor count, shape, or a specific element — just let me know.","goal":"user wants to modify something but hasn\'t specified what","detail_level":"standard","tone":"conversational"}}]}}\n'
             '  "create a building"                                                   -> {{"intents":[{{"intent":"new_build","specific":false,"temperature":0.4,"thinking_budget":16384,"footprint_complexity":"simple","goal":"creating a new building design","detail_level":"standard","tone":"conversational"}}]}}\n'
