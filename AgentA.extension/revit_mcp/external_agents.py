@@ -273,7 +273,7 @@ def dispatch(classified, tracker=None):
         {"intent": "external_agent",
          "agent_name": "agent_d",
          "agent_action": "fill_data",
-         "schedule_name": "...",
+         "category_name": "...",
          "parameter_name": "..."}
 
     Returns a markdown string suitable for the chat window.

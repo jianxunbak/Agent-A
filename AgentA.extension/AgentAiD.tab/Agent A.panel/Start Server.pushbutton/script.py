@@ -68,12 +68,20 @@ clr.AddReference("PresentationFramework")
 clr.AddReference("PresentationCore")
 clr.AddReference("WindowsBase")
 clr.AddReference("System.Xaml")
+clr.AddReference("System")
 import System.Windows.Input
 import threading
 from System.Windows import Window, HorizontalAlignment, VerticalAlignment, Thickness, CornerRadius, TextWrapping, GridLength, GridUnitType
 from System.Windows.Media import Brushes, Color, SolidColorBrush, FontFamily
-from System.Windows.Controls import Border, TextBox, TextBlock, StackPanel, Grid, ColumnDefinition, RowDefinition, ScrollViewer, ScrollBarVisibility
-from System.Windows.Documents import Run, Bold, Italic, Underline
+from System.Windows.Controls import Border, TextBox, TextBlock, RichTextBox, StackPanel, Grid, ColumnDefinition, RowDefinition, ScrollViewer, ScrollBarVisibility
+from System.Windows.Documents import (
+    Run, Bold, Italic, Underline, Hyperlink,
+    FlowDocument, Paragraph, Section, LineBreak, BlockUIContainer,
+    Table, TableRowGroup, TableRow, TableCell, TableColumn,
+    List as FlowList, ListItem,
+)
+from System import Uri, UriKind
+from System.Diagnostics import Process, ProcessStartInfo
 from System.Windows.Interop import WindowInteropHelper
 from System.Windows.Threading import DispatcherTimer
 from System.Windows.Markup import XamlReader
@@ -105,30 +113,142 @@ _MARKER_START = u""
 _MARKER_END   = u""
 
 
-def _apply_inline(tb, text):
-    """Parse **bold**, *italic*, `code`, and plain text into TextBlock Inlines."""
-    pattern = _re.compile(r'(\*\*(.+?)\*\*|\*(.+?)\*|`([^`]+?)`)')
+_LINK_BRUSH = _color(100, 180, 255)
+_URL_RE     = _re.compile(r'(https?://[^\s<>"\')\]]+)')
+_MDLINK_RE  = _re.compile(r'\[([^\]]+)\]\((https?://[^\s)]+)\)')
+
+
+def _on_hyperlink_navigate(sender, e):
+    """Open the clicked URL in the user's default browser."""
+    try:
+        psi = ProcessStartInfo(e.Uri.AbsoluteUri)
+        psi.UseShellExecute = True
+        Process.Start(psi)
+        e.Handled = True
+    except Exception:
+        pass
+
+
+def _make_hyperlink(label, url):
+    """Build a clickable Hyperlink inline (falls back to plain Run on bad URL)."""
+    try:
+        h = Hyperlink(Run(label))
+        h.NavigateUri = Uri(url, UriKind.Absolute)
+        h.Foreground = _LINK_BRUSH
+        h.RequestNavigate += _on_hyperlink_navigate
+        return h
+    except Exception:
+        return Run(label)
+
+
+def _add_text_with_links(tb, text, run_factory=None):
+    """Append text to tb.Inlines, turning bare http(s) URLs into Hyperlinks.
+
+    run_factory: callable(str)->Run that produces a styled Run for non-URL
+    pieces (so bold/italic styling carries across the split). Defaults to plain
+    Run.
+    """
+    if run_factory is None:
+        run_factory = Run
     pos = 0
-    for m in pattern.finditer(text):
+    for m in _URL_RE.finditer(text):
         if m.start() > pos:
-            tb.Inlines.Add(Run(text[pos:m.start()]))
-        full = m.group(0)
-        if full.startswith('**'):
-            r = Run(m.group(2))
-            r.FontWeight = FontWeights.Bold
-            tb.Inlines.Add(r)
-        elif full.startswith('*'):
-            r = Run(m.group(3))
-            r.FontStyle = FontStyles.Italic
-            tb.Inlines.Add(r)
-        elif full.startswith('`'):
-            r = Run(m.group(4))
-            r.FontFamily = _MONO_FONT
-            r.Foreground = _COL_CODE
-            tb.Inlines.Add(r)
+            tb.Inlines.Add(run_factory(text[pos:m.start()]))
+        tb.Inlines.Add(_make_hyperlink(m.group(1), m.group(1)))
         pos = m.end()
     if pos < len(text):
-        tb.Inlines.Add(Run(text[pos:]))
+        tb.Inlines.Add(run_factory(text[pos:]))
+
+
+def _apply_inline(tb, text):
+    """Parse [label](url), **bold**, *italic*, `code`, bare URLs, and plain
+    text into TextBlock Inlines."""
+    # Resolve markdown links first by splitting `text` into a sequence of plain
+    # string chunks and pre-built Hyperlink inlines, then apply bold/italic/
+    # code/URL parsing only to the string chunks.
+    pieces = []
+    pos = 0
+    for m in _MDLINK_RE.finditer(text):
+        if m.start() > pos:
+            pieces.append(text[pos:m.start()])
+        pieces.append(_make_hyperlink(m.group(1), m.group(2)))
+        pos = m.end()
+    if pos < len(text):
+        pieces.append(text[pos:])
+
+    pattern = _re.compile(r'(\*\*(.+?)\*\*|\*(.+?)\*|`([^`]+?)`)')
+    for piece in pieces:
+        if not isinstance(piece, str):
+            tb.Inlines.Add(piece)
+            continue
+        spos = 0
+        for m in pattern.finditer(piece):
+            if m.start() > spos:
+                _add_text_with_links(tb, piece[spos:m.start()])
+            full = m.group(0)
+            if full.startswith('**'):
+                def _bold(t):
+                    r = Run(t); r.FontWeight = FontWeights.Bold; return r
+                _add_text_with_links(tb, m.group(2), _bold)
+            elif full.startswith('*'):
+                def _ital(t):
+                    r = Run(t); r.FontStyle = FontStyles.Italic; return r
+                _add_text_with_links(tb, m.group(3), _ital)
+            elif full.startswith('`'):
+                r = Run(m.group(4))
+                r.FontFamily = _MONO_FONT
+                r.Foreground = _COL_CODE
+                tb.Inlines.Add(r)  # don't linkify inside backtick code
+            spos = m.end()
+        if spos < len(piece):
+            _add_text_with_links(tb, piece[spos:])
+
+
+# ── Enable text selection on TextBlock via the WPF TextEditor trick ──────────
+#
+# WPF's TextBlock does not natively support selection. The internal
+# System.Windows.Documents.TextEditor class can be attached to any
+# UIElement that hosts inlines; this is the standard community workaround
+# and is used by tools like Visual Studio's output pane. It's "undocumented"
+# but stable since .NET 3.5 and only requires reflection to call.
+_TEXT_EDITOR_TYPE = None
+_REG_CMD_HANDLERS = None
+try:
+    import System
+    _pf_asm = System.Reflection.Assembly.Load("PresentationFramework")
+    _TEXT_EDITOR_TYPE = _pf_asm.GetType("System.Windows.Documents.TextEditor")
+    if _TEXT_EDITOR_TYPE is not None:
+        _REG_CMD_HANDLERS = _TEXT_EDITOR_TYPE.GetMethod(
+            "RegisterCommandHandlers",
+            System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic,
+        )
+except Exception:
+    _TEXT_EDITOR_TYPE = None
+    _REG_CMD_HANDLERS = None
+
+
+_selection_registered_types = set()
+
+
+def _enable_selection(tb):
+    """Make a TextBlock selectable. The TextEditor command handlers are
+    registered class-wide on first call; per-instance work after that is just
+    Focusable + IBeam cursor so the user gets the right visual cue."""
+    if _REG_CMD_HANDLERS is None:
+        return
+    try:
+        t = tb.GetType()
+        if t.FullName not in _selection_registered_types:
+            # Signature: RegisterCommandHandlers(Type controlType,
+            #     bool acceptsRichContent, bool readOnly, bool registerEventListeners)
+            _REG_CMD_HANDLERS.Invoke(
+                None, System.Array[System.Object]([t, True, True, True])
+            )
+            _selection_registered_types.add(t.FullName)
+        tb.Focusable = True
+        tb.Cursor = System.Windows.Input.Cursors.IBeam
+    except Exception:
+        pass
 
 
 def _make_tb(text, fg=None, size=None, bold=False, italic=False, wrap=True, font=None):
@@ -144,6 +264,7 @@ def _make_tb(text, fg=None, size=None, bold=False, italic=False, wrap=True, font
     if font:
         tb.FontFamily = font
     _apply_inline(tb, text)
+    _enable_selection(tb)
     return tb
 
 
@@ -266,6 +387,305 @@ def _build_table_grid(rows):
         raise
 
 
+# ── FlowDocument-based renderer (selectable + copyable) ──────────────────────
+#
+# All AI bubbles render into a FlowDocument hosted inside a read-only
+# RichTextBox. That gives the user native Windows text selection across the
+# whole bubble (drag to highlight, Ctrl+C, Ctrl+A) which a StackPanel of
+# TextBlocks fundamentally cannot do.
+#
+# Tables and the horizontal-rule separator can't be expressed as flow inlines
+# alone, so they're embedded as BlockUIContainer(UIElement) — the
+# UIElement-hosted regions are NOT selectable (each cell is its own TextBlock),
+# but the prose flowing around them is, which is what users care about for
+# copying answers.
+
+
+class _InlineSink(object):
+    """Adapter so the TextBlock-oriented inline helpers can write into any
+    InlineCollection (Paragraph.Inlines, Span.Inlines, etc.)."""
+    def __init__(self, col):
+        self.Inlines = col
+
+
+def _apply_inline_to(target_inlines, text):
+    _apply_inline(_InlineSink(target_inlines), text)
+
+
+def _add_text_with_links_to(target_inlines, text, run_factory=None):
+    _add_text_with_links(_InlineSink(target_inlines), text, run_factory)
+
+
+def _flow_paragraph(text, fg=None, size=None, bold=False, italic=False,
+                    margin=None, font=None):
+    p = Paragraph()
+    p.Margin = margin if margin is not None else Thickness(0, 1, 0, 1)
+    if fg is not None:
+        p.Foreground = fg
+    else:
+        p.Foreground = _COL_WHITE
+    if size:
+        p.FontSize = size
+    if bold:
+        p.FontWeight = FontWeights.Bold
+    if italic:
+        p.FontStyle = FontStyles.Italic
+    if font:
+        p.FontFamily = font
+    _apply_inline_to(p.Inlines, text)
+    return p
+
+
+def _build_flow_table(rows):
+    """Build a FlowDocument Table from parsed markdown rows."""
+    if not rows:
+        return None
+    col_count = max(len(r) for r in rows)
+
+    tbl = Table()
+    tbl.CellSpacing = 0
+    tbl.Margin = Thickness(0, 4, 0, 4)
+
+    for ci in range(col_count):
+        longest = 0
+        for row in rows:
+            if ci < len(row):
+                cell = row[ci].replace(_MARKER_START, "").replace(_MARKER_END, "")
+                if len(cell) > longest:
+                    longest = len(cell)
+        px = max(70, min(220, 14 + longest * 7))
+        col = TableColumn()
+        col.Width = GridLength(px)
+        tbl.Columns.Add(col)
+
+    rg = TableRowGroup()
+    tbl.RowGroups.Add(rg)
+
+    for ri, row in enumerate(rows):
+        is_header = (ri == 0)
+        is_active = not is_header and any(_MARKER_START in cell for cell in row)
+        if is_header:
+            bg = _COL_TH_BG
+        elif is_active:
+            bg = _COL_TR_ACTIVE
+        else:
+            bg = _COL_TR_ALT if ri % 2 == 0 else _COL_TR_NORM
+
+        tr = TableRow()
+        tr.Background = bg
+        for ci in range(col_count):
+            cell_text = row[ci] if ci < len(row) else ""
+            cell_text = cell_text.replace(_MARKER_START, "").replace(_MARKER_END, "")
+            cell = TableCell()
+            cell.BorderBrush = _COL_BORDER
+            cell.BorderThickness = Thickness(0.5)
+            cell.Padding = Thickness(6, 4, 6, 4)
+            p = Paragraph()
+            p.Margin = Thickness(0)
+            if is_header:
+                p.Foreground = _color(220, 240, 255)
+                p.FontWeight = FontWeights.Bold
+            elif is_active:
+                p.Foreground = _GREEN_BRUSH
+            else:
+                p.Foreground = _COL_WHITE
+            _apply_inline_to(p.Inlines, cell_text)
+            cell.Blocks.Add(p)
+            tr.Cells.Add(cell)
+        rg.Rows.Add(tr)
+    return tbl
+
+
+def _build_wpf_flow_document(text):
+    """Convert markdown text to a FlowDocument so the host RichTextBox can
+    select+copy across the entire bubble."""
+    doc = FlowDocument()
+    doc.PagePadding = Thickness(0)
+    doc.FontFamily = FontFamily("Segoe UI")
+    doc.FontSize = 13
+    doc.Foreground = _COL_WHITE
+    doc.Background = Brushes.Transparent
+    # Disable column layout — chat bubbles are narrow, multi-column flow would
+    # collapse into a single skinny column with weird breaks.
+    doc.IsColumnWidthFlexible = False
+    doc.ColumnWidth = 1e6  # effectively single column
+
+    # Strip outer ```markdown fence if Gemini wrapped the whole reply.
+    _stripped = text.strip()
+    if _stripped.startswith('```'):
+        _first_nl = _stripped.find('\n')
+        if _first_nl != -1:
+            _opener = _stripped[3:_first_nl].strip().lower()
+            _body = _stripped[_first_nl + 1:]
+            if _body.endswith('```'):
+                _body = _body[:-3].rstrip()
+            if _opener in ('', 'markdown', 'md'):
+                text = _body
+
+    lines = text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        # ── Headings ──
+        h3 = _re.match(r'^### (.+)', line)
+        h2 = _re.match(r'^## (.+)', line)
+        h1 = _re.match(r'^# (.+)', line)
+        if h1:
+            doc.Blocks.Add(_flow_paragraph(h1.group(1), fg=_COL_H1, size=16,
+                                           bold=True, margin=Thickness(0, 6, 0, 2)))
+            i += 1; continue
+        if h2:
+            doc.Blocks.Add(_flow_paragraph(h2.group(1), fg=_COL_H2, size=14,
+                                           bold=True, margin=Thickness(0, 5, 0, 2)))
+            i += 1; continue
+        if h3:
+            doc.Blocks.Add(_flow_paragraph(h3.group(1), fg=_COL_H3, size=13,
+                                           bold=True, margin=Thickness(0, 4, 0, 1)))
+            i += 1; continue
+
+        # ── Horizontal rule ── (empty paragraph with bottom border via Section)
+        if _re.match(r'^[-*_]{3,}$', line.strip()):
+            sep_border = Border()
+            sep_border.Height = 1
+            sep_border.Background = _color(80, 80, 100)
+            sep_border.Margin = Thickness(0, 4, 0, 4)
+            bc = BlockUIContainer(sep_border)
+            doc.Blocks.Add(bc)
+            i += 1; continue
+
+        # ── Table ──
+        if _is_table_line(line):
+            table_lines = []
+            while i < len(lines) and _is_table_line(lines[i]):
+                table_lines.append(lines[i])
+                i += 1
+            try:
+                rows = _parse_table(table_lines)
+                tbl = _build_flow_table(rows)
+                if tbl is not None:
+                    doc.Blocks.Add(tbl)
+                else:
+                    for tl in table_lines:
+                        doc.Blocks.Add(_flow_paragraph(tl))
+            except Exception as _e:
+                import traceback as _tb
+                _table_log("FLOW_TABLE_EXCEPTION", "{0}\n{1}".format(_e, _tb.format_exc()))
+                for tl in table_lines:
+                    doc.Blocks.Add(_flow_paragraph(tl))
+            continue
+
+        # ── Code block ──
+        if line.strip().startswith('```'):
+            code_lines = []
+            i += 1
+            while i < len(lines) and not lines[i].strip().startswith('```'):
+                code_lines.append(lines[i])
+                i += 1
+            i += 1  # skip closing fence
+            code_text = '\n'.join(code_lines)
+            code_p = Paragraph()
+            code_p.FontFamily = _MONO_FONT
+            code_p.FontSize = 11
+            code_p.Foreground = _COL_CODE
+            code_p.Background = _color(20, 20, 30)
+            code_p.Padding = Thickness(8, 6, 8, 6)
+            code_p.Margin = Thickness(0, 3, 0, 3)
+            code_p.BorderBrush = _color(70, 70, 100)
+            code_p.BorderThickness = Thickness(1)
+            code_p.Inlines.Add(Run(code_text))
+            doc.Blocks.Add(code_p)
+            continue
+
+        # ── Bullet / numbered list ──
+        bullet_m = _re.match(r'^(\s*)([-*+]|\d+[.)]) (.+)', line)
+        if bullet_m:
+            indent = len(bullet_m.group(1))
+            marker = bullet_m.group(2)
+            content = bullet_m.group(3)
+            p = Paragraph()
+            p.Margin = Thickness(indent * 8, 1, 0, 1)
+            p.Foreground = _COL_WHITE
+            marker_run = Run(u'▸ ' if not _re.match(r'\d', marker) else marker + ' ')
+            marker_run.Foreground = _color(100, 180, 255)
+            marker_run.FontWeight = FontWeights.Bold
+            p.Inlines.Add(marker_run)
+            _apply_inline_to(p.Inlines, content)
+            doc.Blocks.Add(p)
+            i += 1; continue
+
+        # ── Blockquote ──
+        if line.startswith('> '):
+            p = Paragraph()
+            p.Margin = Thickness(0, 2, 0, 2)
+            p.Padding = Thickness(8, 2, 4, 2)
+            p.BorderBrush = _color(100, 160, 255)
+            p.BorderThickness = Thickness(3, 0, 0, 0)
+            p.Foreground = _COL_MUTED
+            p.FontStyle = FontStyles.Italic
+            _apply_inline_to(p.Inlines, line[2:])
+            doc.Blocks.Add(p)
+            i += 1; continue
+
+        # ── Empty line → small spacer paragraph ──
+        if not line.strip():
+            sp = Paragraph()
+            sp.Margin = Thickness(0, 2, 0, 2)
+            sp.FontSize = 4
+            sp.Inlines.Add(Run(""))
+            doc.Blocks.Add(sp)
+            i += 1; continue
+
+        # ── Plain paragraph ──
+        doc.Blocks.Add(_flow_paragraph(line))
+        i += 1
+
+    return doc
+
+
+def _make_selectable_richtextbox(document):
+    """Wrap a FlowDocument in a read-only, transparent, borderless RichTextBox
+    that allows native text selection + Ctrl+C copy."""
+    rtb = RichTextBox()
+    rtb.Document = document
+    rtb.IsReadOnly = True
+    rtb.IsReadOnlyCaretVisible = False
+    rtb.IsDocumentEnabled = True   # required for clickable Hyperlinks inside read-only mode
+    rtb.Background = Brushes.Transparent
+    rtb.Foreground = _COL_WHITE
+    rtb.BorderThickness = Thickness(0)
+    rtb.Padding = Thickness(0)
+    rtb.Margin = Thickness(0)
+    rtb.IsTabStop = False
+    rtb.FocusVisualStyle = None
+    rtb.AcceptsTab = False
+    rtb.AcceptsReturn = False
+    # Block the built-in scrollbars — the outer ChatScroller handles scrolling;
+    # an inner scrollbar would just chop bubble height and break layout.
+    rtb.VerticalScrollBarVisibility = ScrollBarVisibility.Disabled
+    rtb.HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled
+    return rtb
+
+
+def _make_selectable_plain(text, foreground=None):
+    """Build a read-only RichTextBox holding a single plain paragraph.
+    Used for user bubbles and status-marker bubbles."""
+    doc = FlowDocument()
+    doc.PagePadding = Thickness(0)
+    doc.FontFamily = FontFamily("Segoe UI")
+    doc.FontSize = 13
+    doc.Background = Brushes.Transparent
+    doc.IsColumnWidthFlexible = False
+    doc.ColumnWidth = 1e6
+    p = Paragraph()
+    p.Margin = Thickness(0)
+    p.Foreground = foreground or _COL_WHITE
+    _apply_inline_to(p.Inlines, text)
+    doc.Blocks.Add(p)
+    return _make_selectable_richtextbox(doc)
+
+
 def _build_wpf_markdown(text):
     """Convert markdown text to a WPF StackPanel with styled elements."""
     panel = StackPanel()
@@ -369,6 +789,7 @@ def _build_wpf_markdown(text):
             tb.FontSize = 11
             tb.Foreground = _COL_CODE
             tb.TextWrapping = TextWrapping.Wrap
+            _enable_selection(tb)
             code_border.Child = tb
             panel.Children.Add(code_border)
             continue
@@ -942,17 +1363,21 @@ class AIChatWindow(object):
             new_border.Margin = Thickness(0, 5, 10, 5)
 
         if is_user:
-            # User bubbles: plain TextBlock
-            txt = TextBlock()
-            txt.Text = message
-            txt.TextWrapping = TextWrapping.Wrap
-            txt.Foreground = Brushes.White
-            new_border.Child = txt
+            # User bubbles: read-only RichTextBox so the user can select +
+            # copy their own prompt back. URLs in the prompt become clickable.
+            new_border.Child = _make_selectable_plain(message, Brushes.White)
         elif _MARKER_START in message:
             # Progress/status messages with green/white colour markers
-            txt = TextBlock()
-            txt.TextWrapping = TextWrapping.Wrap
-            txt.Foreground = Brushes.White
+            doc = FlowDocument()
+            doc.PagePadding = Thickness(0)
+            doc.FontFamily = FontFamily("Segoe UI")
+            doc.FontSize = 13
+            doc.Background = Brushes.Transparent
+            doc.IsColumnWidthFlexible = False
+            doc.ColumnWidth = 1e6
+            p = Paragraph()
+            p.Margin = Thickness(0)
+            p.Foreground = Brushes.White
             parts = _re.split(u'(|)', message)
             in_green = False
             for part in parts:
@@ -961,13 +1386,14 @@ class AIChatWindow(object):
                 elif part == _MARKER_END:
                     in_green = False
                 elif part:
-                    run = Run(part)
-                    run.Foreground = _GREEN_BRUSH if in_green else Brushes.White
-                    txt.Inlines.Add(run)
-            new_border.Child = txt
+                    def _factory(t, c=(_GREEN_BRUSH if in_green else Brushes.White)):
+                        r = Run(t); r.Foreground = c; return r
+                    _add_text_with_links_to(p.Inlines, part, _factory)
+            doc.Blocks.Add(p)
+            new_border.Child = _make_selectable_richtextbox(doc)
         else:
-            # AI response — full markdown renderer
-            new_border.Child = _build_wpf_markdown(message)
+            # AI response — full markdown renderer (selectable RichTextBox)
+            new_border.Child = _make_selectable_richtextbox(_build_wpf_flow_document(message))
 
         if self.ChatHistory:
             self.ChatHistory.Children.Add(new_border)
@@ -1213,7 +1639,7 @@ class AIChatWindow(object):
         new_border.Padding = Thickness(12)
         new_border.HorizontalAlignment = HorizontalAlignment.Stretch
         new_border.Margin = Thickness(0, 5, 10, 5)
-        new_border.Child = _build_wpf_markdown(text)
+        new_border.Child = _make_selectable_richtextbox(_build_wpf_flow_document(text))
 
         if self.ChatHistory:
             if self._spinner_border is not None:
