@@ -146,12 +146,19 @@ def _resolve_url(agent):
     return new_url
 
 
-def health_check(name, timeout=0.5):
+def health_check(name, timeout=None):
     """Probe an external agent's URL. Returns True iff the TCP connect succeeds
     and a response (any status code) comes back within `timeout` seconds.
 
     Used to detect whether the agent's bridge is already listening so the chat
     can nag the user with a helpful hint if it isn't. Never raises.
+
+    `timeout`: if None, pick a sensible default based on the agent type —
+    cloud-hosted agents (registry `prewarm: true`, e.g. Railway) get 3s
+    because the public-internet round trip and Railway's slow first response
+    routinely exceeds half a second even when the dyno is awake; loopback
+    agents (Agent D on 127.0.0.1) get 0.5s because anything longer is the
+    process being dead, not network latency.
     """
     agent = get_agent(name)
     if agent is None:
@@ -159,6 +166,8 @@ def health_check(name, timeout=0.5):
     url = _resolve_url(agent)
     if not url:
         return False
+    if timeout is None:
+        timeout = 3.0 if agent.get("prewarm") else 0.5
     try:
         # HEAD avoids triggering any actual action even if the endpoint forgets
         # to gate by method; if the server doesn't support HEAD it'll 405, which
@@ -301,17 +310,23 @@ def dispatch(classified, tracker=None):
     if tracker:
         tracker.set_status("Routing to {} → {}...".format(display, action))
 
-    _log("dispatching {}.{} payload={}".format(agent_name, action, json.dumps(payload)[:200]))
+    _log("dispatching {}.{} url={} timeout={}s payload={}".format(
+        agent_name, action, url, timeout, json.dumps(payload)[:500]))
 
     started = time.time()
     heartbeat_stop = threading.Event()
     _inflight_inc(agent_name)
     try:
+        _log("{}: opening httpx.stream POST...".format(agent_name))
         with httpx.stream("POST", url, json=payload, timeout=timeout) as resp:
+            _log("{}: response opened — status={} headers={}".format(
+                agent_name, resp.status_code, dict(resp.headers)))
             resp.raise_for_status()
             content_type = (resp.headers.get("content-type") or "").lower()
+            _log("{}: content-type='{}' — branching".format(agent_name, content_type))
 
             if "text/event-stream" in content_type:
+                _log("{}: entering SSE consume loop".format(agent_name))
                 return _consume_stream(resp, tracker, agent_name, display, action)
 
             # Non-stream branch: Agent D returns one JSON blob after processing
@@ -319,18 +334,22 @@ def dispatch(classified, tracker=None):
             # tracker so the chat UI doesn't look frozen.
             if tracker:
                 _start_heartbeat(heartbeat_stop, tracker, display, action, started)
+            _log("{}: reading non-stream body...".format(agent_name))
             body = resp.read().decode("utf-8", errors="replace")
             heartbeat_stop.set()
-            _log("{}.{} returned {} bytes in {:.1f}s".format(
-                agent_name, action, len(body), time.time() - started))
+            _log("{}.{} returned {} bytes in {:.1f}s — preview: {}".format(
+                agent_name, action, len(body), time.time() - started, body[:300]))
             try:
                 payload_out = json.loads(body)
-            except Exception:
+            except Exception as je:
+                _log("{}: JSON parse failed: {}: {}".format(agent_name, type(je).__name__, je))
                 return "**{} → {}** returned a non-JSON response:\n\n```\n{}\n```".format(
                     display, action, body[:1500])
+            _log("{}: parsed payload status={}".format(agent_name, payload_out.get("status") if isinstance(payload_out, dict) else "(not a dict)"))
             return _format_result(display, action, payload_out)
 
-    except httpx.ConnectError:
+    except httpx.ConnectError as ce:
+        _log("{}: ConnectError after {:.1f}s: {}".format(agent_name, time.time() - started, ce))
         # Local agents (have a port_file) need their in-Revit bridge started;
         # remote agents (no port_file) are cloud services that we can't help
         # the user restart from here. Tailor the hint accordingly.
@@ -343,16 +362,27 @@ def dispatch(classified, tracker=None):
                 "It looks like the remote service is offline or unreachable from this network. "
                 "Check the service status and try again."
                 .format(display, url))
-    except httpx.TimeoutException:
+    except httpx.TimeoutException as te:
+        _log("{}: TimeoutException after {:.1f}s: {}".format(agent_name, time.time() - started, te))
         return "**{} → {}** timed out after {:.0f}s.".format(display, action, timeout)
     except httpx.HTTPStatusError as e:
-        return "**{} → {}** returned HTTP {}: {}".format(display, action, e.response.status_code, e.response.text[:500])
+        # Response is a streaming response — must call .read() before accessing .text
+        try:
+            e.response.read()
+            body_text = e.response.text[:500]
+        except Exception as re:
+            body_text = "<could not read body: {}>".format(re)
+        _log("{}: HTTPStatusError {}: {}".format(agent_name, e.response.status_code, body_text))
+        return "**{} → {}** returned HTTP {}: {}".format(display, action, e.response.status_code, body_text)
     except Exception as e:
-        _log("dispatch crashed: {}: {}".format(type(e).__name__, e))
+        import traceback as _tb
+        _log("{}: dispatch CRASHED after {:.1f}s: {}: {}\n{}".format(
+            agent_name, time.time() - started, type(e).__name__, e, _tb.format_exc()))
         return "**{} → {}** failed: {}: {}".format(display, action, type(e).__name__, e)
     finally:
         heartbeat_stop.set()
         _inflight_dec(agent_name)
+        _log("{}: dispatch finished, total {:.1f}s".format(agent_name, time.time() - started))
 
 
 def _start_heartbeat(stop_event, tracker, display, action, started):
@@ -387,27 +417,45 @@ def _consume_stream(resp, tracker, agent_name, display, action):
     """Read SSE 'data: <json>' lines until a {"type":"result"} arrives."""
     final_payload = None
     buffer = ""
-    for raw_chunk in resp.iter_text():
-        if is_cancelled():
-            _log("{}.{} cancelled mid-stream".format(agent_name, action))
-            return "Cancelled."
-        if not raw_chunk:
-            continue
-        buffer += raw_chunk
-        while "\n" in buffer:
-            line, buffer = buffer.split("\n", 1)
-            line = line.rstrip("\r").strip()
-            if not line or not line.startswith("data:"):
+    chunks_seen = 0
+    events_seen = 0
+    started = time.time()
+    try:
+        for raw_chunk in resp.iter_text():
+            if is_cancelled():
+                _log("{}.{} cancelled mid-stream after {:.1f}s".format(agent_name, action, time.time() - started))
+                return "Cancelled."
+            if not raw_chunk:
                 continue
-            try:
-                msg = json.loads(line[5:].strip())
-            except Exception:
-                continue
-            mtype = msg.get("type")
-            if mtype == "status" and tracker:
-                tracker.set_status(msg.get("text", ""))
-            elif mtype == "result":
-                final_payload = msg.get("payload")
+            chunks_seen += 1
+            buffer += raw_chunk
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                line = line.rstrip("\r").strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                try:
+                    msg = json.loads(line[5:].strip())
+                except Exception as pe:
+                    _log("{}: SSE line not JSON, skipping: {} — line={}".format(agent_name, pe, line[:200]))
+                    continue
+                events_seen += 1
+                mtype = msg.get("type")
+                _log("{}: SSE event #{} type={} preview={}".format(
+                    agent_name, events_seen, mtype, json.dumps(msg)[:200]))
+                if mtype == "status" and tracker:
+                    tracker.set_status(msg.get("text", ""))
+                elif mtype == "result":
+                    final_payload = msg.get("payload")
+    except Exception as e:
+        import traceback as _tb
+        _log("{}: SSE consume CRASHED after {:.1f}s, chunks={} events={}: {}: {}\n{}".format(
+            agent_name, time.time() - started, chunks_seen, events_seen,
+            type(e).__name__, e, _tb.format_exc()))
+        raise
+
+    _log("{}: SSE stream ended — chunks={} events={} final_payload={} elapsed={:.1f}s".format(
+        agent_name, chunks_seen, events_seen, final_payload is not None, time.time() - started))
 
     if final_payload is None:
         return "**{} → {}** ended without a result payload.".format(display, action)

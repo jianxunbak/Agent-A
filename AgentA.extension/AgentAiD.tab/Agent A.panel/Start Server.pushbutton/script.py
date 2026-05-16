@@ -582,84 +582,113 @@ class AIChatWindow(object):
                 client.log("[status] poll tick crashed: {}".format(ex))
 
     def _refresh_status_async(self, is_click):
-        """Run health checks on a worker thread; UI updates marshal back to
-        the Dispatcher. `is_click=True` prewarms Agent I (wakes the Railway
-        dyno) and surfaces a chat hint if Agent D stays offline.
+        """Trigger a status refresh. Spawns three independent checker threads —
+        one per agent — and updates each letter as soon as its check returns.
 
-        Defensive wrapping: this thread is the ONLY place that updates the
-        AiD indicator. Any uncaught exception here would leave the indicator
-        stuck on its XAML defaults ("Checking agents..." + all-green) and the
-        user has no way to know something went wrong. So we wrap the body in
-        a try/except that logs the failure AND posts a visible state update
-        ("red" + diagnostic text) so the indicator can never be silently
-        wedged in the initial state.
+        Why parallel and incremental: the slowest check is Agent I's Railway
+        probe, which can sit on a TCP connect for many seconds while the dyno
+        wakes. If we waited for all three to complete before painting, the
+        user would see "Checking agents..." for 30-50s on cold start every
+        time Agent I was asleep. Now A and D show their real state within
+        ~0.5-5s and I updates whenever Railway gets around to responding.
+
+        `is_click=True` prewarms Agent I (wakes the Railway dyno) and
+        surfaces a chat hint if Agent D stays offline.
         """
-        def _work():
-            if not self._status_busy.acquire(False):
-                return  # another refresh already in flight; skip this tick
-            try:
+        if not self._status_busy.acquire(False):
+            return  # another refresh already in flight; skip this tick
+
+        if is_click:
+            def _do_prewarm():
                 try:
-                    a_state = self._evaluate_agent_a()
-                    if is_click:
-                        try:
-                            from revit_mcp.external_agents import _prewarm
-                            _prewarm("agent_i")
-                        except Exception as ex:
-                            client.log("[status] prewarm failed: {}".format(ex))
+                    from revit_mcp.external_agents import _prewarm
+                    _prewarm("agent_i")
+                except Exception as ex:
+                    client.log("[status] prewarm failed: {}".format(ex))
+            tp = threading.Thread(target=_do_prewarm)
+            tp.daemon = True
+            tp.start()
+
+        # Each checker writes its own slot in this dict so the finisher can
+        # detect "all three done" and run change-detection / cadence logic.
+        results = {"a": None, "i": None, "d": None}
+        results_lock = threading.Lock()
+        done_event = threading.Event()
+
+        def _checker(key, evaluator):
+            state = "red"
+            try:
+                state = evaluator()
+            except Exception as ex:
+                try:
+                    client.log("[status] {} check crashed: {}".format(key, ex))
+                except Exception:
+                    pass
+                state = "red"
+            # Record the result and paint just this letter immediately.
+            with results_lock:
+                results[key] = state
+                self._agent_state = dict(self._agent_state)
+                self._agent_state[key] = state
+                snapshot = dict(self._agent_state)
+                all_done = all(v is not None for v in results.values())
+            try:
+                self.window.Dispatcher.BeginInvoke(
+                    Action(lambda s=snapshot: self._apply_status_to_ui(s["a"], s["i"], s["d"]))
+                )
+            except Exception:
+                pass
+            if all_done:
+                done_event.set()
+
+        def _eval_a():
+            return self._evaluate_agent_a()
+
+        def _eval_i():
+            from revit_mcp.external_agents import health_check, is_busy
+            return self._evaluate_remote_agent("agent_i", health_check, is_busy)
+
+        def _eval_d():
+            from revit_mcp.external_agents import health_check, is_busy
+            return self._evaluate_remote_agent("agent_d", health_check, is_busy)
+
+        # Snapshot prev state for change detection before we overwrite it.
+        prev_state = dict(self._agent_state)
+
+        for key, evaluator in (("a", _eval_a), ("i", _eval_i), ("d", _eval_d)):
+            t = threading.Thread(target=_checker, args=(key, evaluator))
+            t.daemon = True
+            t.start()
+
+        def _finisher():
+            try:
+                # Hard cap so a hung check can't pin the busy lock forever.
+                done_event.wait(15.0)
+                with results_lock:
+                    final = dict(self._agent_state)
+                changed = (prev_state != final)
+                any_red = any(v == "red" for v in final.values())
+                self._status_next_interval = 2.0 if (changed or any_red) else 30.0
+                try:
+                    client.log("[status] tick: a={} i={} d={} changed={}".format(
+                        final.get("a"), final.get("i"), final.get("d"), changed))
+                except Exception:
+                    pass
+                if is_click and final.get("d") == "red":
+                    msg = ("Agent D bridge not responding. If it didn't auto-start with Revit, "
+                           "restart Revit, or click the **Bridge** button in the Agent D ribbon panel.")
                     try:
-                        from revit_mcp.external_agents import health_check, is_busy
-                        i_state = self._evaluate_remote_agent("agent_i", health_check, is_busy)
-                        d_state = self._evaluate_remote_agent("agent_d", health_check, is_busy)
-                    except Exception as ex:
-                        client.log("[status] external health_check failed: {}".format(ex))
-                        i_state = "red"
-                        d_state = "red"
-
-                    prev = self._agent_state
-                    new_state = {"a": a_state, "i": i_state, "d": d_state}
-                    changed = (prev != new_state)
-                    self._agent_state = new_state
-                    # Fast-recovery cadence: if anything changed, re-check
-                    # sooner so transitions (build finishes → A green) feel
-                    # snappy instead of waiting up to 30s.
-                    self._status_next_interval = 3.0 if changed else 30.0
-
-                    try:
-                        client.log("[status] tick: a={} i={} d={} changed={}".format(
-                            a_state, i_state, d_state, changed))
-                    except Exception:
-                        pass
-                    self.window.Dispatcher.BeginInvoke(
-                        Action(lambda: self._apply_status_to_ui(a_state, i_state, d_state))
-                    )
-
-                    if is_click and d_state == "red":
-                        msg = ("Agent D bridge not responding. If it didn't auto-start with Revit, "
-                               "restart Revit, or click the **Bridge** button in the Agent D ribbon panel.")
                         self.window.Dispatcher.BeginInvoke(
                             Action(lambda: self.add_message(msg, is_user=False))
-                        )
-                except Exception as ex:
-                    import traceback
-                    err = "[status] refresh crashed: {}\n{}".format(ex, traceback.format_exc())
-                    try:
-                        client.log(err)
-                    except Exception:
-                        pass
-                    # Surface the failure in the UI so the indicator never
-                    # stays stuck on its XAML defaults.
-                    try:
-                        self.window.Dispatcher.BeginInvoke(
-                            Action(lambda: self._apply_status_to_ui("red", "red", "red"))
                         )
                     except Exception:
                         pass
             finally:
                 self._status_busy.release()
 
-        t = threading.Thread(target=_work)
-        t.daemon = True
-        t.start()
+        tf = threading.Thread(target=_finisher)
+        tf.daemon = True
+        tf.start()
 
     def _evaluate_agent_a(self):
         """Return 'green', 'amber', or 'red' for Agent A.
@@ -696,7 +725,13 @@ class AIChatWindow(object):
         t = threading.Thread(target=_do_ping)
         t.daemon = True
         t.start()
-        t.join(2.0)
+        # 5s is generous on purpose. The bridge's ExternalEvent dispatch timer
+        # fires every 100ms but the actual Execute() runs only when Revit's
+        # main thread is free; on first startup the main thread is still
+        # finishing document load / other extensions' startup hooks, so the
+        # very first PING after init_bridge can sit in the queue for several
+        # seconds. 2s was producing false-amber on cold start.
+        t.join(5.0)
 
         if result["pong"]:
             return "green"
@@ -718,14 +753,21 @@ class AIChatWindow(object):
         return "green" if health_check(agent_name) else "red"
 
     def _apply_status_to_ui(self, a_state, i_state, d_state):
-        """Paint the letters and rewrite the status text. UI thread only."""
+        """Paint the letters and rewrite the status text. UI thread only.
+
+        Any of the three states may be None when called from incremental
+        per-agent updates — that agent's check is still in flight. In that
+        case the letter is muted grey and the status text says "Checking
+        Agent X...".
+        """
         try:
             client.log("[status] apply: a={} i={} d={}".format(a_state, i_state, d_state))
         except Exception:
             pass
         brushes = {"green": self._brush_green,
                    "amber": self._brush_amber,
-                   "red":   self._brush_red}
+                   "red":   self._brush_red,
+                   None:    self._brush_muted}
         if self.LetterA:
             self.LetterA.Foreground = brushes.get(a_state, self._brush_red)
         if self.LetterI:
@@ -738,10 +780,23 @@ class AIChatWindow(object):
     def _format_status_text(self, a_state, i_state, d_state):
         """Plain-English summary so users don't have to decode the colors.
 
-        Priority: working > offline > all online. We don't mix "X is working"
-        with "Y is offline" in the same line — keeps it short and the most
-        urgent signal wins (someone *is* doing work right now).
+        Priority: still-checking > working > offline > all online. We don't
+        mix categories in one line — keeps it short and the most actionable
+        signal wins. "Checking" beats everything because a None state means
+        we genuinely don't know yet and shouldn't claim "all online".
         """
+        # Still-checking — at least one of the per-agent threads hasn't
+        # reported yet. Surface which one(s).
+        checking = []
+        if a_state is None:
+            checking.append("Agent A")
+        if i_state is None:
+            checking.append("Agent I")
+        if d_state is None:
+            checking.append("Agent D")
+        if checking:
+            return "Checking {}...".format(self._join_agents(checking))
+
         working = []
         if a_state == "amber":
             working.append("Agent A")
@@ -1080,12 +1135,27 @@ class AIChatWindow(object):
 
         except Exception as e:
             import traceback
-            err_msg = "UI Thread CRASH: {}\n{}".format(str(e), traceback.format_exc())
+            err_msg = "UI Thread CRASH: {}: {}\n{}".format(type(e).__name__, str(e), traceback.format_exc())
+            # Belt-and-braces: log via client, also dump to a dedicated crash log
+            # at %APPDATA%\RevitMCP\logs\ui_thread_crash.log so we never lose the
+            # trace even if client.log itself is the thing that broke.
             try: client.log(err_msg)
             except: pass
+            try:
+                import os as _os
+                from revit_mcp.utils import get_appdata_path
+                _crash_path = _os.path.join(get_appdata_path("logs"), "ui_thread_crash.log")
+                with open(_crash_path, "a", encoding="utf-8") as _f:
+                    import datetime as _dt
+                    _f.write("\n[{}] {}\n".format(_dt.datetime.now().isoformat(), err_msg))
+            except Exception:
+                pass
             print(err_msg)
             from System import Action
-            self.window.Dispatcher.BeginInvoke(Action(lambda: self.on_response_finished("Error: check log for details.")))
+            # Surface the exception type+message in the chat so the user can see
+            # what went wrong without having to dig in the log.
+            _user_msg = "Error: {}: {}".format(type(e).__name__, str(e))[:500]
+            self.window.Dispatcher.BeginInvoke(Action(lambda m=_user_msg: self.on_response_finished(m)))
         finally:
             if not responded and not self.cancelled:
                 from System import Action
